@@ -20,11 +20,11 @@ Electron + TypeScript + React + xterm.js (`@xterm/xterm`, `@xterm/headless`) + `
 - Documentação em `docs/`, mensagens de commit e descrições de PR: **português**.
 - Não misture os dois dentro do mesmo artefato — um arquivo `.ts` não leva comentário em português, e um `.md` em `docs/` não é escrito em inglês.
 
-## TypeScript
+## TypeScript e lint
 
-- `strict: true` em todo o monorepo (`tsconfig.base.json`). Não relaxe flags de strictness em um pacote específico para "destravar" uma tarefa.
-- `any` é proibido sem comentário explicando por que é inevitável ali (ex.: `// any: tipos do node-pty não cobrem esse callback`). Prefira `unknown` + narrowing, generics, ou o tipo real quando existir.
-- Evite type assertions (`as`) como atalho para calar o compilador; se for necessário, comente o motivo.
+Regras próprias, em arquivo separado: versão do compilador (preso em 6.x de propósito), as regras de lint que não se desliga, estilo de tipagem, e o que fazer quando o lint barrar sua tarefa.
+
+@.claude/rules/typescript-rules.md
 
 ## Testes
 
