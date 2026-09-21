@@ -1,0 +1,44 @@
+# dependências
+node_modules/
+.pnp.*
+
+# build
+dist/
+out/
+build/
+release/
+*.tsbuildinfo
+
+# electron-builder
+dist_electron/
+
+# módulos nativos recompilados
+*.node
+
+# testes
+coverage/
+test-results/
+playwright-report/
+.playwright/
+
+# editores
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+.idea/
+*.swp
+
+# sistema
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# logs
+*.log
+npm-debug.log*
+logs/
+
+# ambiente
+.env
+.env.*
+!.env.example
