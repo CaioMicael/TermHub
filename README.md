@@ -38,8 +38,6 @@ These scripts do not fully work yet — `package.json`, the workspace packages, 
 - [`docs/plan.md`](./docs/plan.md) — architecture, technical decisions, and the milestone roadmap.
 - [`docs/milestones.md`](./docs/milestones.md) — the task-by-task execution backlog.
 
-A visual reference for the UI is kept in `prototype.html` at the repository root.
-
 ## License
 
 MIT — see [LICENSE](./LICENSE).

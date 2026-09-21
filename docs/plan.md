@@ -14,7 +14,7 @@ Diferencial frente ao que existe: Windows Terminal / Tabby / WezTerm são emulad
 
 ## 2. Referência visual
 
-`prototype.html` na raiz do repo é a **referência visual aprovada** — protótipo estático e interativo, validado antes de escrever código. A UI final deve bater com ele. Decisões de UI já fechadas ali:
+A **referência visual aprovada** é um protótipo estático e interativo da UI, validado antes de escrever qualquer código. Ele não é versionado aqui; o caminho do arquivo entra no prompt de cada tarefa de UI. A UI final deve bater com ele. Decisões de UI já fechadas nele:
 
 - Tema Dark+ do VS Code na régua: activity bar `#333`, sidebar `#252526`, editor `#1e1e1e`, texto `#cccccc`. Segoe UI na interface, Cascadia Mono nos terminais.
 - **Aba = workspace/projeto**; os terminais são painéis dentro da aba. Troca de contexto entre projetos é um clique.
@@ -67,7 +67,6 @@ Deps principais: `electron`, `react`, `zustand`, `react-resizable-panels`, `node
 TermHub/
 ├─ docs/plan.md               este documento
 ├─ docs/milestones.md         quebra dos milestones em tarefas de subagente
-├─ prototype.html             referência visual aprovada
 ├─ packages/
 │  ├─ shared/     protocol.ts (tipos + framing), events.ts, config-schema.ts
 │  ├─ daemon/     index.ts, server.ts, session.ts, registry.ts,

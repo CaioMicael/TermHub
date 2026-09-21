@@ -8,7 +8,7 @@ TermHub é um app desktop (Electron) que hospeda múltiplos terminais de agentes
 
 - `docs/plan.md` — fonte da verdade de arquitetura e decisões técnicas. Qualquer dúvida sobre "como isso deveria funcionar" se resolve ali antes de inventar uma solução nova.
 - `docs/milestones.md` — backlog de tarefas, dependências e critério de aceite de cada uma.
-- `prototype.html` (raiz) — referência visual **obrigatória** para qualquer tarefa de UI. A UI final tem que bater com ele; não é inspiração, é especificação visual aprovada. Não existe "ficha visual" alternativa.
+- O **protótipo aprovado da UI** — referência visual obrigatória para qualquer tarefa de UI. Ele não é versionado neste repositório: o caminho do arquivo vem no prompt da tarefa. A UI final tem que bater com ele; não é inspiração, é especificação visual aprovada. Se sua tarefa é de UI e você não recebeu o caminho, pare e peça — não invente a interface.
 
 ## Stack
 

@@ -2,7 +2,7 @@
 
 Quebra dos 8 milestones do [plan.md](./plan.md) em tarefas pequenas o bastante para um subagente Sonnet executar de ponta a ponta sem perder contexto.
 
-**Como usar:** cada linha da tabela é **uma tarefa para um subagente**. O prompt do subagente deve carregar `docs/plan.md` (arquitetura e decisões), `prototype.html` (referência visual, quando a tarefa for de UI) e a linha da tarefa. A coluna **Aceite** é o que o subagente tem que provar antes de devolver — sem isso, a tarefa não está pronta.
+**Como usar:** cada linha da tabela é **uma tarefa para um subagente**. O prompt do subagente deve carregar `docs/plan.md` (arquitetura e decisões), o protótipo aprovado da UI (referência visual obrigatória quando a tarefa for de UI; não é versionado, o caminho vai no prompt) e a linha da tarefa. A coluna **Aceite** é o que o subagente tem que provar antes de devolver — sem isso, a tarefa não está pronta.
 
 **Um subagente Sonnet por tarefa, no máximo 2 ao mesmo tempo.** As 7 tarefas marcadas ⬥ recebem antes uma techspec escrita pelo Opus; o resto vai direto. Ver [Execução](#execução-quem-faz-o-quê) no fim do documento.
 
@@ -33,7 +33,7 @@ Quebra dos 8 milestones do [plan.md](./plan.md) em tarefas pequenas o bastante p
 
 | # | Tarefa | Aceite |
 |---|---|---|
-| **M0.1** | Base do repo: `LICENSE` (MIT), `README.md` (o que é, por que existe, como rodar), `CLAUDE.md` (convenções pra agentes: TS strict, nomes em inglês, testes junto do código). `.gitignore` e `.gitattributes` já estão commitados | README explica o projeto sem depender do plan.md; `git check-attr text -- prototype.html` confirma a normalização |
+| **M0.1** | Base do repo: `LICENSE` (MIT), `README.md` (o que é, por que existe, como rodar), `CLAUDE.md` (convenções pra agentes: TS strict, nomes em inglês, testes junto do código). `.gitignore` e `.gitattributes` já estão commitados | README explica o projeto sem depender do plan.md; `git check-attr text -- docs/plan.md` confirma a normalização |
 | **M0.2** ← 0.1 | npm workspaces: `package.json` raiz com `workspaces: ["packages/*"]`, `tsconfig.base.json` (strict, ES2022, moduleResolution bundler), `packages/shared` com tsconfig próprio e um `index.ts` | `npm install` na raiz resolve; `npm run typecheck` passa |
 | **M0.3** ← 0.2 | electron-vite em `packages/app`: main, preload e renderer mínimos (janela 1400×900, dark, sem menu nativo), script `npm run dev` com HMR no renderer | `npm run dev` abre uma janela Electron escura e vazia; editar o renderer recarrega sem fechar a janela |
 | **M0.4** ← 0.2 | Ferramental de qualidade: ESLint (flat config) + Prettier + Vitest configurados na raiz, rodando em todos os workspaces; um teste de exemplo em `shared` | `npm run lint`, `npm run test` e `npm run typecheck` passam limpos |
@@ -65,7 +65,7 @@ O milestone de fundação e o mais arriscado. `M1.1`, `M1.3` e `M1.4` são indep
 | **M2.1** | `packages/app/main/daemon-client.ts`: lê `daemon.json`, tenta conectar; se não houver daemon ou a versão divergir, spawna com `ELECTRON_RUN_AS_NODE=1` + `detached:true` + `unref()` e faz retry com backoff | Fechar o app e reabrir **não** sobe um segundo daemon; apagar `daemon.json` com daemon vivo não cria duplicata |
 | **M2.2** ← 2.1 | Ponte IPC: preload com `contextBridge` tipado, canais de RPC e de dados de PTY como `Uint8Array` (sem base64), coalescing de writes numa janela de ~8ms | Teste: 1000 frames pequenos chegam íntegros e em ordem no renderer |
 | **M2.3** ← 2.2 | `packages/ui/Terminal.tsx`: xterm + `addon-fit` + `addon-unicode11` + `addon-web-links`, monta, anexa à sessão, envia teclado, escreve o stream recebido | Digitar num `pwsh` dentro do app e ver o eco correto, incluindo acentuação |
-| **M2.4** ← 2.3 | Renderer WebGL com fallback para canvas + tema do xterm com a paleta ANSI do `prototype.html`; fonte Cascadia Mono | Cores do terminal batem com o protótipo lado a lado; sem erro de contexto WebGL no console |
+| **M2.4** ← 2.3 | Renderer WebGL com fallback para canvas + tema do xterm com a paleta ANSI do protótipo; fonte Cascadia Mono | Cores do terminal batem com o protótipo lado a lado; sem erro de contexto WebGL no console |
 | **M2.5** ← 2.3 | Resize (`ResizeObserver` → `fit` → `session.resize` com debounce) e clipboard (Ctrl+Shift+C/V + menu de contexto) | Redimensionar a janela reflui a saída sem lixo; `claude` redesenha a TUI corretamente |
 | **M2.6** ← 2.1,2.3 | Reattach no boot: lista sessões vivas no daemon, reata, escreve o snapshot e emenda no stream ao vivo sem duplicar | **Gate do M2:** rodar `claude` no app, fechar a janela, reabrir → a sessão volta viva com o histórico |
 
@@ -79,7 +79,7 @@ O milestone de fundação e o mais arriscado. `M1.1`, `M1.3` e `M1.4` são indep
 |---|---|---|
 | **M3.1** | Store Zustand: modelo workspace → aba → árvore binária de painéis (`{dir, ratio, a, b}` / folha `{sessionId}`) e reducers `split`, `closePane`, `movePane`, `setRatio` | Testes do reducer: dividir, fechar folha colapsando o nó pai, mover painel entre ramos, ratio preservado |
 | **M3.2** ← 3.1 | `SplitTree.tsx`: render recursivo com `react-resizable-panels`, divisórias arrastáveis gravando o ratio na store | Grade 2×2 arrastável; o ratio sobrevive à troca de aba |
-| **M3.3** ← 3.1 | `TabBar.tsx`: aba = workspace, com bolinha de estado agregado, contador de sessões, fechar e botão `+` | Visual idêntico ao `prototype.html`; trocar de aba troca a grade |
+| **M3.3** ← 3.1 | `TabBar.tsx`: aba = workspace, com bolinha de estado agregado, contador de sessões, fechar e botão `+` | Visual idêntico ao protótipo; trocar de aba troca a grade |
 | **M3.4** ← 3.1 | `PaneHeader.tsx`: nome, tag, cwd, badge de estado e botões maximizar/dividir/fechar; **painel solo = tela cheia** (sem moldura, sem divisória, cabeçalho liso) | Workspace com 1 painel renderiza igual à aba `landing-page` do protótipo |
 | **M3.5** ← 3.2 | Terminais ocultos permanecem montados (`display:none`, nunca desmontar); WebGL anexado só nos painéis visíveis, liberado nos ocultos | Alternar 3 abas 10 vezes não reata sessão nenhuma e não estoura contexto WebGL |
 | **M3.6** ← 3.2,3.3 | Drag & drop: reordenar abas e arrastar um painel pra borda de outro criando split | **Gate do M3:** 4 agentes em grade 2×2, divisórias arrastáveis, troca de aba sem perder scrollback |
