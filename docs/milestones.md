@@ -4,14 +4,16 @@ Quebra dos 8 milestones do [plan.md](./plan.md) em tarefas pequenas o bastante p
 
 **Como usar:** cada linha da tabela é **uma tarefa para um subagente**. O prompt do subagente deve carregar `docs/plan.md` (arquitetura e decisões), `prototype.html` (referência visual, quando a tarefa for de UI) e a linha da tarefa. A coluna **Aceite** é o que o subagente tem que provar antes de devolver — sem isso, a tarefa não está pronta.
 
+**Um subagente Sonnet por tarefa, no máximo 2 ao mesmo tempo.** As 7 tarefas marcadas ⬥ recebem antes uma techspec escrita pelo Opus; o resto vai direto. Ver [Execução](#execução-quem-faz-o-quê) no fim do documento.
+
 **Convenções:**
 - Uma branch por milestone (`m1-daemon`, `m2-ui-shell`, …); um commit por tarefa.
 - `Mx.y ← a,b` significa que a tarefa depende das tarefas `a` e `b`. Tarefas sem dependência entre si podem rodar **em paralelo**, em subagentes simultâneos.
 - Toda tarefa que cria lógica nova cria também o teste dela. Tarefa sem teste só é aceitável quando é puramente visual.
 - Nenhuma tarefa mexe em arquivo que outra tarefa paralela está editando — as fronteiras de arquivo abaixo já foram desenhadas pra isso.
-- As 7 tarefas marcadas **⬥ Opus** no fim do documento não devem ir para Sonnet. O motivo de cada uma está lá.
+- Tarefa marcada ⬥ não é disparada sem a techspec dela em `docs/specs/` já escrita.
 
-| Milestone | Tarefas | Paralelismo máximo |
+| Milestone | Tarefas | Independentes entre si |
 |---|---|---|
 | M0 Scaffold | 5 | 2 |
 | M1 Daemon + PTY | 8 | 3 |
@@ -22,6 +24,8 @@ Quebra dos 8 milestones do [plan.md](./plan.md) em tarefas pequenas o bastante p
 | M6 Switcher + busca | 5 | 3 |
 | M7 Acabamento | 6 | 4 |
 | **Total** | **50** | |
+
+> A última coluna diz quantas tarefas ficam livres ao mesmo tempo, não quantas rodam. **O teto de execução é 2 subagentes simultâneos**; quando houver mais de 2 livres, escolher 2 e deixar o resto pra próxima rodada.
 
 ---
 
@@ -137,22 +141,36 @@ O milestone de fundação e o mais arriscado. `M1.1`, `M1.3` e `M1.4` são indep
 
 ---
 
-## Escolha de modelo por tarefa
+## Execução: quem faz o quê
 
-**A regra:** Sonnet resolve tarefa **bem especificada** — a dificuldade está em escrever o código, e o teste de aceite pega o erro. Opus entra onde o erro é uma **corrida ou um furo de protocolo** que passa no teste óbvio e só aparece no uso real, ou onde ainda falta tomar uma decisão de desenho.
+**Implementação é sempre Sonnet.** Um subagente por tarefa, **no máximo 2 rodando ao mesmo tempo** — o teto é de custo, não de dependência.
 
-Pelo critério acima, **7 das 50 tarefas** pedem Opus:
+**Opus não implementa: especifica.** Nas 7 tarefas marcadas ⬥, antes de disparar o subagente, Opus escreve uma techspec em `docs/specs/<tarefa>.md` e o prompt do Sonnet aponta pra ela.
 
-| # | Por que não é tarefa de Sonnet |
-|---|---|
-| **M1.7** attach/detach ⬥ | A janela entre serializar o snapshot e assinar o stream ao vivo. Assinar depois do serialize perde bytes; assinar antes sem bufferizar duplica. A ordem correta é assinar → bufferizar → serializar → despejar o buffer → seguir ao vivo, e o teste ingênuo passa nas duas versões erradas. |
-| **M1.8** lock de instância única ⬥ | Dois apps abrindo juntos: ambos leem `daemon.json` inexistente, ambos sobem um daemon. O lock tem que ser a criação do named pipe (atômica no SO), não uma checagem de arquivo. |
-| **M2.1** spawn/reattach do daemon ⬥ | A mesma corrida pelo lado do cliente, somada a backoff, versão de protocolo divergente e daemon zumbi que aceita conexão mas não responde. |
-| **M2.6** reattach no boot ⬥ | A janela do M1.7 de novo, agora com o xterm do renderer no meio: snapshot escrito no terminal e stream ao vivo emendado sem duplicar nem embaralhar. |
-| **M3.5** ciclo de vida do WebGL ⬥ | Recurso escasso (~16 contextos no Chromium) com montagem e desmontagem constantes. Vazar contexto não quebra no teste, quebra na vigésima troca de aba do usuário. |
-| **M4.1** escrita atômica de estado ⬥ | tmp + rename, corrida entre o debounce e o fechamento do app, arquivo corrompido tendo que cair no default. Perder o `workspaces.json` apaga o layout do usuário. |
-| **M5.1** parser de OSC ⬥ | Sequência partida entre dois chunks, terminador ausente, e a obrigação de não corromper o passthrough. Erro aqui suja o terminal do usuário com lixo de escape. |
+### O que a techspec precisa ter
 
-O resto — 43 tarefas — é Sonnet com o aceite da tabela.
+Sem estes cinco itens ela não serve — vira um texto bonito que o Sonnet contorna:
 
-**Alternativa mais barata:** em vez de Opus escrever o código dessas 7, Opus escreve **só a suíte de testes** de cada uma (que é onde mora o conhecimento do problema) e Sonnet implementa até passar. Vale principalmente em M1.7 e M5.1, onde o teste é mais difícil de escrever que a implementação.
+1. **A decisão já tomada**, não o problema descrito. Não "cuidado com a corrida no attach", e sim "assine o stream → bufferize → serialize → despeje o buffer → siga ao vivo, nesta ordem".
+2. **O modo de falha que a decisão evita**, escrito com todas as letras. É o que impede o Sonnet de "simplificar" de volta pro bug quando a implementação ficar deselegante.
+3. **Os casos de teste obrigatórios**, com destaque pro caso que o teste ingênuo não pega. Sem isso o agente escreve o teste que a própria implementação dele passa, e o verde não significa nada.
+4. **Assinaturas** das funções públicas e o contrato de cada uma (o que pode lançar, o que é síncrono, quem é dono do recurso).
+5. **O que está fora de escopo** — o que a tarefa não deve tocar, pra não vazar pra tarefa vizinha.
+
+### Quando escrever
+
+**Na hora da tarefa, não agora.** A techspec do M1.7 depende de como M1.5 e M1.6 ficaram no código real; escrever as 7 hoje seria especificar sobre código que não existe. A regra é: dependências fechadas → Opus lê o que ficou de pé → escreve a spec → dispara o Sonnet.
+
+### As 7 tarefas com techspec
+
+| # | Techspec | O que a spec tem que resolver |
+|---|---|---|
+| **M1.7** attach/detach ⬥ | `docs/specs/m1.7-attach-detach.md` | A janela entre serializar o snapshot e assinar o stream ao vivo. Assinar depois do serialize perde bytes; assinar antes sem bufferizar duplica. O teste ingênuo passa nas duas versões erradas — só quebra com output chegando no exato instante do reattach, que é o caso do agente trabalhando. |
+| **M1.8** lock de instância única ⬥ | `docs/specs/m1.8-single-instance.md` | Dois apps abrindo juntos: ambos leem `daemon.json`, ambos não acham nada, ambos sobem um daemon. O lock tem que ser a criação do named pipe (atômica no SO), não `existsSync`. |
+| **M2.1** spawn/reattach do daemon ⬥ | `docs/specs/m2.1-daemon-client.md` | A mesma corrida pelo lado do cliente, mais backoff, versão de protocolo divergente e daemon zumbi que aceita conexão e não responde. |
+| **M2.6** reattach no boot ⬥ | `docs/specs/m2.6-boot-reattach.md` | A janela do M1.7 de novo, agora com o xterm do renderer no meio: snapshot escrito no terminal e stream ao vivo emendado sem duplicar nem embaralhar. |
+| **M3.5** ciclo de vida do WebGL ⬥ | `docs/specs/m3.5-webgl-lifecycle.md` | Recurso escasso (~16 contextos no Chromium) com montagem e desmontagem constantes. Vazar contexto não quebra no teste, quebra na vigésima troca de aba. |
+| **M4.1** escrita atômica de estado ⬥ | `docs/specs/m4.1-atomic-state.md` | tmp + rename, corrida entre o debounce e o fechamento do app, arquivo corrompido caindo no default. Perder o `workspaces.json` apaga o layout do usuário. |
+| **M5.1** parser de OSC ⬥ | `docs/specs/m5.1-osc-parser.md` | Sequência partida entre dois chunks, terminador ausente, e a obrigação de não corromper o passthrough. Erro aqui suja o terminal do usuário com lixo de escape. |
+
+As outras 43 tarefas vão direto pro Sonnet com a linha da tabela e o critério de aceite.
