@@ -17,8 +17,8 @@
     "test": "vitest run",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "build": "node scripts/not-implemented.mjs build",
-    "dev": "node scripts/not-implemented.mjs dev"
+    "build": "npm run build --workspace @termhub/app",
+    "dev": "npm run dev --workspace @termhub/app"
   },
   "devDependencies": {
     "typescript": "^6.0.3",
