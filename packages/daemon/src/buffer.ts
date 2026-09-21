@@ -80,6 +80,13 @@ export class TerminalBuffer {
    * far has been fully parsed by xterm's internal parser, in order.
    */
   private pendingWrites: Promise<void> = Promise.resolve();
+  /**
+   * Monotonic count of `write()` calls issued so far, incremented
+   * synchronously inside `write()` — see `sequence`'s doc comment for why
+   * this exists (M1.7's reattach race, `docs/specs/m1.7-attach-detach.md`
+   * section 2).
+   */
+  private writeSeq = 0;
 
   constructor(options: TerminalBufferOptions) {
     this.terminal = new Terminal({
@@ -106,12 +113,31 @@ export class TerminalBuffer {
    * schedules its parser.
    */
   write(data: string): void {
+    // Synchronous, unconditional: every call — even one issued while a
+    // `serialize()` is in flight — gets the next number, with no gap where a
+    // caller could observe an in-between state. `sequence`'s doc comment and
+    // `serialize()` below explain what this number is *for*.
+    this.writeSeq += 1;
     this.pendingWrites = this.pendingWrites.then(
       () =>
         new Promise<void>((resolve) => {
           this.terminal.write(data, resolve);
         }),
     );
+  }
+
+  /**
+   * The sequence number of the most recent `write()` call, i.e. how many
+   * `write()` calls have been made so far. Read this synchronously, right
+   * after calling `write()` (no `await` in between — there must not be one,
+   * since another `write()` could land in that gap), to learn the sequence
+   * number `write()` call just got — that's the `chunkSeq` M1.7's
+   * `docs/specs/m1.7-attach-detach.md` (section 3.2/3.3) needs to decide
+   * whether a chunk delivered to a newly-attaching client is already
+   * reflected in a `serialize()` snapshot or not.
+   */
+  get sequence(): number {
+    return this.writeSeq;
   }
 
   /** Resizes the emulator's viewport. Does not affect retained scrollback. */
@@ -123,15 +149,39 @@ export class TerminalBuffer {
    * Serializes the current screen and scrollback into VT sequences that,
    * written into a fresh terminal of the same size, reproduce this
    * terminal's visible state — including cursor position, in-progress SGR
-   * attributes, and (if active) the alternate screen buffer.
+   * attributes, and (if active) the alternate screen buffer — plus the
+   * `write()` sequence number (`seq`) that state reflects.
    *
-   * Always waits for every `write()` call issued so far to be fully parsed
-   * before reading anything out, so the result never reflects a partially
-   * processed write (see the class doc comment).
+   * `seq` is captured *synchronously*, at call time, before this method's
+   * first `await` — it is exactly `this.writeSeq` at the instant
+   * `serialize()` was called, not at the instant it resolves. That
+   * distinction is the whole point: `write()` calls made *after*
+   * `serialize()` is called but *before* it resolves must not silently leak
+   * into `vt`, or a caller relying on `seq` as "the boundary between what's
+   * in `vt` and what isn't" (M1.7's reattach) would sometimes get a `vt`
+   * containing one write more than `seq` claims.
+   *
+   * That guarantee doesn't come from hoping microtask ordering works out —
+   * it comes from where the read is spliced into the write chain. `read`
+   * below is chained onto `pendingWrites` *as captured at this call*, so it
+   * runs only after every write issued so far has been parsed. Then
+   * `pendingWrites` is reassigned to run *after* `read` — so any `write()`
+   * called during this `await` doesn't just get a higher `seq`, its
+   * underlying `terminal.write()` is *held back* until after `read`'s
+   * `serializeAddon.serialize()` call has already captured the screen. Two
+   * independent things point the same way (the sequence number and the
+   * actual terminal content), instead of one guarding a promise the other
+   * doesn't keep.
+   *
+   * Still always waits for every write issued *before* this call to be
+   * fully parsed first, same as before — the result never reflects a
+   * partially processed write (see the class doc comment).
    */
-  async serialize(): Promise<string> {
-    await this.pendingWrites;
-    return this.serializeAddon.serialize();
+  async serialize(): Promise<{ vt: string; seq: number }> {
+    const seq = this.writeSeq;
+    const read = this.pendingWrites.then(() => this.serializeAddon.serialize());
+    this.pendingWrites = read.then(() => undefined);
+    return { vt: await read, seq };
   }
 
   /**

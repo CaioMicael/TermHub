@@ -205,7 +205,24 @@ export class TransportClient {
     return { dispose: () => this.eventListeners.delete(listener) };
   }
 
-  /** Subscribes to broadcast binary PTY data frames (`TransportServer.broadcastData`). */
+  /**
+   * Subscribes to binary PTY data frames — both `TransportServer.
+   * broadcastData` and (M1.7) `TransportServer.sendDataTo`'s targeted
+   * sends, which is what a `session.attach` snapshot travels as.
+   *
+   * ## Contract for `session.attach` (docs/specs/m1.7-attach-detach.md section 3.4)
+   *
+   * Call this — install the data handler — **before** calling
+   * `request('session.attach', ...)`, not after. `session.attach`'s result
+   * carries no snapshot field; the snapshot (and any output that arrived
+   * while it was being produced) is written to this connection as one or
+   * more binary data frames *before* the RPC response frame, on the same
+   * ordered stream `FramedSocket` already guarantees delivery order for —
+   * no separate synchronization is needed, but only if a listener is
+   * already registered to receive them. A handler installed *after*
+   * `await`ing `session.attach()` has already missed those frames; they are
+   * not re-sent.
+   */
   onData(listener: (sessionId: SessionId, data: Uint8Array) => void): Disposable {
     this.dataListeners.add(listener);
     return { dispose: () => this.dataListeners.delete(listener) };

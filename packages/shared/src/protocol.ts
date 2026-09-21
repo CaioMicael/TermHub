@@ -184,15 +184,19 @@ export interface SessionAttachParams {
 }
 export interface SessionAttachResult {
   session: SessionSummary;
-  /**
-   * VT sequence snapshot produced by `@xterm/headless` + `addon-serialize`
-   * (M1.6/M1.7). Writing this into a fresh terminal reproduces the current
-   * screen and scrollback; the live stream resumes right after, without
-   * duplicating or dropping bytes (see `docs/specs/m1.7-attach-detach.md`
-   * once it exists).
-   */
-  snapshot: string;
 }
+/**
+ * `session.attach`'s result deliberately carries no snapshot field. The VT
+ * sequence snapshot (produced by `@xterm/headless` + `addon-serialize`,
+ * M1.6) travels as a binary `type: FRAME_TYPE.DATA` frame instead — the
+ * same framing `session.data` output already uses — written to the
+ * connection *before* this RPC's response, per the client contract
+ * documented in `packages/daemon/src/transport-client.ts` and
+ * `docs/specs/m1.7-attach-detach.md` section 3.4: install the data handler
+ * before calling `session.attach`, since its frames arrive ahead of the
+ * response. A megabyte-scale scrollback going through `JSON.stringify` here
+ * would undo the M1.5 work that took keyboard input off the JSON path.
+ */
 
 export interface SessionDetachParams {
   sessionId: SessionId;

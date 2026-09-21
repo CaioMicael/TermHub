@@ -147,6 +147,7 @@ export class TransportServer {
   private readonly handshakeTimeoutMs: number;
   private readonly handlers = new Map<string, AnyMethodHandler>();
   private dataHandler: DataFrameHandler | undefined;
+  private connectionCloseHandler: ((clientId: string) => void) | undefined;
   private readonly connections = new Map<string, ConnectionRecord>();
   private nextConnectionSeq = 1;
   private listening = false;
@@ -225,6 +226,41 @@ export class TransportServer {
     this.dataHandler = handler;
   }
 
+  /**
+   * Registers a handler invoked once for every connection that closes,
+   * *regardless of why*: a graceful `end()`, a `destroy()` after a malformed
+   * frame or a bad/expired handshake, or the handshake timeout firing on a
+   * connection that never sent one. Added for M1.7 — `docs/specs/
+   * m1.7-attach-detach.md` section 3.7 needs *something* to tell
+   * `service.ts` a client is gone so it can drop that client from every
+   * session's attached list; this is that something.
+   *
+   * `clientId` is the same id `RequestContext.clientId` carries — assigned
+   * when the socket connects, before the handshake completes (see
+   * `RequestContext`'s own doc comment) — so it is handed to the handler
+   * even for a connection that never got past `pending-handshake`. That
+   * `clientId` will not be in any of `service.ts`'s attached lists (it
+   * never got far enough to attach anything), and the handler is expected
+   * to tolerate that silently, not treat it as an error.
+   *
+   * Called from `onSocketClose`, wrapped so a throwing handler can never
+   * propagate: a connection closing is normal traffic on a long-running
+   * daemon, not a path where one client's cleanup bug is allowed to bring
+   * the rest of the server down.
+   *
+   * At most one handler, like `registerDataHandler`: a second call throws
+   * instead of silently replacing the first.
+   */
+  onConnectionClose(handler: (clientId: string) => void): void {
+    if (this.connectionCloseHandler !== undefined) {
+      throw new ProtocolError(
+        PROTOCOL_ERROR_CODE.INTERNAL_ERROR,
+        'a connection-close handler is already registered',
+      );
+    }
+    this.connectionCloseHandler = handler;
+  }
+
   /** Starts listening. Resolves once the server is actually accepting connections; rejects on a listen-time error (e.g. the address is already in use). Idempotent — a second call while already listening resolves immediately. */
   async listen(): Promise<void> {
     if (this.listening) {
@@ -300,6 +336,41 @@ export class TransportServer {
     }
   }
 
+  /**
+   * Sends a binary (type 1) PTY data frame to one specific client — the
+   * targeted counterpart to `broadcastData`, added for M1.7's
+   * `session.attach`/`session.detach` (`docs/specs/m1.7-attach-detach.md`
+   * section 3.5), which delivers a session's output only to clients
+   * actually attached to it instead of every connected client.
+   *
+   * Silently does nothing if `clientId` names a connection that is no
+   * longer open (never handshaked, or already closed) instead of throwing —
+   * the caller may be racing a client that disconnected mid-attach, and
+   * that is normal, expected traffic, not a programming error worth
+   * tearing anything down over.
+   */
+  sendDataTo(clientId: string, sessionId: SessionId, data: Uint8Array): void {
+    const conn = this.connections.get(clientId);
+    if (conn === undefined || conn.state !== 'ready') {
+      return;
+    }
+    conn.framed.send(encodeWireData(sessionId, data));
+  }
+
+  /**
+   * Sends a JSON control-plane event to one specific client — the targeted
+   * counterpart to `broadcastEvent`, for the same reason `sendDataTo`
+   * exists (see its doc comment). Same silent-no-op contract for a
+   * `clientId` that is no longer connected.
+   */
+  sendEventTo(clientId: string, event: string, payload: unknown): void {
+    const conn = this.connections.get(clientId);
+    if (conn === undefined || conn.state !== 'ready') {
+      return;
+    }
+    conn.framed.send(encodeWireControl({ kind: 'event', event, payload }));
+  }
+
   private handleConnection(socket: Socket): void {
     const id = `conn-${this.nextConnectionSeq}`;
     this.nextConnectionSeq += 1;
@@ -359,6 +430,18 @@ export class TransportServer {
     }
     clearTimeout(conn.handshakeTimer);
     this.connections.delete(id);
+    if (this.connectionCloseHandler !== undefined) {
+      try {
+        this.connectionCloseHandler(id);
+      } catch {
+        // See onConnectionClose's doc comment: a connection closing is not
+        // a path where a handler's own bug gets to propagate and take the
+        // rest of the server down with it. No logger exists yet to hand
+        // this to (same tradeoff `listen()`'s own swallowed server-level
+        // 'error' listener above already makes) — silently isolating it is
+        // safer than an unhandled exception here.
+      }
+    }
   }
 
   private onFrame(id: string, frame: Frame): void {

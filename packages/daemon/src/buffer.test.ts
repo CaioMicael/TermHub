@@ -50,7 +50,8 @@ describe('TerminalBuffer', () => {
     for (const chunk of chunks) {
       source.write(chunk);
     }
-    const vt = await source.serialize();
+    const { vt, seq } = await source.serialize();
+    expect(seq).toBe(chunks.length);
 
     // Ground truth: an independent raw terminal driven with the exact same
     // chunks, with nothing going through TerminalBuffer or serialize() at all.
@@ -90,7 +91,8 @@ describe('TerminalBuffer', () => {
       expectedText += chunk;
     }
 
-    const vt = await buffer.serialize();
+    const { vt, seq } = await buffer.serialize();
+    expect(seq).toBe(50);
     const target = new Terminal({ cols, rows, ...COMPARISON_OPTS });
     await writeAndWait(target, vt);
 
@@ -111,7 +113,7 @@ describe('TerminalBuffer', () => {
     for (let i = 0; i < totalLines; i++) {
       buffer.write(`L${i}\r\n`);
     }
-    const vt = await buffer.serialize();
+    const { vt } = await buffer.serialize();
 
     const target = new Terminal({ cols, rows, ...COMPARISON_OPTS });
     await writeAndWait(target, vt);
@@ -142,5 +144,40 @@ describe('TerminalBuffer', () => {
 
     buffer.dispose();
     expect(() => buffer.dispose()).not.toThrow();
+  });
+
+  it('sequence() matches the number of write() calls, and serialize() excludes a write() issued after it was called — not by timing luck, but because serialize() splices its read into the write chain', async () => {
+    const cols = 40;
+    const rows = 5;
+    const buffer = new TerminalBuffer({ cols, rows });
+
+    expect(buffer.sequence).toBe(0);
+    buffer.write('before\r\n');
+    expect(buffer.sequence).toBe(1);
+
+    // Call serialize() but don't await it yet, then — still perfectly
+    // deterministically, since nothing has yielded to the event loop —
+    // issue one more write(). This is exactly the M1.7 danger window
+    // (docs/specs/m1.7-attach-detach.md section 2): a write "during"
+    // serialize()'s own await.
+    const serializePromise = buffer.serialize();
+    buffer.write('after\r\n');
+    expect(buffer.sequence).toBe(2);
+
+    const { vt, seq } = await serializePromise;
+    // The returned seq is frozen at the value serialize() saw when it was
+    // *called*, not when it resolves — it must not have observed the
+    // second write() even though that write() happened before this await
+    // completed.
+    expect(seq).toBe(1);
+
+    const target = new Terminal({ cols, rows, ...COMPARISON_OPTS });
+    await writeAndWait(target, vt);
+    const text = linesOf(target).join('\n');
+    expect(text).toContain('before');
+    expect(text).not.toContain('after');
+
+    buffer.dispose();
+    target.dispose();
   });
 });
