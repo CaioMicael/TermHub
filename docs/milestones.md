@@ -9,6 +9,7 @@ Quebra dos 8 milestones do [plan.md](./plan.md) em tarefas pequenas o bastante p
 - `Mx.y ← a,b` significa que a tarefa depende das tarefas `a` e `b`. Tarefas sem dependência entre si podem rodar **em paralelo**, em subagentes simultâneos.
 - Toda tarefa que cria lógica nova cria também o teste dela. Tarefa sem teste só é aceitável quando é puramente visual.
 - Nenhuma tarefa mexe em arquivo que outra tarefa paralela está editando — as fronteiras de arquivo abaixo já foram desenhadas pra isso.
+- As 7 tarefas marcadas **⬥ Opus** no fim do documento não devem ir para Sonnet. O motivo de cada uma está lá.
 
 | Milestone | Tarefas | Paralelismo máximo |
 |---|---|---|
@@ -28,7 +29,7 @@ Quebra dos 8 milestones do [plan.md](./plan.md) em tarefas pequenas o bastante p
 
 | # | Tarefa | Aceite |
 |---|---|---|
-| **M0.1** | Base do repo: `.gitignore`, `LICENSE` (MIT), `README.md` (o que é, por que existe, como rodar), `CLAUDE.md` (convenções pra agentes: TS strict, nomes em inglês, testes junto do código) | `git log` mostra o commit inicial; README explica o projeto sem depender do plan.md |
+| **M0.1** | Base do repo: `LICENSE` (MIT), `README.md` (o que é, por que existe, como rodar), `CLAUDE.md` (convenções pra agentes: TS strict, nomes em inglês, testes junto do código). `.gitignore` e `.gitattributes` já estão commitados | README explica o projeto sem depender do plan.md; `git check-attr text -- prototype.html` confirma a normalização |
 | **M0.2** ← 0.1 | npm workspaces: `package.json` raiz com `workspaces: ["packages/*"]`, `tsconfig.base.json` (strict, ES2022, moduleResolution bundler), `packages/shared` com tsconfig próprio e um `index.ts` | `npm install` na raiz resolve; `npm run typecheck` passa |
 | **M0.3** ← 0.2 | electron-vite em `packages/app`: main, preload e renderer mínimos (janela 1400×900, dark, sem menu nativo), script `npm run dev` com HMR no renderer | `npm run dev` abre uma janela Electron escura e vazia; editar o renderer recarrega sem fechar a janela |
 | **M0.4** ← 0.2 | Ferramental de qualidade: ESLint (flat config) + Prettier + Vitest configurados na raiz, rodando em todos os workspaces; um teste de exemplo em `shared` | `npm run lint`, `npm run test` e `npm run typecheck` passam limpos |
@@ -133,3 +134,25 @@ O milestone de fundação e o mais arriscado. `M1.1`, `M1.3` e `M1.4` são indep
 | **M7.4** | E2E com `@playwright/test` + `_electron`: abrir, criar 4 terminais em grade, `Ctrl+P`, `Ctrl+Shift+T`, screenshot | Suíte verde no CI |
 | **M7.5** ← 7.1,7.2,7.3 | Empacotamento `electron-builder`: NSIS + portable, ícone, AppUserModelId, rebuild do `node-pty`, artefato publicado pelo CI | Instalador roda numa máquina limpa sem Node instalado |
 | **M7.6** ← 7.5 | `README` com GIF de demonstração, `CONTRIBUTING.md`, release `v0.1.0` no GitHub | **Gate do M7:** instalar o `.exe` numa máquina limpa e abrir 5 agentes |
+
+---
+
+## Escolha de modelo por tarefa
+
+**A regra:** Sonnet resolve tarefa **bem especificada** — a dificuldade está em escrever o código, e o teste de aceite pega o erro. Opus entra onde o erro é uma **corrida ou um furo de protocolo** que passa no teste óbvio e só aparece no uso real, ou onde ainda falta tomar uma decisão de desenho.
+
+Pelo critério acima, **7 das 50 tarefas** pedem Opus:
+
+| # | Por que não é tarefa de Sonnet |
+|---|---|
+| **M1.7** attach/detach ⬥ | A janela entre serializar o snapshot e assinar o stream ao vivo. Assinar depois do serialize perde bytes; assinar antes sem bufferizar duplica. A ordem correta é assinar → bufferizar → serializar → despejar o buffer → seguir ao vivo, e o teste ingênuo passa nas duas versões erradas. |
+| **M1.8** lock de instância única ⬥ | Dois apps abrindo juntos: ambos leem `daemon.json` inexistente, ambos sobem um daemon. O lock tem que ser a criação do named pipe (atômica no SO), não uma checagem de arquivo. |
+| **M2.1** spawn/reattach do daemon ⬥ | A mesma corrida pelo lado do cliente, somada a backoff, versão de protocolo divergente e daemon zumbi que aceita conexão mas não responde. |
+| **M2.6** reattach no boot ⬥ | A janela do M1.7 de novo, agora com o xterm do renderer no meio: snapshot escrito no terminal e stream ao vivo emendado sem duplicar nem embaralhar. |
+| **M3.5** ciclo de vida do WebGL ⬥ | Recurso escasso (~16 contextos no Chromium) com montagem e desmontagem constantes. Vazar contexto não quebra no teste, quebra na vigésima troca de aba do usuário. |
+| **M4.1** escrita atômica de estado ⬥ | tmp + rename, corrida entre o debounce e o fechamento do app, arquivo corrompido tendo que cair no default. Perder o `workspaces.json` apaga o layout do usuário. |
+| **M5.1** parser de OSC ⬥ | Sequência partida entre dois chunks, terminador ausente, e a obrigação de não corromper o passthrough. Erro aqui suja o terminal do usuário com lixo de escape. |
+
+O resto — 43 tarefas — é Sonnet com o aceite da tabela.
+
+**Alternativa mais barata:** em vez de Opus escrever o código dessas 7, Opus escreve **só a suíte de testes** de cada uma (que é onde mora o conhecimento do problema) e Sonnet implementa até passar. Vale principalmente em M1.7 e M5.1, onde o teste é mais difícil de escrever que a implementação.

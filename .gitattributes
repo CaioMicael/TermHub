@@ -1,0 +1,25 @@
+# Finais de linha: LF no repositório, sempre. Evita diff fantasma entre
+# contribuidores de Windows e Linux/macOS.
+* text=auto eol=lf
+
+# Exceções: só funcionam com CRLF no Windows
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# Binários — nunca normalizar
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.node  binary
+*.exe   binary
+*.dll   binary
+
+# Gerados: fora do diff e das estatísticas de linguagem do GitHub
+package-lock.json linguist-generated=true -diff
