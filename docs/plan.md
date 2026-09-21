@@ -115,7 +115,7 @@ A quebra de cada milestone em tarefas de subagente está em [milestones.md](./mi
 
 - **Throughput do IPC com 6 agentes cuspindo output.** v1 relaya pelo main com `Uint8Array` (sem base64). Se medir lag de digitação ou CPU alta no main, migrar pra `MessageChannelMain` (renderer fala direto com o socket) — é a rota do VS Code. Coalescer writes numa janela de ~8ms.
 - **Contextos WebGL são limitados (~16 no Chromium).** Anexar o addon WebGL só nos painéis visíveis; os ocultos ficam vivos mas sem contexto. Terminais ocultos **não desmontam** (só `display:none`), senão cada troca de aba paga reattach.
-- **`node-pty` é nativo.** `@electron/rebuild` no postinstall e no CI; validar que o prebuild carrega sob `ELECTRON_RUN_AS_NODE`.
+- ~~**`node-pty` é nativo**, exigindo `@electron/rebuild`.~~ **Risco descartado na M1.3, com medição.** O `node-pty` 1.1.0 usa N-API (`node-addon-api`) e traz os prebuilds dentro do próprio tarball. O mesmo `prebuilds/win32-x64/pty.node` foi carregado e spawnou um PTY real sob Node 22.14 (ABI `modules` 127) e sob Electron 44.4.3 / Node 24.21 (ABI `modules` 149). Não há rebuild por ABI a fazer: `npm ci` do zero leva 10s e nunca chama o node-gyp. O `electron-builder` no M7 pode ainda ter motivos próprios para rebuild no empacotamento, mas não por causa do `node-pty`.
 - **Daemon órfão ou zumbi.** `daemon.json` com pid + versão de protocolo; no boot, se o pipe não responde ou a versão diverge, mata e sobe de novo. Daemon se encerra sozinho após X min sem cliente **e** sem sessão viva.
 - **Detecção de status é heurística.** Tratar como dica, nunca como verdade: nunca bloquear ação do usuário com base nela, e deixar limiar de ociosidade configurável por perfil.
 
