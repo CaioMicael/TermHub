@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  // Not part of the tsc --build project graph (nothing references it, and
+  // it isn't referenced from the root tsconfig.json). It exists solely to
+  // give typescript-eslint's projectService a strict, real tsconfig to use
+  // for root-level TypeScript tooling files that aren't part of any
+  // package's own tsconfig (see eslint.config.mjs's `defaultProject` /
+  // `allowDefaultProject`), instead of falling back to unchecked defaults.
+  "extends": "./tsconfig.base.json",
+  "include": ["vitest.config.ts"]
+}

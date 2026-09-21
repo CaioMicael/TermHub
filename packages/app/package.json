@@ -1,0 +1,22 @@
+{
+  "name": "@termhub/app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TermHub Electron shell: main, preload and renderer, built with electron-vite.",
+  "main": "./dist/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build"
+  },
+  "dependencies": {
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "electron": "^44.4.3",
+    "electron-vite": "^5.0.0"
+  }
+}

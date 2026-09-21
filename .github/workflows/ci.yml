@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches:
+      - main
+
+# Cancel a superseded run on the same branch/PR when new commits land, so the
+# queue doesn't pile up with runs nobody will look at.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # electron@44.4.3 (see packages/app/package.json) has no postinstall hook of
+  # its own: `npm ci` never touches node_modules/electron/dist, and
+  # `electron-vite build` only externalizes the `electron` import instead of
+  # spawning the binary, so nothing in this workflow needs it downloaded.
+  # This is set anyway as a harmless, forward-looking guard: if a future
+  # electron/electron-builder bump reintroduces an automatic download on
+  # install, this stops it from silently creeping back into the fast
+  # lint/typecheck/test/build job. It has no effect today.
+  # Revisit once M7 adds Playwright + `_electron` E2E (M7.4) and
+  # electron-builder packaging (M7.5): those DO need the real binary, so a
+  # separate job/step will need to unset this, actually fetch the binary
+  # (e.g. `node node_modules/electron/install.js`), and cache the download
+  # (electron's cache dir, keyed by electron version) to avoid re-fetching
+  # ~100+ MB from the Electron CDN on every run.
+  ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm run test
+
+      - name: Build
+        run: npm run build
+
+      - name: Format check
+        run: npm run format:check
