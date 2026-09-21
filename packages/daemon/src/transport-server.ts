@@ -59,6 +59,18 @@ export type MethodHandler<TParams = unknown, TResult = unknown> = (
 /** Internal erased form every registered handler is stored as — see `registerMethod`'s doc comment for why the cast down to this is safe. */
 type AnyMethodHandler = MethodHandler<unknown, unknown>;
 
+/**
+ * Handler invoked for every binary (`type` 1) PTY data frame a client sends
+ * once its connection is `ready` — the client->daemon half of PTY input (see
+ * protocol.ts's frame-format header comment: `type` 1 now carries both
+ * directions). Registered via `registerDataHandler`.
+ */
+export type DataFrameHandler = (
+  sessionId: SessionId,
+  data: Uint8Array,
+  context: RequestContext,
+) => void;
+
 export interface TransportServerOptions {
   /**
    * Shared secret every connecting client must present in its handshake.
@@ -134,6 +146,7 @@ export class TransportServer {
   private readonly address: string;
   private readonly handshakeTimeoutMs: number;
   private readonly handlers = new Map<string, AnyMethodHandler>();
+  private dataHandler: DataFrameHandler | undefined;
   private readonly connections = new Map<string, ConnectionRecord>();
   private nextConnectionSeq = 1;
   private listening = false;
@@ -185,6 +198,31 @@ export class TransportServer {
       );
     }
     this.handlers.set(method, handler as AnyMethodHandler);
+  }
+
+  /**
+   * Registers the handler for every binary (`type` 1) PTY data frame a
+   * client sends once its connection is `ready` — see `DataFrameHandler`'s
+   * doc comment. Called synchronously from `onFrame`, in the exact same
+   * per-connection, strict-arrival-order dispatch loop `handleRequest` is
+   * invoked from for control frames: no internal queue, `setImmediate`, or
+   * `await` sits between a frame becoming decoded and this handler being
+   * called for it. That is the property M1.5's ordering requirement rests
+   * on — a `session.resize` request and a keystroke frame sent right after
+   * it arrive on the same socket in the order the client wrote them, and
+   * this dispatch never reorders them relative to each other.
+   *
+   * At most one handler, like `registerMethod`: a second call throws
+   * instead of silently replacing the first.
+   */
+  registerDataHandler(handler: DataFrameHandler): void {
+    if (this.dataHandler !== undefined) {
+      throw new ProtocolError(
+        PROTOCOL_ERROR_CODE.INTERNAL_ERROR,
+        'a data frame handler is already registered',
+      );
+    }
+    this.dataHandler = handler;
   }
 
   /** Starts listening. Resolves once the server is actually accepting connections; rejects on a listen-time error (e.g. the address is already in use). Idempotent — a second call while already listening resolves immediately. */
@@ -335,11 +373,23 @@ export class TransportServer {
     }
 
     if (frame.type !== FRAME_TYPE.CONTROL) {
-      // A client never legitimately sends a binary data frame — input goes
-      // over the `session.write` RPC (see protocol.ts's
-      // `SessionWriteParams` doc comment) precisely so it can stay
-      // JSON/UTF-8. Ignored rather than torn down: this milestone doesn't
-      // define semantics for it, and being lenient here costs nothing.
+      // Binary data frames are the client->daemon half of PTY input
+      // (protocol.ts's frame-format header comment: `type` 1 carries both
+      // directions). Dispatched synchronously to whatever
+      // `registerDataHandler` registered — see that method's doc comment
+      // for why staying synchronous here, in this same per-frame loop, is
+      // what keeps this connection's control and data frames applied in
+      // the order they arrived. No handler registered (e.g. a daemon build
+      // that never wired session input) silently drops it instead of
+      // tearing the connection down: this transport stays session-agnostic
+      // and doesn't get to decide that's a protocol violation.
+      if (this.dataHandler !== undefined) {
+        const context: RequestContext = {
+          clientId: conn.id,
+          ...(conn.clientName !== undefined ? { clientName: conn.clientName } : {}),
+        };
+        this.dataHandler(frame.sessionId, frame.data, context);
+      }
       return;
     }
 

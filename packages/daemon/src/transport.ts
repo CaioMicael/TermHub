@@ -8,7 +8,7 @@
 // - `TransportServer` (transport-server.ts): listens, handshakes each
 //   connecting client (token + protocol version, with a timeout), and
 //   dispatches `request`s to handlers registered by name
-//   (`registerMethod`). `session.create`/`write`/`resize`/`close`/`list`/
+//   (`registerMethod`). `session.create`/`resize`/`close`/`list`/
 //   `attach`/`detach` are M1.5's handlers, registered from outside — this
 //   package's own tests register a throwaway `ping` handler instead.
 // - `TransportClient` (transport-client.ts): connects, handshakes, and

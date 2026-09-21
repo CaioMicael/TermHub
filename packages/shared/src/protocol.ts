@@ -13,10 +13,13 @@
 //   itself — i.e. it includes the 1-byte `type` field.
 // - `type` 0 is a control frame: payload is a UTF-8 JSON-encoded
 //   `ControlMessage`.
-// - `type` 1 is a PTY data frame: payload is `[uint32 sessionId][raw bytes]`,
-//   sessionId also big-endian. This is the whole reason a binary frame type
-//   exists: PTY output can be megabytes per second across several agents,
-//   and it must never pay JSON/base64 encoding cost.
+// - `type` 1 is a PTY data frame, carried in both directions: payload is
+//   `[uint32 sessionId][raw bytes]`, sessionId also big-endian.
+//   Daemon->client it's a session's output; client->daemon it's keyboard/
+//   pasted input (see `SessionDataPayload`'s doc comment and the RPC-methods
+//   section below). This is the whole reason a binary frame type exists: PTY
+//   traffic can be megabytes per second across several agents in either
+//   direction, and it must never pay JSON/base64 encoding cost.
 // - Any other `type` is a protocol error.
 
 // ---------------------------------------------------------------------------
@@ -120,10 +123,27 @@ export interface SessionSummary {
   cols: number;
   rows: number;
   status: SessionStatus;
+  /**
+   * Process exit code, present only once the session has died (`status`
+   * `'exited'`). Mirrors `SessionExitPayload`/`session.ts`'s `SessionExit` so
+   * a client that reconnects after missing the `session.exit` event — it
+   * wasn't connected at the time — can still learn *why* a session it sees
+   * in `session.list` is dead, instead of only that it is.
+   */
+  exitCode?: number;
+  /** POSIX signal number that terminated the process, when applicable. Not set on Windows. */
+  signal?: number;
 }
 
 // ---------------------------------------------------------------------------
-// RPC methods: session.create / write / resize / close / list / attach / detach
+// RPC methods: session.create / resize / close / list / attach / detach
+//
+// Keyboard/pasted input (formerly a `session.write` RPC here) travels as a
+// binary `type: FRAME_TYPE.DATA` frame instead (`Frame` below), the same
+// format `session.data` output already uses in the daemon->client direction.
+// A JSON RPC per keystroke would double the message count on this product's
+// most latency-sensitive path (pasting a large prompt is routine), and the
+// data frame already carries `sessionId` without JSON string-escaping.
 // ---------------------------------------------------------------------------
 
 export interface SessionCreateParams {
@@ -141,23 +161,6 @@ export interface SessionCreateParams {
 export interface SessionCreateResult {
   session: SessionSummary;
 }
-
-export interface SessionWriteParams {
-  sessionId: SessionId;
-  /**
-   * UTF-8 text written to the PTY's stdin — keystrokes, pasted text, or a
-   * literal line like the M1.8 CLI diagnostic's `echo hi`. This is a JSON
-   * control-plane RPC on purpose: input volume is bounded by how fast a
-   * human types (or a script writes short commands), so paying JSON's
-   * string-encoding cost here is fine. It is the *output* side
-   * (`session.data`) that is volume-sensitive and therefore binary-only —
-   * see `SessionDataPayload` below. If a future caller needs to forward
-   * truly arbitrary/non-UTF-8 input bytes, that should get its own binary
-   * frame instead of stretching this field with base64.
-   */
-  data: string;
-}
-export type SessionWriteResult = Record<string, never>;
 
 export interface SessionResizeParams {
   sessionId: SessionId;
@@ -199,7 +202,6 @@ export type SessionDetachResult = Record<string, never>;
 /** Every request method's params type, keyed by method name — the single source of truth `RequestMethod` and the discriminated envelopes below are derived from. */
 export interface RequestParamsByMethod {
   'session.create': SessionCreateParams;
-  'session.write': SessionWriteParams;
   'session.resize': SessionResizeParams;
   'session.close': SessionCloseParams;
   'session.list': SessionListParams;
@@ -210,7 +212,6 @@ export interface RequestParamsByMethod {
 /** Every request method's success result type, keyed by method name. */
 export interface RequestResultByMethod {
   'session.create': SessionCreateResult;
-  'session.write': SessionWriteResult;
   'session.resize': SessionResizeResult;
   'session.close': SessionCloseResult;
   'session.list': SessionListResult;
@@ -261,9 +262,10 @@ export interface SessionDataPayload {
 
 export interface SessionExitPayload {
   sessionId: SessionId;
-  /** `null` when the process was killed by signal or the exit code is otherwise unknown. */
-  exitCode: number | null;
-  signal?: string;
+  /** Matches `session.ts`'s `SessionExit#exitCode`, which is always a `number` — node-pty/ConPTY never hands the wrapper a null/unknown code in practice. */
+  exitCode: number;
+  /** POSIX signal number that terminated the process, when applicable. Not set on Windows. */
+  signal?: number;
 }
 
 export interface SessionStatusPayload {

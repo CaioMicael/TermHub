@@ -8,6 +8,7 @@ import { FramedSocket } from './transport-socket.js';
 import {
   DEFAULT_HANDSHAKE_TIMEOUT_MS,
   encodeWireControl,
+  encodeWireData,
   fromControlMessage,
 } from './transport-wire.js';
 import type { WireEvent, WireResponse } from './transport-wire.js';
@@ -178,6 +179,24 @@ export class TransportClient {
       });
       framed.send(encodeWireControl({ kind: 'request', id, method, params }));
     });
+  }
+
+  /**
+   * Sends a binary (`type` 1) PTY data frame to the daemon — the
+   * client->daemon half of PTY input (see protocol.ts's frame-format header
+   * comment: `type` 1 now carries both directions). Unlike `request()`
+   * there is no response to correlate this with, so this returns as soon as
+   * the frame is handed to the socket (or queued under backpressure — see
+   * transport-socket.ts's `send()`), not once the daemon has processed it.
+   * Throws synchronously if called before `connect()` resolves.
+   */
+  sendData(sessionId: SessionId, data: Uint8Array): void {
+    if (this.state !== 'ready' || this.framed === undefined) {
+      throw new Error(
+        `sendData() called in state "${this.state}", expected "ready" (call connect() first)`,
+      );
+    }
+    this.framed.send(encodeWireData(sessionId, data));
   }
 
   /** Subscribes to broadcast JSON events (`TransportServer.broadcastEvent`). */
