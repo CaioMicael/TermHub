@@ -1,5 +1,7 @@
 # TermHub
 
+[![CI](https://github.com/CaioMicael/TermHub/actions/workflows/ci.yml/badge.svg)](https://github.com/CaioMicael/TermHub/actions/workflows/ci.yml)
+
 TermHub is a desktop terminal IDE for running multiple AI coding agents side by side on Windows.
 
 ## The problem
