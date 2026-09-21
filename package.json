@@ -21,15 +21,15 @@
     "dev": "npm run dev --workspace @termhub/app"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.2",
+    "eslint": "^10.11.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^17.12.0",
+    "prettier": "^3.9.8",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.70.0",
-    "eslint": "^10.11.0",
-    "@eslint/js": "^10.0.1",
-    "globals": "^17.12.0",
-    "eslint-config-prettier": "^10.1.8",
-    "prettier": "^3.9.8",
-    "vitest": "^5.0.1",
-    "vite": "^8.3.0",
-    "@types/node": "^26.6.2"
+    "vite": "^7.3.6",
+    "vitest": "^5.0.1"
   }
 }
