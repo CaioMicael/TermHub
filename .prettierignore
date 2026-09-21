@@ -1,0 +1,15 @@
+# generated / build output
+node_modules
+dist
+coverage
+*.tsbuildinfo
+package-lock.json
+
+# owned by other tasks / not tooling: don't reformat these from here
+README.md
+LICENSE
+CLAUDE.md
+docs/
+prototype.html
+.gitignore
+.gitattributes
