@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "declarationMap": true,
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    // Explicit because TypeScript's automatic @types inclusion isn't
+    // picking up the hoisted root node_modules/@types/node here (same gap
+    // exists in packages/shared, unexercised there until it touches a Node
+    // global). The daemon is Node-only — no DOM code — so this also keeps
+    // unrelated @types (react, chai, ...) out of its program.
+    "types": ["node"]
+  },
+  "include": ["src"]
+}
