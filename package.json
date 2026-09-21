@@ -1,0 +1,23 @@
+{
+  "name": "termhub",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop terminal IDE for running multiple AI coding agents side by side on Windows.",
+  "license": "MIT",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "tsc --build --pretty",
+    "lint": "node scripts/not-implemented.mjs lint",
+    "test": "node scripts/not-implemented.mjs test",
+    "build": "node scripts/not-implemented.mjs build",
+    "dev": "node scripts/not-implemented.mjs dev"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}
