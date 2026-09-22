@@ -12,6 +12,7 @@ Quebra dos 8 milestones do [plan.md](./plan.md) em tarefas pequenas o bastante p
 - Toda tarefa que cria lógica nova cria também o teste dela. Tarefa sem teste só é aceitável quando é puramente visual.
 - Nenhuma tarefa mexe em arquivo que outra tarefa paralela está editando — as fronteiras de arquivo abaixo já foram desenhadas pra isso.
 - Tarefa marcada ⬥ não é disparada sem a techspec dela em `docs/specs/` já escrita.
+- O processo de trabalho com subagentes (quem roda git, como se verifica uma entrega, por que o paralelismo é limitado pelo npm) está em [`.claude/rules/agent-workflow.md`](../.claude/rules/agent-workflow.md).
 
 | Milestone | Tarefas | Independentes entre si |
 |---|---|---|
@@ -136,7 +137,7 @@ O milestone de fundação e o mais arriscado. `M1.1`, `M1.3` e `M1.4` são indep
 | **M7.2** | Keybindings configuráveis (`keymap.json`) sobre um registro central de comandos | Trocar o atalho de `Ctrl+P` e ver valer sem recompilar |
 | **M7.3** | Temas: paleta do protótipo como padrão + importador de tema do VS Code (JSON) | Importar um tema conhecido e ver UI e ANSI mudarem juntos |
 | **M7.4** | E2E com `@playwright/test` + `_electron`: abrir, criar 4 terminais em grade, `Ctrl+P`, `Ctrl+Shift+T`, screenshot | Suíte verde no CI |
-| **M7.5** ← 7.1,7.2,7.3 | Empacotamento `electron-builder`: NSIS + portable, ícone, AppUserModelId, rebuild do `node-pty`, artefato publicado pelo CI | Instalador roda numa máquina limpa sem Node instalado |
+| **M7.5** ← 7.1,7.2,7.3 | Empacotamento `electron-builder`: NSIS + portable, ícone, AppUserModelId, artefato publicado pelo CI. **Herdado da M2.1:** `node-pty` **não** é dependência declarada de `@termhub/app` (fica externo ao bundle de propósito), então o `electron-builder` precisa ser instruído a incluí-lo explicitamente, com o `.node` em `asarUnpack` — binário nativo não carrega de dentro do asar. Sem rebuild por ABI: ver riscos no `plan.md` | Instalador roda numa máquina limpa sem Node instalado |
 | **M7.6** ← 7.5 | `README` com GIF de demonstração, `CONTRIBUTING.md`, release `v0.1.0` no GitHub | **Gate do M7:** instalar o `.exe` numa máquina limpa e abrir 5 agentes |
 
 ---
