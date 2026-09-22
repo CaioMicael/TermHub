@@ -8,7 +8,25 @@
     "declarationMap": true,
     "outDir": "dist/types-web",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "jsx": "react-jsx"
+    "jsx": "react-jsx",
+    // M2.2: `index.d.ts`'s typed `window.termhub` surface (`request<M extends
+    // RequestMethod>`, etc. — see `src/preload/bridge.ts`'s `PreloadBridge`)
+    // reaches into `@termhub/shared`'s `protocol.ts` for those method/event
+    // types, via `bridge.ts` and `src/main/ipc-contract.ts` below. Because
+    // `@termhub/shared`'s package.json points `types`/`main` straight at its
+    // *source* (no build step consumed here — same as every other package
+    // in this monorepo), this project ends up type-checking protocol.ts's
+    // whole implementation (Buffer-based framing, not just the types this
+    // project actually needs), the same way `packages/shared/tsconfig.json`
+    // itself does — see that file's own comment for the identical root
+    // cause ("without an explicit `types` array, TS's automatic @types
+    // inclusion was not resolving @types/node for this project").
+    "types": ["node"]
   },
-  "include": ["src/renderer/src/**/*", "src/preload/index.d.ts"]
+  "include": [
+    "src/renderer/src/**/*",
+    "src/preload/index.d.ts",
+    "src/preload/bridge.ts",
+    "src/main/ipc-contract.ts"
+  ]
 }

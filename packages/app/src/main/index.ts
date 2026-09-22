@@ -1,7 +1,12 @@
 import { join } from 'node:path';
-import { app, BrowserWindow, Menu } from 'electron';
+import { app, BrowserWindow, ipcMain, Menu } from 'electron';
+import type { IpcMainEvent } from 'electron';
 
+import { BridgeGateway } from './bridge-gateway.js';
 import { connectToDaemon } from './daemon-client.js';
+import type { DaemonConnection } from './daemon-client.js';
+import { IPC_CHANNEL } from './ipc-contract.js';
+import type { RelayInboundMessage, RelayOutboundMessage } from './ipc-contract.js';
 
 // packages/app has its own package.json without "type": "module" (unlike
 // the repo root), so main and preload build as CommonJS and __dirname is
@@ -58,17 +63,19 @@ async function loadRenderer(mainWindow: BrowserWindow): Promise<void> {
 }
 
 /**
- * Kicks off docs/specs/m2.1-daemon-client.md's find-or-spawn-or-reconnect
- * flow at startup and logs the outcome. Deliberately not awaited by
- * `main()` below — the daemon connection and the window showing up are
- * independent concerns, and a slow/backed-off daemon connection must never
- * delay the window from appearing. M2.1's own scope stops at producing a
- * `DaemonConnection` and surfacing it here; wiring `'blocked'`/`'failed'`
- * into a visible warning banner, and `'connected'`'s client into an IPC
- * bridge the renderer can actually use, is M2.2/M2.3.
+ * Logs the outcome of docs/specs/m2.1-daemon-client.md's
+ * find-or-spawn-or-reconnect flow. Deliberately not awaited by `main()`
+ * below — the daemon connection and the window showing up are independent
+ * concerns, and a slow/backed-off daemon connection must never delay the
+ * window from appearing. Takes the same `connectionPromise` handed to
+ * `attachDaemonBridge` (a single `connectToDaemon()` call per app start,
+ * not one per window) so this is purely an observer of it, never a second
+ * connection attempt.
  */
-async function startDaemonConnection(): Promise<void> {
-  const result = await connectToDaemon();
+async function logDaemonConnectionOutcome(
+  connectionPromise: Promise<DaemonConnection>,
+): Promise<void> {
+  const result = await connectionPromise;
 
   switch (result.outcome) {
     case 'connected':
@@ -79,9 +86,9 @@ async function startDaemonConnection(): Promise<void> {
       });
       return;
     case 'blocked':
-      // Section 2: never auto-resolved. M2.2/M2.3 turn this into the
-      // visible warning banner the spec requires; this module's job stops
-      // at surfacing it clearly here.
+      // Section 2: never auto-resolved. The M2.2 bridge (below) surfaces
+      // this to the renderer as connection state; the visible warning
+      // banner itself is M2.3's job.
       console.warn('[TermHub] daemon connection blocked — will not spawn or kill', {
         reason: result.reason,
         pid: result.info.pid,
@@ -97,14 +104,64 @@ async function startDaemonConnection(): Promise<void> {
   }
 }
 
+/**
+ * Wires one window to the shared daemon connection: a `BridgeGateway`
+ * (main/bridge-gateway.ts — connection-state tracking + the `DaemonRelay`
+ * once connected) fed by an `ipcMain` listener scoped to exactly this
+ * window's `webContents` (so multiple windows, were M2 ever to grow one,
+ * would not cross-deliver each other's requests), and a `sendToRenderer`
+ * that drops messages once the window is destroyed instead of throwing
+ * (armadilha 5 — see `DaemonRelay.dispose`'s doc comment for the other half
+ * of that guarantee). Every main -> renderer message, whatever its kind,
+ * goes out over the same `webContents.send` channel
+ * (`IPC_CHANNEL.TO_RENDERER`) — see `ipc-contract.ts`'s header comment for
+ * why (armadilha 2: `invoke`/`handle` is never used for RPC here, precisely
+ * because its reply doesn't share an ordering guarantee with `send`).
+ */
+function attachDaemonBridge(
+  window: BrowserWindow,
+  connectionPromise: Promise<DaemonConnection>,
+): { dispose: () => void } {
+  const sendToRenderer = (message: RelayOutboundMessage): void => {
+    if (window.isDestroyed()) {
+      return;
+    }
+    window.webContents.send(IPC_CHANNEL.TO_RENDERER, message);
+  };
+
+  const gateway = new BridgeGateway({ sendToRenderer, connectionPromise });
+
+  const onFromRenderer = (event: IpcMainEvent, message: RelayInboundMessage): void => {
+    if (event.sender !== window.webContents) {
+      return; // Not this window's bridge — ipcMain listeners are process-global.
+    }
+    gateway.handleRendererMessage(message);
+  };
+  ipcMain.on(IPC_CHANNEL.FROM_RENDERER, onFromRenderer);
+
+  return {
+    dispose(): void {
+      ipcMain.removeListener(IPC_CHANNEL.FROM_RENDERER, onFromRenderer);
+      gateway.dispose();
+    },
+  };
+}
+
 async function main(): Promise<void> {
   await app.whenReady();
 
-  startDaemonConnection().catch((error: unknown) => {
+  // One `connectToDaemon()` call for the whole app start, shared by the
+  // logger above and every window's bridge — never one call per window.
+  const connectionPromise = connectToDaemon();
+  logDaemonConnectionOutcome(connectionPromise).catch((error: unknown) => {
     console.error('[TermHub] unexpected error while connecting to the daemon', error);
   });
 
   const mainWindow = createWindow();
+  const bridge = attachDaemonBridge(mainWindow, connectionPromise);
+  mainWindow.on('closed', () => {
+    bridge.dispose();
+  });
   await loadRenderer(mainWindow);
 
   app.on('activate', () => {
@@ -113,6 +170,10 @@ async function main(): Promise<void> {
     }
 
     const nextWindow = createWindow();
+    const nextBridge = attachDaemonBridge(nextWindow, connectionPromise);
+    nextWindow.on('closed', () => {
+      nextBridge.dispose();
+    });
     loadRenderer(nextWindow).catch((error: unknown) => {
       console.error('[TermHub] failed to load renderer after activate', error);
     });
