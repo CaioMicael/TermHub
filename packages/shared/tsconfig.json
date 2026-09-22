@@ -6,7 +6,13 @@
     "declarationMap": true,
     "noEmit": false,
     "outDir": "dist",
-    "rootDir": "src"
+    "rootDir": "src",
+    // Without an explicit `types` array, TS's automatic @types inclusion
+    // was not resolving `@types/node` for this project (verified with an
+    // isolated repro tsconfig: identical code type-checks once "node" is
+    // listed here). protocol.ts/protocol.test.ts use Buffer and other Node
+    // globals, so this is needed for `tsc --build` to see them at all.
+    "types": ["node"]
   },
   "include": ["src"]
 }
