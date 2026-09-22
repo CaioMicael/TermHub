@@ -1,6 +1,6 @@
 import { timingSafeEqual } from 'node:crypto';
 import { unlink } from 'node:fs/promises';
-import { createServer } from 'node:net';
+import { createConnection, createServer } from 'node:net';
 import type { Server, Socket } from 'node:net';
 
 import { FRAME_TYPE, PROTOCOL_ERROR_CODE, PROTOCOL_VERSION, ProtocolError } from '@termhub/shared';
@@ -125,9 +125,93 @@ function isErrnoException(err: unknown): err is NodeJS.ErrnoException {
   return err instanceof Error && 'code' in err;
 }
 
-/** Removes a leftover unix-socket file at `address`, if any. No-op on win32 (named pipes aren't filesystem entries) and when nothing is there. */
-async function removeStaleSocketFile(address: string): Promise<void> {
-  if (process.platform === 'win32') {
+/**
+ * Outcome of probing whether *something* is currently listening at
+ * `address` — see `removeStaleSocketFile`'s doc comment for why this
+ * matters. `'alive'`: a connection was accepted (a real process owns this
+ * address right now). `'stale'`: the connection was refused — the address
+ * exists as a leftover filesystem entry (a POSIX unix-socket file) but
+ * nothing is listening on it anymore, e.g. a daemon that crashed instead of
+ * unlinking its own socket on the way out. `'absent'`: nothing exists at
+ * `address` at all (or the probe hit any other error — see `probeSocket`).
+ */
+type SocketProbeResult = 'alive' | 'stale' | 'absent';
+
+/**
+ * How `removeStaleSocketFile` opens its probe connection. Defaults to
+ * `net.createConnection`; overridable purely so tests can inject a fake
+ * connector and force each branch (`'alive'` / `'stale'` / `'absent'`)
+ * deterministically — in particular `'stale'` (`ECONNREFUSED` against a
+ * lingering POSIX socket file with no listener), which this project's own
+ * dev/CI machines cannot always reproduce with a real socket: Windows named
+ * pipes have no equivalent "file exists, nobody's listening" state at all
+ * (closing the server makes the pipe disappear outright, so a probe against
+ * it gets `ENOENT`, never `ECONNREFUSED`), and this file's own test suite
+ * documents exactly which branches it could and couldn't exercise for real
+ * on the machine it was written on.
+ */
+type SocketConnector = (address: string) => Socket;
+
+function probeSocket(address: string, connector: SocketConnector): Promise<SocketProbeResult> {
+  return new Promise((resolve) => {
+    const socket = connector(address);
+    const finish = (result: SocketProbeResult): void => {
+      socket.removeListener('connect', onConnect);
+      socket.removeListener('error', onError);
+      socket.destroy();
+      resolve(result);
+    };
+    const onConnect = (): void => {
+      finish('alive');
+    };
+    const onError = (err: Error): void => {
+      // Only ECONNREFUSED says "this is a dead process's leftover file, safe
+      // to clear". Anything else (ENOENT, or a surprise like EACCES) is
+      // treated the same as "nothing to protect" rather than risking an
+      // unlink this probe can't actually justify.
+      finish(isErrnoException(err) && err.code === 'ECONNREFUSED' ? 'stale' : 'absent');
+    };
+    socket.once('connect', onConnect);
+    socket.once('error', onError);
+  });
+}
+
+/**
+ * Removes a leftover unix-socket file at `address`, if any — but only after
+ * probing that nothing is actually listening on it
+ * (docs/specs/m1.8-single-instance.md section 3.3). No-op on win32 (named
+ * pipes vanish along with the process that owns them — there is no
+ * equivalent of a POSIX socket file outliving its listener there) and when
+ * the probe finds nothing to remove.
+ *
+ * Before this fix, a second daemon starting up would unconditionally
+ * `unlink` whatever sat at `address` and then listen in its place — even
+ * with a first daemon still alive and listening on it. That second `listen()`
+ * would then succeed instead of failing with `EADDRINUSE`: the lock (section
+ * 3.1) silently stopped working, and the first daemon's already-connected
+ * clients were left holding a socket nothing was reading from anymore, with
+ * no error to explain why. Probing first — attempting a real connection
+ * before ever touching the filesystem — is what restores that guarantee:
+ * an accepted connection means stop immediately and let `listen()` fail with
+ * `EADDRINUSE` on its own, which is the correct, expected outcome for a
+ * daemon that lost the race.
+ *
+ * `platform` defaults to `process.platform` and `connector` to
+ * `net.createConnection`; both are overridable purely for tests — see
+ * `SocketConnector`'s doc comment.
+ */
+export async function removeStaleSocketFile(
+  address: string,
+  platform: NodeJS.Platform = process.platform,
+  connector: SocketConnector = createConnection,
+): Promise<void> {
+  if (platform === 'win32') {
+    return;
+  }
+  const probeResult = await probeSocket(address, connector);
+  if (probeResult !== 'stale') {
+    // 'alive': leave it for the real listen() call to fail with
+    // EADDRINUSE. 'absent': there is nothing to remove.
     return;
   }
   try {
