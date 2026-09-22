@@ -1,6 +1,8 @@
 import { join } from 'node:path';
 import { app, BrowserWindow, Menu } from 'electron';
 
+import { connectToDaemon } from './daemon-client.js';
+
 // packages/app has its own package.json without "type": "module" (unlike
 // the repo root), so main and preload build as CommonJS and __dirname is
 // available here. This is deliberate, not an oversight of the root's ESM
@@ -55,8 +57,52 @@ async function loadRenderer(mainWindow: BrowserWindow): Promise<void> {
   }
 }
 
+/**
+ * Kicks off docs/specs/m2.1-daemon-client.md's find-or-spawn-or-reconnect
+ * flow at startup and logs the outcome. Deliberately not awaited by
+ * `main()` below — the daemon connection and the window showing up are
+ * independent concerns, and a slow/backed-off daemon connection must never
+ * delay the window from appearing. M2.1's own scope stops at producing a
+ * `DaemonConnection` and surfacing it here; wiring `'blocked'`/`'failed'`
+ * into a visible warning banner, and `'connected'`'s client into an IPC
+ * bridge the renderer can actually use, is M2.2/M2.3.
+ */
+async function startDaemonConnection(): Promise<void> {
+  const result = await connectToDaemon();
+
+  switch (result.outcome) {
+    case 'connected':
+      console.log('[TermHub] connected to daemon', {
+        pid: result.info.pid,
+        pipe: result.info.pipe,
+        startedAt: result.info.startedAt,
+      });
+      return;
+    case 'blocked':
+      // Section 2: never auto-resolved. M2.2/M2.3 turn this into the
+      // visible warning banner the spec requires; this module's job stops
+      // at surfacing it clearly here.
+      console.warn('[TermHub] daemon connection blocked — will not spawn or kill', {
+        reason: result.reason,
+        pid: result.info.pid,
+        startedAt: result.info.startedAt,
+      });
+      return;
+    case 'failed':
+      console.error('[TermHub] could not find or start a daemon', {
+        attempts: result.attempts,
+        daemonPath: result.daemonPath,
+        lastError: result.lastError.message,
+      });
+  }
+}
+
 async function main(): Promise<void> {
   await app.whenReady();
+
+  startDaemonConnection().catch((error: unknown) => {
+    console.error('[TermHub] unexpected error while connecting to the daemon', error);
+  });
 
   const mainWindow = createWindow();
   await loadRenderer(mainWindow);
