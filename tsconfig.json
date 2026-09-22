@@ -3,6 +3,7 @@
   "references": [
     { "path": "packages/shared" },
     { "path": "packages/daemon" },
+    { "path": "packages/ui" },
     { "path": "packages/app" }
   ]
 }
