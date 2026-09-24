@@ -4,6 +4,18 @@ export type { TerminalProps } from './Terminal.js';
 export { TabBar } from './TabBar.js';
 export type { TabBarProps } from './TabBar.js';
 
+export {
+  canCloseWorkspace,
+  closeWorkspaceTab,
+  createWorkspaceTab,
+  generateWorkspaceId,
+  nextWorkspaceName,
+  NEW_WORKSPACE_CWD_FALLBACK,
+  NEW_WORKSPACE_NAME_BASE,
+  NEW_WORKSPACE_SIZE,
+} from './tab-bar-actions.js';
+export type { CloseWorkspaceStoreApi } from './tab-bar-actions.js';
+
 export { SplitTree } from './SplitTree.js';
 export type { SplitTreeProps } from './SplitTree.js';
 

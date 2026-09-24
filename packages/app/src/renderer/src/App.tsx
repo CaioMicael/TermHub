@@ -37,7 +37,7 @@ const shellStyle = {
   backgroundColor: '#1e1e1e',
   color: '#cccccc',
   fontFamily: '"Segoe UI", system-ui, sans-serif',
-  fontSize: '14px',
+  fontSize: '13px',
   display: 'flex',
   flexDirection: 'column',
 } as const;
@@ -178,6 +178,7 @@ export function App() {
         onSelect={(workspaceId) => {
           setActiveWorkspace(workspaceId);
         }}
+        bridge={window.termhub}
       />
       <div style={gridAreaStyle}>
         {workspaces.map((workspace) => (

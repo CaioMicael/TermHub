@@ -1,0 +1,97 @@
+/*
+ * `TabBar.tsx` visuals matching `termhub-prototipo.html`'s `.tabbar`/`.tab`/
+ * `.tab-add` rules exactly (colors below are that file's `:root` custom
+ * properties). Side-effect CSS import, same pattern `split-tree.css`
+ * documents: `:hover` and the active tab's top accent line (`::before`)
+ * aren't expressible with inline `style={{...}}` objects.
+ */
+
+.th-tab {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px 0 12px;
+  background: #2d2d2d; /* prototype --bg-tab */
+  color: #9d9d9d;
+  border-right: 1px solid #252526; /* prototype --bg-side */
+  max-width: 220px;
+  position: relative;
+  cursor: pointer;
+  user-select: none;
+}
+
+.th-tab:hover {
+  background: #2f3031;
+}
+
+.th-tab.th-tab-active {
+  background: #1e1e1e; /* prototype --bg-tab-active */
+  color: #fff;
+}
+
+.th-tab.th-tab-active::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: #0098ff; /* prototype --accent-hi */
+}
+
+.th-tab-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.th-tab-count {
+  font-size: 10px;
+  color: #858585; /* prototype --fg-dim */
+  background: #3a3a3a;
+  border-radius: 8px;
+  padding: 0 5px;
+}
+
+.th-tab-close {
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  opacity: 0.75;
+  font-size: 14px;
+  line-height: 1;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.th-tab-close:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.th-tab-close:disabled {
+  visibility: hidden;
+  cursor: default;
+}
+
+.th-tab-add {
+  width: 34px;
+  align-self: stretch;
+  display: grid;
+  place-items: center;
+  color: #c5c5c5;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+.th-tab-add:hover:not(:disabled) {
+  background: #2a2d2e; /* prototype --hover */
+}
+
+.th-tab-add:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
