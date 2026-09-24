@@ -286,6 +286,19 @@ function PaneLeafView({
         focused={focused}
         maximized={maximized}
         solo={solo}
+        // `as unknown as`: this component's own `bridge` prop is typed
+        // `TerminalBridge` (generic `request` over just 3 RPC methods,
+        // `terminal-session.ts`), while `PaneHeader`'s new `bridge` prop
+        // (M3.4's authorized contract extension) is typed
+        // `SessionActionsBridge` (generic `request` over `session.create`
+        // among others, `store/session-actions.ts`). TypeScript won't
+        // structurally unify two differently-constrained generic method
+        // signatures even though the real runtime value (`window.termhub`,
+        // `PreloadBridge`) satisfies both — its own `request` is generic
+        // over the full `RequestMethod` union, a superset of each. See
+        // M3.4's final report for why this line, not a `SplitTreeProps`
+        // change, was the fix.
+        bridge={bridge as unknown as import('./store/session-actions.js').SessionActionsBridge}
       />
       <div
         style={{
