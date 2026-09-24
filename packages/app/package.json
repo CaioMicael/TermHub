@@ -9,6 +9,7 @@
     "build": "electron-vite build"
   },
   "dependencies": {
+    "@termhub/ui": "*",
     "react": "^19.3.0",
     "react-dom": "^19.3.0"
   },

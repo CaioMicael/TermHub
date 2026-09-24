@@ -153,47 +153,91 @@ describe('startDaemon: daemon.json is never a gate (required test 4)', () => {
   });
 });
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 describe('writeDaemonJsonAtomic: no partial-write window (required test 5)', () => {
   it(
-    'a reader sampling daemon.json continuously, in a tight loop, across many repeated writes to the same path ' +
-      'never observes a truncated or malformed file — only a complete previous or complete next version, proving ' +
-      'the write goes through a temp-file-then-rename rather than a direct write to the destination. Writes are ' +
-      "sequential (never two writers racing the same rename at once — that scenario is required test 1/2's job, " +
-      "not this one's: in production there is never more than one live daemon holding the lock, so more than one " +
-      'legitimate writer to a given daemon.json never happens); what is realistic and worth stressing here is a ' +
-      'reader — a client resolving the daemon to connect to — sampling the file at the exact instant it gets ' +
-      'rewritten, repeated many times over.',
+    'several readers sampling daemon.json repeatedly, across many repeated writes to the same path, never observe ' +
+      'a truncated or malformed file — only a complete previous or complete next version, proving the write goes ' +
+      'through a temp-file-then-rename rather than a direct write to the destination. Writes are sequential (never ' +
+      "two writers racing the same rename at once — that scenario is required test 1/2's job, not this one's: in " +
+      'production there is never more than one live daemon holding the lock, so more than one legitimate writer to ' +
+      'a given daemon.json never happens); what is realistic and worth stressing here is a reader — a client ' +
+      'resolving the daemon to connect to — sampling the file at the exact instant it gets rewritten, repeated many ' +
+      'times over (several independent readers here, not one, purely to widen sampling coverage — see the ' +
+      '`readerCount` comment below). Each reader cedes the event loop between its own samples (see the sleep below) ' +
+      'instead of calling ' +
+      "readFile back-to-back with zero pause. That is not a cosmetic choice: on NTFS, `rename()` can't retarget a " +
+      "destination another handle currently has open (daemon.ts's `renameWithRetry` doc comment), and a reader " +
+      "with no pause at all keeps a handle open on daemon.json almost continuously, so the writer's bounded retry " +
+      '(20 attempts * 20ms = 400ms) can run out entirely — starving the rename outright rather than exercising the ' +
+      'atomicity guarantee this test exists to check. That is not hypothetical: measured locally (Windows/NTFS), a ' +
+      'zero-pause reader made this test fail 5/5 isolated runs on EPERM after exhausting all 20 rename attempts, ' +
+      'and pauses up to ~25ms still failed some runs — the failures cluster because 25ms is close enough to the ' +
+      "20ms retry delay that the reader's read cycle stays roughly in phase with the writer's retries instead of " +
+      'landing in the gaps between them. 30ms cleared that resonance and passed 10/10 isolated runs, so that — not ' +
+      'the 1-5ms initially guessed — is the pause used below. A realistic reader (a client polling to connect, ' +
+      "with multi-second backoff) never comes anywhere near this cadence; see required test 5's own acceptance " +
+      'evidence for the full before/after attempt-count numbers. Do not shrink the pause to make the loop ' +
+      '"tighter" — that reintroduces the starvation, not a stronger test; if you need more samples, raise ' +
+      '`totalWrites` instead, which lengthens the run without changing the pause.',
     async () => {
       const daemonJsonPath = daemonJsonPathFor('atomic');
-      const totalWrites = 40;
+      // 120 rather than a smaller round number so each reader — sampling
+      // every ~30ms (see this test's own description for why 30ms, not a
+      // smaller pause) — still gets a meaningful number of real samples
+      // over the run.
+      const totalWrites = 120;
+      const readerPauseMs = 30;
+      // Several independent readers, not one, each still pacing itself at
+      // readerPauseMs: one reader at 30ms only manages on the order of ~20
+      // samples across the whole run (measured), which is too sparse a net
+      // to reliably catch a rare truncation window — see this test's own
+      // description ("required test 5's own acceptance evidence") for the
+      // measured before/after sample counts. Multiple readers, offset from
+      // each other purely by the natural jitter of when each one starts,
+      // multiply the number of independent snapshots in time without any
+      // single one of them looping tightly.
+      const readerCount = 6;
       const readErrors: string[] = [];
       let stopReading = false;
 
-      const readerLoop = (async () => {
-        while (!stopReading) {
-          try {
-            const raw = await readFile(daemonJsonPath, 'utf8');
+      const makeReaderLoop = (): Promise<void> =>
+        (async () => {
+          while (!stopReading) {
             try {
-              const parsed = JSON.parse(raw) as Partial<Record<keyof DaemonInfo, unknown>>;
-              const looksComplete =
-                typeof parsed.pid === 'number' &&
-                typeof parsed.pipe === 'string' &&
-                typeof parsed.token === 'string' &&
-                typeof parsed.protocolVersion === 'number' &&
-                typeof parsed.startedAt === 'string';
-              if (!looksComplete) {
-                readErrors.push(`parsed but incomplete: ${raw}`);
+              const raw = await readFile(daemonJsonPath, 'utf8');
+              try {
+                const parsed = JSON.parse(raw) as Partial<Record<keyof DaemonInfo, unknown>>;
+                const looksComplete =
+                  typeof parsed.pid === 'number' &&
+                  typeof parsed.pipe === 'string' &&
+                  typeof parsed.token === 'string' &&
+                  typeof parsed.protocolVersion === 'number' &&
+                  typeof parsed.startedAt === 'string';
+                if (!looksComplete) {
+                  readErrors.push(`parsed but incomplete: ${raw}`);
+                }
+              } catch {
+                readErrors.push(`unparsable JSON (truncated write?): ${JSON.stringify(raw)}`);
               }
             } catch {
-              readErrors.push(`unparsable JSON (truncated write?): ${JSON.stringify(raw)}`);
+              // ENOENT before the very first write lands is expected and
+              // fine — that is "the previous complete state (nothing)", not
+              // a partial one.
             }
-          } catch {
-            // ENOENT before the very first write lands is expected and
-            // fine — that is "the previous complete state (nothing)", not
-            // a partial one.
+            // Cede the event loop between samples instead of looping back
+            // immediately — see this test's own description for why a
+            // near-zero pause here starves the writer's rename retry on
+            // NTFS rather than testing atomicity, and why 30ms
+            // specifically.
+            await sleep(readerPauseMs);
           }
-        }
-      })();
+        })();
+
+      const readerLoops = Array.from({ length: readerCount }, () => makeReaderLoop());
 
       for (let i = 0; i < totalWrites; i += 1) {
         await writeDaemonJsonAtomic(daemonJsonPath, {
@@ -208,7 +252,7 @@ describe('writeDaemonJsonAtomic: no partial-write window (required test 5)', () 
         });
       }
       stopReading = true;
-      await readerLoop;
+      await Promise.all(readerLoops);
 
       expect(readErrors).toEqual([]);
 

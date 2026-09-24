@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { Terminal } from '@xterm/headless';
 import { PROTOCOL_ERROR_CODE, ProtocolError } from '@termhub/shared';
 import type {
+  SessionAttachResult,
   SessionCreateResult,
   SessionExitPayload,
   SessionId,
@@ -1005,5 +1006,167 @@ describe('session.attach / session.detach (M1.7)', () => {
     expect(state).toEqual({ phase: 'live' });
 
     runtime.buffer.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M2.6 required test 1 (parte A, docs/specs/m2.6-boot-reattach.md section
+// 5): "attach -> detach -> attach com output" não pode perder nada.
+//
+// The race (section 2.1): `attachClient`'s first call registers `clientId`
+// as `snapshotting` and starts `buffer.serialize()`. Before that resolves,
+// `detachClient` removes it and a *second* `attachClient` call (same
+// `clientId`) registers a brand new `AttachState` object and starts its own
+// `serialize()`. `TerminalBuffer.serialize()` (docs/specs/
+// m1.7-attach-detach.md section 3.1) chains every call's read behind
+// `pendingWrites`, so the second call's read only starts once the first's
+// has resolved — which is exactly what makes this reproduce
+// deterministically, with no artificial "holding" of the buffer needed: by
+// construction, the first call always resumes *before* the second one does,
+// with the second call's (different) state object already sitting in
+// `runtime.attached` under the same `clientId`.
+// ---------------------------------------------------------------------------
+
+describe('session.attach: attach -> detach -> attach loses nothing (M2.6 required test 1)', () => {
+  const COLS = 24;
+  const ROWS = 8;
+
+  it('every chunk emitted before, between, during and after the detach/reattach reaches the client exactly once, in order', async () => {
+    const sessionId = 1 as SessionId;
+    const clientId = 'client-A';
+    const session = new FakeSession();
+    const runtime: SessionRuntime = {
+      buffer: new TerminalBuffer({ cols: COLS, rows: ROWS }),
+      attached: new Map(),
+    };
+    const transport = new RecordingTransport();
+    wireSessionDelivery(transport, sessionId, session, runtime);
+
+    const chunks: string[] = [];
+    const emit = (text: string): void => {
+      chunks.push(text);
+      session.emitData(text);
+    };
+
+    emit('BOOT-1\r\n'); // before the first attach — only reachable via a snapshot
+
+    // First attach: registers, starts its own (in-flight) serialize().
+    const firstAttach = attachClient(transport, sessionId, runtime, clientId);
+
+    // Detach, then reattach — synchronously, in the same tick, before the
+    // first attach's serialize() has any chance to resolve. Section 2.1's
+    // exact scenario.
+    detachClient(runtime, clientId);
+    emit('MID-1\r\n'); // written to the buffer while nobody is attached — still owed via the *second* attach's eventual snapshot, since TerminalBuffer.write() (wireSessionDelivery, unconditionally) never depends on anyone being attached (section 3.6)
+    const secondAttach = attachClient(transport, sessionId, runtime, clientId);
+
+    emit('MID-2\r\n'); // during the second attach's own in-flight serialize() — only reachable via its flushed pending queue
+
+    await Promise.all([firstAttach, secondAttach]);
+
+    emit('AFTER\r\n'); // a normal live chunk once everything has settled
+
+    const received = transport.sentData.get(clientId) ?? [];
+    const reconstructed = new Terminal({ cols: COLS, rows: ROWS, ...COMPARISON_OPTS });
+    for (const frame of received) {
+      await writeAndWait(reconstructed, frame.toString('utf8'));
+    }
+
+    const groundTruth = new Terminal({ cols: COLS, rows: ROWS, ...COMPARISON_OPTS });
+    for (const chunk of chunks) {
+      await writeAndWait(groundTruth, chunk);
+    }
+
+    expect(linesOf(reconstructed)).toEqual(linesOf(groundTruth));
+
+    // Belt-and-suspenders on top of the line-by-line comparison above: each
+    // marker reaches the client exactly once (not zero — lost, section
+    // 2.1's own failure mode — and not two — the naive "just don't ever
+    // discard" fix would duplicate MID-2).
+    const combined = Buffer.concat(received).toString('utf8');
+    for (const marker of ['BOOT-1', 'MID-1', 'MID-2', 'AFTER']) {
+      expect(combined.split(marker).length - 1).toBe(1);
+    }
+
+    reconstructed.dispose();
+    groundTruth.dispose();
+    runtime.buffer.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M2.6 part B, required test 9a (docs/specs/m2.6-boot-reattach.md section
+// 3.6): after session.resize, session.list() and session.attach's own
+// response must both report the *new* cols/rows, and the snapshot they
+// describe must actually be wrapped for that new geometry — not the
+// session's creation size.
+//
+// Before Registry#resize existed, session.resize's handler resized the
+// underlying session and the buffer directly, but never touched the
+// registry's own summary. A boot-time Terminal (packages/ui/src/Terminal.tsx,
+// section 3.5) constructs its xterm using exactly the cols/rows this
+// response carries — so a stale summary here would size that xterm to the
+// session's *old* geometry while the snapshot bytes it receives are already
+// wrapped for the *new* one, corrupting the line wrap on reattach.
+// ---------------------------------------------------------------------------
+describe('session.resize keeps the summary in sync with the buffer (M2.6 required test 9a)', () => {
+  it('session.list and session.attach report the resized cols/rows, and the snapshot is wrapped for that new size', async () => {
+    const { factory, sessions } = fakeFactory();
+    const { client } = await startHarness({ sessionFactory: factory });
+
+    const created = await client.request<SessionCreateResult>('session.create', baseCreateParams());
+    const sessionId = created.session.id;
+    const fake = sessions[0]!;
+
+    // A line that wraps differently at 80 cols (one line) than at 20 cols
+    // (two lines) — the geometry mismatch this test exists to catch would
+    // otherwise be invisible if every emitted line fit inside both widths.
+    const longLine = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'; // 37 chars
+    fake.emitData(`${longLine}\r\n`);
+
+    await client.request('session.resize', { sessionId, cols: 20, rows: 24 });
+
+    // session.list must report the resized geometry, not the creation one.
+    const listed = await client.request<SessionListResult>('session.list', {});
+    const listedSession = listed.sessions.find((s) => s.id === sessionId);
+    expect(listedSession?.cols).toBe(20);
+    expect(listedSession?.rows).toBe(24);
+
+    let received = Buffer.alloc(0);
+    client.onData((sid, data) => {
+      if (sid === sessionId) {
+        received = Buffer.concat([received, Buffer.from(data)]);
+      }
+    });
+    // session.attach's own response must also report the resized geometry —
+    // it's what a boot-time Terminal actually constructs its xterm with
+    // (section 3.5), not session.list's.
+    const attached = await client.request<SessionAttachResult>('session.attach', { sessionId });
+    expect(attached.session.cols).toBe(20);
+    expect(attached.session.rows).toBe(24);
+
+    // Reconstruct the snapshot using the geometry the response itself
+    // reported — exactly what Terminal.tsx does — and compare it, line by
+    // line, against ground truth built directly at the real (post-resize)
+    // 20-column geometry fed the same raw bytes. If the reported geometry
+    // were stale (80, pre-fix), the reconstructed terminal would wrap
+    // `longLine` onto one line while the daemon's buffer had already
+    // wrapped it onto two — a mismatch this comparison catches.
+    const reconstructed = new Terminal({
+      cols: attached.session.cols,
+      rows: attached.session.rows,
+      ...COMPARISON_OPTS,
+    });
+    await writeAndWait(reconstructed, received.toString('utf8'));
+
+    const groundTruth = new Terminal({ cols: 20, rows: 24, ...COMPARISON_OPTS });
+    await writeAndWait(groundTruth, received.toString('utf8'));
+
+    expect(linesOf(reconstructed)).toEqual(linesOf(groundTruth));
+    expect(linesOf(reconstructed).join('\n')).toContain('ABCDEFGHIJKLMNOPQRST');
+    expect(linesOf(reconstructed).join('\n')).toContain('UVWXYZ0123456789');
+
+    reconstructed.dispose();
+    groundTruth.dispose();
   });
 });
