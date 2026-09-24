@@ -51,6 +51,12 @@ function createFakeBridge(): {
         listeners.delete(listener);
       };
     },
+    // M2.5 additions to `TerminalBridge` — unused by this file's tests
+    // (they exercise attach/detach only), stubbed so the fake still
+    // satisfies the interface.
+    readClipboardText: () => Promise.resolve(''),
+    writeClipboardText: () => Promise.resolve(),
+    openContextMenu: () => Promise.resolve(undefined),
   };
 
   return {
@@ -108,6 +114,9 @@ function createDaemonLikeFakeBridge(): {
         listeners.delete(listener);
       };
     },
+    readClipboardText: () => Promise.resolve(''),
+    writeClipboardText: () => Promise.resolve(),
+    openContextMenu: () => Promise.resolve(undefined),
   };
 
   return {

@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { app, BrowserWindow, ipcMain, Menu } from 'electron';
+import { app, BrowserWindow, clipboard, ipcMain, Menu } from 'electron';
 import type { IpcMainEvent } from 'electron';
 
 import { BridgeGateway, wireWebContentsLifecycle } from './bridge-gateway.js';
@@ -106,6 +106,59 @@ async function logDaemonConnectionOutcome(
 }
 
 /**
+ * M2.5, section 2.3: builds and pops the native OS context menu ("Copiar"/
+ * "Colar") at the current cursor position (`Menu.popup({ window })` with no
+ * explicit `x`/`y` uses the cursor's position — Electron's own documented
+ * default), and resolves with the user's choice.
+ *
+ * `Menu.popup`'s own `callback` option fires once the menu closes, whether
+ * or not an item was clicked (Electron's docs: "Called when menu is
+ * closed") — including *after* a clicked item's own `click` handler has
+ * already run, not instead of it. `settle`'s `settled` guard is what turns
+ * that into "resolve with the clicked choice, or with `undefined` if the
+ * menu closed with no item chosen" instead of every popup resolving twice.
+ */
+function openContextMenu(
+  window: BrowserWindow,
+  hasSelection: boolean,
+): Promise<'copy' | 'paste' | undefined> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (choice: 'copy' | 'paste' | undefined): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve(choice);
+    };
+
+    const menu = Menu.buildFromTemplate([
+      {
+        label: 'Copiar',
+        accelerator: 'Ctrl+Shift+C',
+        enabled: hasSelection,
+        click: () => {
+          settle('copy');
+        },
+      },
+      {
+        label: 'Colar',
+        accelerator: 'Ctrl+Shift+V',
+        click: () => {
+          settle('paste');
+        },
+      },
+    ]);
+    menu.popup({
+      window,
+      callback: () => {
+        settle(undefined);
+      },
+    });
+  });
+}
+
+/**
  * Wires one window to the shared daemon connection: a `BridgeGateway`
  * (main/bridge-gateway.ts — connection-state tracking + the `DaemonRelay`
  * once connected) fed by an `ipcMain` listener scoped to exactly this
@@ -131,7 +184,19 @@ function attachDaemonBridge(
     window.webContents.send(IPC_CHANNEL.TO_RENDERER, message);
   };
 
-  const gateway = new BridgeGateway({ sendToRenderer, connectionPromise, sessionAttachments });
+  const gateway = new BridgeGateway({
+    sendToRenderer,
+    connectionPromise,
+    sessionAttachments,
+    // M2.5, section 2.4: clipboard access lives in the main process — never
+    // `navigator.clipboard` in the sandboxed renderer (see
+    // `@termhub/ui`'s `TerminalBridge.readClipboardText` doc comment).
+    clipboard: {
+      readText: () => clipboard.readText(),
+      writeText: (text) => clipboard.writeText(text),
+    },
+    openContextMenu: (hasSelection) => openContextMenu(window, hasSelection),
+  });
 
   const onFromRenderer = (event: IpcMainEvent, message: RelayInboundMessage): void => {
     if (event.sender !== window.webContents) {

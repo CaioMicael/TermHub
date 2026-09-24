@@ -4,7 +4,10 @@ import type { DaemonConnection } from './daemon-client.js';
 import { DaemonRelay, toBridgeError } from './daemon-relay.js';
 import type { DaemonRelayOptions } from './daemon-relay.js';
 import type {
+  BridgeClipboardReadMessage,
+  BridgeClipboardWriteMessage,
   BridgeConnectionState,
+  BridgeContextMenuMessage,
   BridgeRequestMessage,
   RelayInboundMessage,
   RelayOutboundMessage,
@@ -90,6 +93,34 @@ export interface BridgeGatewayOptions {
   /** Forwarded to the `DaemonRelay` created on `'connected'`. */
   coalesceWindowMs?: DaemonRelayOptions['coalesceWindowMs'];
   coalesceByteLimitBytes?: DaemonRelayOptions['coalesceByteLimitBytes'];
+  /**
+   * M2.5, section 2.4: access to the OS clipboard, backing
+   * `clipboardRead`/`clipboardWrite`. Never imports `electron` itself (this
+   * class's own no-`electron`-import contract, stated in this file's header
+   * comment) — `main/index.ts` supplies this backed by Electron's
+   * `clipboard` module. `undefined` (the default in every test that doesn't
+   * need it) answers both message kinds with a `bridge_internal_error`.
+   */
+  clipboard?: {
+    /**
+     * Electron 44's `clipboard.readText()` is itself asynchronous (a
+     * `Promise<string>`, modeled after the W3C `navigator.clipboard`
+     * API — see `electron.d.ts`'s `Clipboard` interface; this project's
+     * final report notes this as a version-specific fact worth double
+     * checking on a future Electron upgrade). This method is the same
+     * shape for that reason, not by this bridge's own choice.
+     */
+    readText(): Promise<string>;
+    writeText(text: string): Promise<void>;
+  };
+  /**
+   * M2.5, section 2.3: opens the native OS context menu and resolves with
+   * the user's choice (or `undefined` if dismissed without one).
+   * `main/index.ts` supplies this backed by `Menu.buildFromTemplate` +
+   * `Menu.popup`. `undefined` answers `contextMenu` with a
+   * `bridge_internal_error`.
+   */
+  openContextMenu?: (hasSelection: boolean) => Promise<'copy' | 'paste' | undefined>;
 }
 
 function outcomeReason(result: DaemonConnection): string | undefined {
@@ -215,6 +246,25 @@ export class BridgeGateway {
       return;
     }
 
+    // M2.5: clipboard/context-menu messages never touch the daemon at all
+    // (`DaemonRelay`/`SessionAttachments`) — they are answered directly by
+    // this gateway, using the same `requestOwners`/`sendFiltered`
+    // instance-ownership bookkeeping as an ordinary RPC request, so a stale
+    // instance's late clipboard read or menu choice is dropped the same way
+    // (`ipc-contract.ts`'s doc comments on these message kinds).
+    if (message.kind === 'clipboardRead') {
+      this.handleClipboardRead(message);
+      return;
+    }
+    if (message.kind === 'clipboardWrite') {
+      this.handleClipboardWrite(message);
+      return;
+    }
+    if (message.kind === 'contextMenu') {
+      this.handleContextMenu(message);
+      return;
+    }
+
     // `message.kind === 'request'` from here on. Every request gets a fresh,
     // gateway-wide-unique internal id — never `message.id` itself, which is
     // only unique *within one renderer instance's own counter* (see
@@ -224,9 +274,7 @@ export class BridgeGateway {
     // this method's own attach/detach handling, or `DaemonRelay`
     // asynchronously — actually dispatches and answers; `sendFiltered`
     // rewrites the id back to `originalId` only after confirming ownership.
-    const internalId = `gw-req-${this.nextInternalRequestId}`;
-    this.nextInternalRequestId += 1;
-    this.requestOwners.set(internalId, { instanceId: message.instanceId, originalId: message.id });
+    const internalId = this.mintInternalId(message.id, message.instanceId);
     const internalMessage: BridgeRequestMessage = { ...message, id: internalId };
 
     if (message.method === 'session.attach' || message.method === 'session.detach') {
@@ -318,6 +366,126 @@ export class BridgeGateway {
     this.relay = undefined;
     this.closeSubscription?.dispose();
     this.closeSubscription = undefined;
+  }
+
+  /**
+   * Mints a fresh, gateway-wide-unique internal id for one inbound message
+   * that expects a response (an RPC request, or one of M2.5's
+   * clipboard/context-menu messages) and records its owning instance in
+   * `requestOwners` — the same bookkeeping `sendFiltered` consults to drop a
+   * response whose instance has since been superseded. See
+   * `requestOwners`'s own doc comment for why this can't just reuse
+   * `originalId` directly.
+   */
+  private mintInternalId(originalId: string, instanceId: string | undefined): string {
+    const internalId = `gw-req-${this.nextInternalRequestId}`;
+    this.nextInternalRequestId += 1;
+    this.requestOwners.set(internalId, { instanceId, originalId });
+    return internalId;
+  }
+
+  private bridgeInternalErrorResponse(internalId: string, message: string): RelayOutboundMessage {
+    return {
+      kind: 'response',
+      id: internalId,
+      outcome: { ok: false, error: { code: 'bridge_internal_error', message } },
+    };
+  }
+
+  /** M2.5: `clipboardRead` — reads the OS clipboard via `options.clipboard`. */
+  private handleClipboardRead(message: BridgeClipboardReadMessage): void {
+    const internalId = this.mintInternalId(message.id, message.instanceId);
+    const clipboard = this.options.clipboard;
+    if (clipboard === undefined) {
+      this.sendFiltered(
+        this.bridgeInternalErrorResponse(
+          internalId,
+          'clipboard is not available in this environment',
+        ),
+      );
+      return;
+    }
+    void clipboard.readText().then(
+      (text) => {
+        this.sendFiltered({
+          kind: 'response',
+          id: internalId,
+          outcome: { ok: true, result: { text } },
+        });
+      },
+      (err: unknown) => {
+        this.sendFiltered({
+          kind: 'response',
+          id: internalId,
+          outcome: { ok: false, error: toBridgeError(err) },
+        });
+      },
+    );
+  }
+
+  /** M2.5: `clipboardWrite` — writes `message.text` to the OS clipboard via `options.clipboard`. */
+  private handleClipboardWrite(message: BridgeClipboardWriteMessage): void {
+    const internalId = this.mintInternalId(message.id, message.instanceId);
+    const clipboard = this.options.clipboard;
+    if (clipboard === undefined) {
+      this.sendFiltered(
+        this.bridgeInternalErrorResponse(
+          internalId,
+          'clipboard is not available in this environment',
+        ),
+      );
+      return;
+    }
+    void clipboard.writeText(message.text).then(
+      () => {
+        this.sendFiltered({ kind: 'response', id: internalId, outcome: { ok: true, result: {} } });
+      },
+      (err: unknown) => {
+        this.sendFiltered({
+          kind: 'response',
+          id: internalId,
+          outcome: { ok: false, error: toBridgeError(err) },
+        });
+      },
+    );
+  }
+
+  /**
+   * M2.5, section 2.3: `contextMenu` — opens the native menu via
+   * `options.openContextMenu` and answers once the user has made a choice
+   * (or dismissed it). The response can be arbitrarily delayed; `sendFiltered`
+   * still correctly drops it if `internalId`'s owning instance has since
+   * been superseded (a reload while the menu was open) — the same guard
+   * every other response goes through.
+   */
+  private handleContextMenu(message: BridgeContextMenuMessage): void {
+    const internalId = this.mintInternalId(message.id, message.instanceId);
+    const openContextMenu = this.options.openContextMenu;
+    if (openContextMenu === undefined) {
+      this.sendFiltered(
+        this.bridgeInternalErrorResponse(
+          internalId,
+          'context menu is not available in this environment',
+        ),
+      );
+      return;
+    }
+    void openContextMenu(message.hasSelection).then(
+      (choice) => {
+        this.sendFiltered({
+          kind: 'response',
+          id: internalId,
+          outcome: { ok: true, result: { choice } },
+        });
+      },
+      (err: unknown) => {
+        this.sendFiltered({
+          kind: 'response',
+          id: internalId,
+          outcome: { ok: false, error: toBridgeError(err) },
+        });
+      },
+    );
   }
 
   private handleHello(instanceId: string): void {

@@ -533,6 +533,185 @@ describe('BridgeGateway — M2.6 renderer instances', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// M2.5: clipboard/context-menu messages travel over the same ordered
+// channel and instance bookkeeping as any RPC request (`ipc-contract.ts`'s
+// doc comments on `BridgeClipboardReadMessage`/`BridgeContextMenuMessage`),
+// but never touch the daemon — `options.clipboard`/`options.openContextMenu`
+// are plain fakes here, exactly the shape `main/index.ts` supplies backed by
+// Electron's `clipboard` module and `Menu.popup`.
+// ---------------------------------------------------------------------------
+
+describe('BridgeGateway — M2.5 clipboard/context menu', () => {
+  it('clipboardRead/clipboardWrite round-trip over the single ordered channel, without touching REQUEST_METHODS', async () => {
+    const { promise, resolve } = deferred<DaemonConnection>();
+    const { sink, messages } = collectOutbound();
+    let written: string | undefined;
+    const gateway = new BridgeGateway({
+      sendToRenderer: sink,
+      connectionPromise: promise,
+      clipboard: {
+        readText: () => Promise.resolve('clipboard contents'),
+        writeText: (text) => {
+          written = text;
+          return Promise.resolve();
+        },
+      },
+    });
+    cleanup.push(() => gateway.dispose());
+    resolve({ outcome: 'blocked', reason: 'zombie', info: fakeInfo() });
+    await flushMicrotasks();
+    messages.length = 0;
+
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'inst-1' });
+    messages.length = 0;
+
+    gateway.handleRendererMessage({ kind: 'clipboardRead', id: 'c1', instanceId: 'inst-1' });
+    await flushMicrotasks();
+    expect(messages).toEqual([
+      { kind: 'response', id: 'c1', outcome: { ok: true, result: { text: 'clipboard contents' } } },
+    ]);
+    messages.length = 0;
+
+    gateway.handleRendererMessage({
+      kind: 'clipboardWrite',
+      id: 'c2',
+      instanceId: 'inst-1',
+      text: 'to write',
+    });
+    await flushMicrotasks();
+    expect(written).toBe('to write');
+    expect(messages).toEqual([{ kind: 'response', id: 'c2', outcome: { ok: true, result: {} } }]);
+  });
+
+  it('clipboard read/write work with no daemon connection at all — they never depend on it', async () => {
+    const { promise } = deferred<DaemonConnection>(); // never resolves — gateway stays 'connecting'
+    const { sink, messages } = collectOutbound();
+    const gateway = new BridgeGateway({
+      sendToRenderer: sink,
+      connectionPromise: promise,
+      clipboard: {
+        readText: () => Promise.resolve('still works'),
+        writeText: () => Promise.resolve(),
+      },
+    });
+    cleanup.push(() => gateway.dispose());
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'inst-1' });
+    messages.length = 0;
+
+    gateway.handleRendererMessage({ kind: 'clipboardRead', id: 'c1', instanceId: 'inst-1' });
+    await flushMicrotasks();
+    expect(messages).toEqual([
+      { kind: 'response', id: 'c1', outcome: { ok: true, result: { text: 'still works' } } },
+    ]);
+  });
+
+  it('clipboardRead without a configured clipboard fails closed with bridge_internal_error', async () => {
+    const { promise } = deferred<DaemonConnection>();
+    const { sink, messages } = collectOutbound();
+    const gateway = new BridgeGateway({ sendToRenderer: sink, connectionPromise: promise });
+    cleanup.push(() => gateway.dispose());
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'inst-1' });
+    messages.length = 0;
+
+    gateway.handleRendererMessage({ kind: 'clipboardRead', id: 'c1', instanceId: 'inst-1' });
+    await flushMicrotasks();
+    expect(messages).toEqual([
+      {
+        kind: 'response',
+        id: 'c1',
+        outcome: {
+          ok: false,
+          error: {
+            code: 'bridge_internal_error',
+            message: 'clipboard is not available in this environment',
+          },
+        },
+      },
+    ]);
+  });
+
+  it('contextMenu resolves with the choice, or undefined if dismissed — never depends on the daemon connection', async () => {
+    const { promise } = deferred<DaemonConnection>();
+    const { sink, messages } = collectOutbound();
+    let lastHasSelection: boolean | undefined;
+    let resolveMenu!: (choice: 'copy' | 'paste' | undefined) => void;
+    const gateway = new BridgeGateway({
+      sendToRenderer: sink,
+      connectionPromise: promise,
+      openContextMenu: (hasSelection) => {
+        lastHasSelection = hasSelection;
+        return new Promise((resolve) => {
+          resolveMenu = resolve;
+        });
+      },
+    });
+    cleanup.push(() => gateway.dispose());
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'inst-1' });
+    messages.length = 0;
+
+    gateway.handleRendererMessage({
+      kind: 'contextMenu',
+      id: 'm1',
+      instanceId: 'inst-1',
+      hasSelection: true,
+    });
+    expect(lastHasSelection).toBe(true);
+    expect(messages).toEqual([]); // the user hasn't picked anything yet
+
+    resolveMenu('copy');
+    await flushMicrotasks();
+    expect(messages).toEqual([
+      { kind: 'response', id: 'm1', outcome: { ok: true, result: { choice: 'copy' } } },
+    ]);
+  });
+
+  it("a context menu opened by a reloaded-away instance delivers its choice to nobody (the new instance's hello supersedes it first)", async () => {
+    const { promise } = deferred<DaemonConnection>();
+    const { sink, messages } = collectOutbound();
+    let resolveMenu!: (choice: 'copy' | 'paste' | undefined) => void;
+    const gateway = new BridgeGateway({
+      sendToRenderer: sink,
+      connectionPromise: promise,
+      openContextMenu: () =>
+        new Promise((resolve) => {
+          resolveMenu = resolve;
+        }),
+    });
+    cleanup.push(() => gateway.dispose());
+
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'instance-1' });
+    gateway.handleRendererMessage({
+      kind: 'contextMenu',
+      id: 'm1',
+      instanceId: 'instance-1',
+      hasSelection: false,
+    });
+
+    // The reload happens while the native menu is still open (the user
+    // hasn't clicked anything yet) — a fresh `hello` supersedes instance 1.
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'instance-2' });
+    messages.length = 0;
+
+    // The user finally clicks "Colar" on the (now orphaned) menu instance 1 opened.
+    resolveMenu('paste');
+    await flushMicrotasks();
+    expect(messages.filter((m) => m.kind === 'response')).toHaveLength(0);
+  });
+
+  it('REQUEST_METHODS is untouched by M2.5 — clipboard/menu are not daemon methods', async () => {
+    const { REQUEST_METHODS } = await import('./ipc-contract.js');
+    expect(REQUEST_METHODS).toEqual([
+      'session.create',
+      'session.resize',
+      'session.close',
+      'session.list',
+      'session.attach',
+      'session.detach',
+    ]);
+  });
+});
+
 function fakeInfo(): DaemonInfo {
   return {
     pid: 12345,

@@ -12,6 +12,8 @@ import {
   encodeTerminalTextInput,
   type TerminalBridge,
 } from './terminal-session.js';
+import { createClipboardKeyHandler, dispatchContextMenuChoice } from './terminal-clipboard.js';
+import { createTerminalResizeController } from './terminal-resize.js';
 import { TERMINAL_FONT_OPTIONS, ensureTerminalFontReady, terminalTheme } from './terminal-theme.js';
 import { attachWebglRenderer, type WebglRendererHandle } from './terminal-webgl.js';
 
@@ -29,11 +31,18 @@ export interface TerminalProps {
  *
  * Scope notes for later milestones (see this task's final report for the
  * full writeup):
- * - `ResizeObserver` → `fit()` → `session.resize` and clipboard handling
- *   are M2.5. This component calls `fit()` exactly once, at mount.
+ * - M2.5 (this task): `ResizeObserver` → `fit()` → `session.resize`
+ *   (`terminal-resize.ts`'s `createTerminalResizeController`, gated on the
+ *   attach's `ready` per docs/specs/m2.6-boot-reattach.md section 3.5 —
+ *   see the resize wiring below) and Ctrl+Shift+C/V + native context menu
+ *   clipboard handling (`terminal-clipboard.ts`).
  * - Multi-session reattach-on-boot and detach-on-window-close policy are
  *   M2.6; this component itself is reattach-agnostic — it just attaches to
- *   whatever `sessionId` it's given, whenever it's given one.
+ *   whatever `sessionId` it's given, whenever it's given one. M2.6 part B
+ *   (after this task) makes this component receive the session's own
+ *   initial `cols`/`rows` instead of always starting from `fit()`'s guess
+ *   — see this task's final report for what that changes about the resize
+ *   wiring below.
  * - WebGL is attached unconditionally on mount (this milestone renders
  *   exactly one, always-visible terminal). Deciding whether to attach WebGL
  *   based on pane visibility, and juggling the ~16-context Chromium budget
@@ -85,6 +94,45 @@ export function Terminal({ sessionId, bridge }: TerminalProps) {
       bridge.sendData(sessionId, encodeTerminalBinaryInput(data));
     });
 
+    // M2.5, section 2.2: the clipboard action deps shared by the keyboard
+    // shortcut handler and the context menu's dispatch below — both must
+    // agree on what "copy"/"paste" actually does (`terminal-clipboard.ts`'s
+    // header comment on why paste always goes through `term.paste`, never
+    // `sendData`).
+    const clipboardDeps = {
+      hasSelection: () => term.hasSelection(),
+      getSelection: () => term.getSelection(),
+      paste: (text: string) => {
+        term.paste(text);
+      },
+      writeClipboardText: (text: string) => bridge.writeClipboardText(text),
+      readClipboardText: () => bridge.readClipboardText(),
+      isDisposed: () => disposed,
+    };
+
+    // Ctrl+Shift+C/V are intercepted here (returning `false` keeps xterm
+    // from forwarding them to the PTY) — plain Ctrl+C/Ctrl+V fall through
+    // untouched (`createClipboardKeyHandler`'s own doc comment).
+    term.attachCustomKeyEventHandler(createClipboardKeyHandler(clipboardDeps));
+
+    // Native context menu (section 2.3) — the prototype has none of its
+    // own (docs/plan.md's UI reference for this task), so this replaces the
+    // browser's default with the OS one instead of suppressing it outright.
+    const onContextMenu = (event: MouseEvent): void => {
+      event.preventDefault();
+      bridge
+        .openContextMenu(term.hasSelection())
+        .then((choice) => {
+          if (!disposed) {
+            dispatchContextMenuChoice(choice, clipboardDeps);
+          }
+        })
+        .catch((err: unknown) => {
+          console.error('[Terminal] context menu failed', sessionId, err);
+        });
+    };
+    container.addEventListener('contextmenu', onContextMenu);
+
     // Subscribed before `term.open()` on purpose: `write` below works
     // against xterm's internal buffer whether or not the terminal is
     // attached to the DOM yet — the same mechanism `@xterm/headless` (never
@@ -109,6 +157,55 @@ export function Terminal({ sessionId, bridge }: TerminalProps) {
       // just logs instead of leaving an unhandled rejection.
       console.error('[Terminal] attach failed', sessionId, err);
     });
+
+    // M2.5's resize flow is allowed to start only once *both* of these have
+    // happened: `term.open()` (a `fit()` before that throws — there is no
+    // live DOM measurement yet) and the attach's own `ready`
+    // (docs/specs/m2.6-boot-reattach.md section 3.5: resizing ahead of the
+    // snapshot write races the session's geometry against bytes already
+    // serialized at the old one). `openedResolve` fires from inside the
+    // font-wait `.then()` below, but only for the mount that actually
+    // reaches `term.open()` — the discarded StrictMode mount never resolves
+    // it, so its `resizeController` (constructed unconditionally below,
+    // like `onDataDisposable`) simply never fits/resizes before its own
+    // cleanup disposes it.
+    //
+    // A rejected `ready` (a failed attach) still lets resizing start —
+    // `terminal-resize.ts`'s own doc comment on why: there is no snapshot
+    // left to protect once the attach itself has failed.
+    let openedResolve: () => void = () => {};
+    const opened = new Promise<void>((resolve) => {
+      openedResolve = resolve;
+    });
+    const resizeReady = Promise.all([opened, session.ready.catch(() => undefined)]).then(
+      () => undefined,
+    );
+    const resizeController = createTerminalResizeController({
+      ready: resizeReady,
+      fit: () => {
+        fitAddon.fit();
+        return { cols: term.cols, rows: term.rows };
+      },
+      resize: ({ cols, rows }) => {
+        bridge.request('session.resize', { sessionId, cols, rows }).catch((err: unknown) => {
+          console.error('[Terminal] session.resize failed', sessionId, err);
+        });
+      },
+    });
+    // `ResizeObserver` on `container` itself — the same element `fitAddon`
+    // measures against (it becomes `.xterm`'s parent once `term.open`
+    // appends it): armadilha 2 (this task's prompt) is exactly about
+    // observing/measuring a *different* box than the one `fit()` actually
+    // reads, which would desync `cols`/`rows` between what this component
+    // renders and what `fit-size.ts`'s `measureFitSize` probe agreed on.
+    const resizeObserver = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (entry === undefined) {
+        return;
+      }
+      resizeController.notifySize(entry.contentRect.width, entry.contentRect.height);
+    });
+    resizeObserver.observe(container);
 
     // Armadilha 1 (this task's prompt): xterm measures its cell size when
     // it opens. Opening before the configured font has actually resolved
@@ -143,9 +240,14 @@ export function Terminal({ sessionId, bridge }: TerminalProps) {
           return;
         }
         term.open(container);
-        // One fit at mount, per this task's scope — reacting to window/pane
-        // resize is M2.5's `ResizeObserver` wiring, not this component's.
+        // One eager fit right at open, so the terminal isn't left at
+        // xterm's 80x24 construction default until the first `ResizeObserver`
+        // callback fires — M2.5's debounced fit/resize flow (`resizeController`
+        // above) takes over from here for every size change after this.
         fitAddon.fit();
+        // Only now does `resizeController` above become allowed to run
+        // (still also gated on `session.ready` — see its own comment).
+        openedResolve();
 
         // Loaded after `open()` (WebGL needs a live canvas/DOM element),
         // with an automatic, non-throwing fallback to xterm's default
@@ -167,6 +269,12 @@ export function Terminal({ sessionId, bridge }: TerminalProps) {
       disposed = true;
       onDataDisposable.dispose();
       onBinaryDisposable.dispose();
+      container.removeEventListener('contextmenu', onContextMenu);
+      // Disconnects the observer and cancels any debounced fit/resize still
+      // pending — a resize of an already-torn-down `Terminal` must never
+      // reach the daemon (this task's prompt, section 2.1).
+      resizeObserver.disconnect();
+      resizeController.dispose();
       // Synchronous, reference-counted release — safe to call immediately,
       // whether or not `session.ready` has settled yet (that's the whole
       // point: see `terminal-session.ts`'s header comment on ownership).

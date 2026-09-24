@@ -81,10 +81,11 @@
 // live from that point on. Nothing in M2/M3 mounts two `Terminal`s for the
 // same session today; M2.6/M3 own deciding whether/how that should work.
 
-/** Every RPC method `terminal-session.ts` actually calls, keyed to its params shape. */
+/** Every RPC method `terminal-session.ts`/`Terminal.tsx` actually calls, keyed to its params shape. `session.resize` is M2.5's addition — the resize flow (`terminal-resize.ts`) calls it through the same `request` surface. */
 export interface TerminalBridgeRequestParams {
   'session.attach': { sessionId: number };
   'session.detach': { sessionId: number };
+  'session.resize': { sessionId: number; cols: number; rows: number };
 }
 
 export type TerminalBridgeMethod = keyof TerminalBridgeRequestParams;
@@ -109,6 +110,24 @@ export interface TerminalBridge {
   sendData(sessionId: number, data: Uint8Array): void;
   /** Fires for *every* attached session's output, not just this one — callers (this module) filter by `sessionId`. Returns an unsubscribe function. */
   onData(listener: (sessionId: number, data: Uint8Array) => void): () => void;
+  /**
+   * M2.5: reads the OS clipboard's current text via the main process
+   * (`clipboard.readText()`, Electron's module) — never `navigator.
+   * clipboard` (this task's prompt, section 2.2: reading it in a sandboxed
+   * renderer depends on focus/permission in ways this product can't rely
+   * on). Used by `Terminal.tsx`'s Ctrl+Shift+V handler and its context
+   * menu's "Colar".
+   */
+  readClipboardText(): Promise<string>;
+  /** M2.5: writes `text` to the OS clipboard via the main process. Used by `Terminal.tsx`'s Ctrl+Shift+C handler and its context menu's "Copiar". */
+  writeClipboardText(text: string): Promise<void>;
+  /**
+   * M2.5: opens the native OS context menu ("Copiar"/"Colar", section 2.3)
+   * with `hasSelection` controlling whether "Copiar" is enabled, and
+   * resolves with the chosen action — or `undefined` if the menu was
+   * dismissed without choosing one.
+   */
+  openContextMenu(hasSelection: boolean): Promise<'copy' | 'paste' | undefined>;
 }
 
 /** The minimal surface `attachTerminalSession` needs from a terminal to write PTY output into — real `Terminal.tsx` passes something backed by `@xterm/xterm`'s `write`; tests pass a plain recorder. */

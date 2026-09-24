@@ -232,4 +232,78 @@ describe('createBridge', () => {
     // getConnectionState() itself keeps tracking regardless of subscriptions.
     expect(bridge.getConnectionState()).toEqual({ state: 'disconnected' });
   });
+
+  // -------------------------------------------------------------------------
+  // M2.5: clipboard/context-menu — same request/response correlation
+  // machinery as `request()` (`sendAwaitable` in bridge.ts), over the same
+  // single channel, but with their own message `kind`s (never `session.*`
+  // methods — `ipc-contract.ts`'s `REQUEST_METHODS` doesn't grow for these).
+  // -------------------------------------------------------------------------
+
+  it('readClipboardText(): sends a clipboardRead message and resolves with the text', async () => {
+    const { ipc, sent, deliver } = createFakeIpc();
+    const bridge = createBridge(ipc, 'inst-1');
+
+    const resultPromise = bridge.readClipboardText();
+    const clipboardMessages = sent.filter((m) => m.kind === 'clipboardRead');
+    expect(clipboardMessages).toHaveLength(1);
+    const msg = clipboardMessages[0];
+    if (msg === undefined || msg.kind !== 'clipboardRead') {
+      throw new Error('expected a clipboardRead message');
+    }
+    expect(msg.instanceId).toBe('inst-1');
+
+    deliver({ kind: 'response', id: msg.id, outcome: { ok: true, result: { text: 'copied!' } } });
+    await expect(resultPromise).resolves.toBe('copied!');
+  });
+
+  it('writeClipboardText(): sends a clipboardWrite message carrying the text and resolves on success', async () => {
+    const { ipc, sent, deliver } = createFakeIpc();
+    const bridge = createBridge(ipc, 'inst-1');
+
+    const resultPromise = bridge.writeClipboardText('hello world');
+    const msg = sent.find((m) => m.kind === 'clipboardWrite');
+    if (msg === undefined || msg.kind !== 'clipboardWrite') {
+      throw new Error('expected a clipboardWrite message');
+    }
+    expect(msg.text).toBe('hello world');
+
+    deliver({ kind: 'response', id: msg.id, outcome: { ok: true, result: {} } });
+    await expect(resultPromise).resolves.toBeUndefined();
+  });
+
+  it('openContextMenu(): sends a contextMenu message carrying hasSelection and resolves with the choice', async () => {
+    const { ipc, sent, deliver } = createFakeIpc();
+    const bridge = createBridge(ipc, 'inst-1');
+
+    const resultPromise = bridge.openContextMenu(true);
+    const msg = sent.find((m) => m.kind === 'contextMenu');
+    if (msg === undefined || msg.kind !== 'contextMenu') {
+      throw new Error('expected a contextMenu message');
+    }
+    expect(msg.hasSelection).toBe(true);
+
+    deliver({ kind: 'response', id: msg.id, outcome: { ok: true, result: { choice: 'copy' } } });
+    await expect(resultPromise).resolves.toBe('copy');
+  });
+
+  it('readClipboardText() rejects with the plain BridgeErrorPayload on failure, same as request()', async () => {
+    const { ipc, sent, deliver } = createFakeIpc();
+    const bridge = createBridge(ipc);
+
+    const resultPromise = bridge.readClipboardText();
+    const msg = sent.find((m) => m.kind === 'clipboardRead');
+    if (msg === undefined || msg.kind !== 'clipboardRead') {
+      throw new Error('expected a clipboardRead message');
+    }
+    deliver({
+      kind: 'response',
+      id: msg.id,
+      outcome: { ok: false, error: { code: 'bridge_internal_error', message: 'no clipboard' } },
+    });
+    await expect(resultPromise).rejects.toEqual({
+      code: 'bridge_internal_error',
+      message: 'no clipboard',
+    });
+  });
 });

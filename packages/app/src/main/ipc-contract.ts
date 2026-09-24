@@ -123,7 +123,56 @@ export interface BridgeSendDataMessage {
   data: Uint8Array;
 }
 
-export type RelayInboundMessage = BridgeHelloMessage | BridgeRequestMessage | BridgeSendDataMessage;
+/**
+ * Renderer -> main (M2.5, section 2.4): reads the OS clipboard's current
+ * text. Answered with a `BridgeResponseMessage` whose `result` is
+ * `{ text: string }` — this is deliberately **not** a `RequestMethod`/
+ * `session.*` call: the daemon has no clipboard concept, and adding it to
+ * `REQUEST_METHODS` would mean `DaemonRelay` forwards it to a
+ * `TransportClient` that doesn't recognize it. Routed and instance-filtered
+ * exactly like a `BridgeRequestMessage` (`BridgeGateway.handleRendererMessage`),
+ * reusing the same `requestOwners`/`sendFiltered` machinery so a stale
+ * instance's late response is dropped the same way a stale RPC response is.
+ */
+export interface BridgeClipboardReadMessage {
+  kind: 'clipboardRead';
+  id: string;
+  instanceId?: string;
+}
+
+/** Renderer -> main (M2.5): writes `text` to the OS clipboard. Answered with `result: {}`. See `BridgeClipboardReadMessage`'s doc comment for why this is its own message kind, not a `session.*` method. */
+export interface BridgeClipboardWriteMessage {
+  kind: 'clipboardWrite';
+  id: string;
+  instanceId?: string;
+  text: string;
+}
+
+/**
+ * Renderer -> main (M2.5, section 2.3): opens the native OS context menu
+ * ("Copiar"/"Colar") at the current cursor position, with "Copiar" enabled
+ * only when `hasSelection` is true. Answered with `result: { choice: 'copy'
+ * | 'paste' | undefined }` once the menu closes — `undefined` if it was
+ * dismissed without a choice. The response can be arbitrarily delayed (the
+ * user decides when to click, or not), which is exactly why this goes
+ * through the same `requestOwners` instance-ownership check as any other
+ * request: a menu opened by a page that gets reloaded before the user picks
+ * anything must not deliver its choice to the *new* page.
+ */
+export interface BridgeContextMenuMessage {
+  kind: 'contextMenu';
+  id: string;
+  instanceId?: string;
+  hasSelection: boolean;
+}
+
+export type RelayInboundMessage =
+  | BridgeHelloMessage
+  | BridgeRequestMessage
+  | BridgeSendDataMessage
+  | BridgeClipboardReadMessage
+  | BridgeClipboardWriteMessage
+  | BridgeContextMenuMessage;
 
 /** Main -> renderer: the reply to one `BridgeRequestMessage`. */
 export interface BridgeResponseMessage {

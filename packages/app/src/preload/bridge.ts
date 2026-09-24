@@ -9,7 +9,10 @@ import type {
 
 import { IPC_CHANNEL } from '../main/ipc-contract.js';
 import type {
+  BridgeClipboardReadMessage,
+  BridgeClipboardWriteMessage,
   BridgeConnectionState,
+  BridgeContextMenuMessage,
   BridgeErrorPayload,
   BridgeHelloMessage,
   BridgeRequestMessage,
@@ -72,6 +75,12 @@ export interface PreloadBridge {
   getConnectionState(): BridgeConnectionStateSnapshot;
   /** Subscribes to connection-state changes. Returns an unsubscribe function. */
   onConnectionStateChange(listener: (state: BridgeConnectionStateSnapshot) => void): () => void;
+  /** M2.5, section 2.4: reads the OS clipboard's current text via the main process. Never `navigator.clipboard` — see `@termhub/ui`'s `TerminalBridge.readClipboardText` doc comment for why. */
+  readClipboardText(): Promise<string>;
+  /** M2.5: writes `text` to the OS clipboard via the main process. */
+  writeClipboardText(text: string): Promise<void>;
+  /** M2.5, section 2.3: opens the native OS context menu ("Copiar"/"Colar") and resolves with the user's choice, or `undefined` if dismissed without one. */
+  openContextMenu(hasSelection: boolean): Promise<'copy' | 'paste' | undefined>;
 }
 
 /**
@@ -180,6 +189,27 @@ export function createBridge(
   const hello: BridgeHelloMessage = { kind: 'hello', instanceId };
   ipc.send(IPC_CHANNEL.FROM_RENDERER, hello);
 
+  /**
+   * Shared plumbing for M2.5's three clipboard/context-menu messages: mints
+   * an id, registers it in the same `pendingRequests` map `request()` uses
+   * (a `'response'` from main resolves/rejects it identically regardless of
+   * which message kind produced it — `ipc.on` above doesn't distinguish),
+   * and sends `build(id)`.
+   */
+  function sendAwaitable<TResult>(build: (id: string) => RelayInboundMessage): Promise<TResult> {
+    const id = `bridge-req-${nextRequestSeq}`;
+    nextRequestSeq += 1;
+    return new Promise<TResult>((resolve, reject) => {
+      pendingRequests.set(id, {
+        resolve: (value) => {
+          resolve(value as TResult);
+        },
+        reject,
+      });
+      ipc.send(IPC_CHANNEL.FROM_RENDERER, build(id));
+    });
+  }
+
   return {
     request<M extends RequestMethod>(
       method: M,
@@ -227,6 +257,37 @@ export function createBridge(
       return () => {
         stateListeners.delete(listener);
       };
+    },
+
+    readClipboardText() {
+      return sendAwaitable<{ text: string }>((id) => {
+        const message: BridgeClipboardReadMessage = { kind: 'clipboardRead', id, instanceId };
+        return message;
+      }).then((result) => result.text);
+    },
+
+    writeClipboardText(text) {
+      return sendAwaitable<Record<string, never>>((id) => {
+        const message: BridgeClipboardWriteMessage = {
+          kind: 'clipboardWrite',
+          id,
+          instanceId,
+          text,
+        };
+        return message;
+      }).then(() => undefined);
+    },
+
+    openContextMenu(hasSelection) {
+      return sendAwaitable<{ choice: 'copy' | 'paste' | undefined }>((id) => {
+        const message: BridgeContextMenuMessage = {
+          kind: 'contextMenu',
+          id,
+          instanceId,
+          hasSelection,
+        };
+        return message;
+      }).then((result) => result.choice);
     },
   };
 }
