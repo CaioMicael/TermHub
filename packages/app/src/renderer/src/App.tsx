@@ -93,6 +93,7 @@ export function App() {
   const sessions = useTermhubStore((s) => s.sessions);
   const setActiveWorkspace = useTermhubStore((s) => s.setActiveWorkspace);
   const focusPaneAction = useTermhubStore((s) => s.focusPane);
+  const setRatioAction = useTermhubStore((s) => s.setRatio);
 
   useEffect(() => window.termhub.onConnectionStateChange(setConnection), []);
 
@@ -189,6 +190,7 @@ export function App() {
             }}
           >
             <SplitTree
+              workspaceId={workspace.id}
               root={workspace.root}
               sessions={sessions}
               focusedSessionId={workspace.focusedSessionId}
@@ -196,6 +198,9 @@ export function App() {
               bridge={window.termhub}
               onFocusPane={(sessionId) => {
                 focusPaneAction(workspace.id, sessionId);
+              }}
+              onSetRatio={(nodeId, ratio) => {
+                setRatioAction(workspace.id, nodeId, ratio);
               }}
             />
           </div>
