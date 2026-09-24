@@ -50,6 +50,29 @@ export interface DaemonRuntime {
    * the same settling promise instead of repeating any of this.
    */
   shutdown: () => Promise<void>;
+  /**
+   * Registers a listener called once a `shutdown()` — however it was
+   * triggered, whether `index.ts`'s own signal handler or idle-shutdown's
+   * `onIdleTimeout` below — finishes settling, successfully or not. `error`
+   * is the rejection reason when settling failed, `undefined` otherwise.
+   *
+   * This exists so `index.ts` has exactly one place to decide "the process
+   * should now exit", instead of duplicating that decision once per
+   * shutdown trigger. Before this, only the signal path called
+   * `process.exit` explicitly (in its own `.finally`); the idle path
+   * (`onIdleTimeout` below) only ever called `shutdown()` and let the event
+   * loop empty on its own — which is exactly the zombie-daemon bug this
+   * task fixes (see index.ts's own comment on `onShutdownComplete`'s
+   * registration for what was actually keeping the event loop alive).
+   *
+   * Registering after a shutdown has already settled still calls the
+   * listener (with that settled outcome) rather than silently dropping it,
+   * but production code always registers synchronously right after
+   * `runDaemon()` resolves — before any signal or idle timer could
+   * possibly have fired — so that path only matters for tests that call
+   * `shutdown()` directly before registering.
+   */
+  onShutdownComplete: (listener: (error?: unknown) => void) => void;
 }
 
 export type RunDaemonResult =
@@ -97,6 +120,11 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<RunDaem
   const service = registerSessionService(server, registry);
 
   let settling: Promise<void> | undefined;
+  const shutdownListeners: Array<(error?: unknown) => void> = [];
+
+  function onShutdownComplete(listener: (error?: unknown) => void): void {
+    shutdownListeners.push(listener);
+  }
 
   // Declared before `startIdleShutdown` so `onIdleTimeout` (invoked well
   // after this function returns) can close over it. Function declarations
@@ -115,6 +143,25 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<RunDaem
       await server.close();
       await removeDaemonJsonIfOwnedByPid(daemonJsonPath, info.pid);
     })();
+    // Notified once settling resolves or rejects, whatever listeners have
+    // been registered by then (see `onShutdownComplete`'s doc comment on
+    // `DaemonRuntime` for why registration ordering isn't a real concern in
+    // production). `void` because nothing here awaits this chain — it only
+    // exists to fan the outcome out to listeners, and a listener throwing
+    // is not this function's problem to handle (same reasoning `index.ts`'s
+    // own former `.catch` used for the signal path).
+    void settling.then(
+      () => {
+        for (const listener of shutdownListeners) {
+          listener();
+        }
+      },
+      (err: unknown) => {
+        for (const listener of shutdownListeners) {
+          listener(err);
+        }
+      },
+    );
     return settling;
   }
 
@@ -124,12 +171,12 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<RunDaem
     onIdleTimeout: () => {
       // Fire-and-forget from idle-shutdown's own perspective — see
       // idle-shutdown.ts: it only guarantees `onIdleTimeout` runs, not that
-      // anything async it kicks off is awaited by anything. There is
-      // nothing further to hand this rejection to here either; a shutdown
-      // step failing outright (e.g. `server.close()` itself erroring) is
-      // already a condition serious enough that a swallowed rejection here
-      // is the lesser problem — `index.ts` is where a real process log/exit
-      // for that belongs, not this library-level function.
+      // anything async it kicks off is awaited by anything. The outcome
+      // (success or a shutdown step failing, e.g. `server.close()` itself
+      // erroring) isn't dropped, though: `shutdown()` fans it out to
+      // whoever registered via `onShutdownComplete` above — `index.ts` is
+      // where the real process log/exit for that belongs, not this
+      // library-level function.
       void shutdown();
     },
     ...(options.idleTimeoutMs !== undefined ? { idleTimeoutMs: options.idleTimeoutMs } : {}),
@@ -140,6 +187,6 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<RunDaem
 
   return {
     outcome: 'started',
-    runtime: { info, server, registry, service, shutdown },
+    runtime: { info, server, registry, service, shutdown, onShutdownComplete },
   };
 }
