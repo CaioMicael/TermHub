@@ -1,15 +1,18 @@
+import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 
 import { PROTOCOL_ERROR_CODE, ProtocolError } from '@termhub/shared';
+import type { SessionAttachResult, SessionId } from '@termhub/shared';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { resolvePipeAddress } from '@termhub/daemon/src/transport-address.js';
 import { TransportClient } from '@termhub/daemon/src/transport-client.js';
 import { TransportServer } from '@termhub/daemon/src/transport-server.js';
 
-import { BridgeGateway } from './bridge-gateway.js';
+import { BridgeGateway, wireWebContentsLifecycle } from './bridge-gateway.js';
 import type { DaemonConnection, DaemonInfo } from './daemon-client.js';
 import type { RelayOutboundMessage } from './ipc-contract.js';
+import { SessionAttachments } from './session-attachments.js';
 
 // `BridgeGateway` is deliberately electron-free (see its own header comment)
 // so these tests construct `DaemonConnection` values by hand — exactly the
@@ -287,7 +290,13 @@ describe('BridgeGateway', () => {
     const server = new TransportServer({ token, address });
     await server.listen();
     cleanup.push(() => server.close());
-    server.registerMethod('session.attach', () => {
+    // 'session.resize', not 'session.attach': as of M2.6, 'session.attach'/
+    // 'session.detach' from the renderer no longer reach DaemonRelay at all
+    // — BridgeGateway routes them to SessionAttachments instead (docs/specs/
+    // m2.6-boot-reattach.md section 3.2). This test is about DaemonRelay's
+    // generic ProtocolError-forwarding, still exercised the same way by any
+    // other allowlisted method.
+    server.registerMethod('session.resize', () => {
       throw new ProtocolError(PROTOCOL_ERROR_CODE.SESSION_NOT_FOUND, 'session 42 not found');
     });
     const client = new TransportClient({ address, token, handshakeTimeoutMs: 1000 });
@@ -307,8 +316,8 @@ describe('BridgeGateway', () => {
     gateway.handleRendererMessage({
       kind: 'request',
       id: 'r1',
-      method: 'session.attach',
-      params: { sessionId: 42 },
+      method: 'session.resize',
+      params: { sessionId: 42, cols: 80, rows: 24 },
     });
 
     await vi.waitFor(() => expect(messages.some((m) => m.kind === 'response')).toBe(true), {
@@ -320,6 +329,207 @@ describe('BridgeGateway', () => {
       id: 'r1',
       outcome: { ok: false, error: { code: 'session_not_found', message: 'session 42 not found' } },
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M2.6 required tests 3, 4, 5 (docs/specs/m2.6-boot-reattach.md section 5,
+// parte A) — renderer-instance handshake and lifecycle, at the `BridgeGateway`
+// level. Required tests 1, 2, 6, 7 live elsewhere: 1 in
+// packages/daemon/src/service.test.ts (the daemon-side fix), 7 in
+// session-attachments.test.ts (the book's own rejection path), 2 and 6 in
+// boot-reattach.integration.test.ts (the full real-daemon pipeline).
+// ---------------------------------------------------------------------------
+
+describe('BridgeGateway — M2.6 renderer instances', () => {
+  it('required test 3: state is pulled on hello — a second hello (reload) gets the same state again, with no separate transition push in between', async () => {
+    const { client } = await startServerAndClient('pulled-state');
+    const { sink, messages } = collectOutbound();
+    const connectionPromise = Promise.resolve<DaemonConnection>({
+      outcome: 'connected',
+      client,
+      info: fakeInfo(),
+    });
+    const gateway = new BridgeGateway({ sendToRenderer: sink, connectionPromise });
+    cleanup.push(() => gateway.dispose());
+
+    // The connection settles ('connected' pushed) before any renderer is
+    // even listening — docs/specs/m2.6-boot-reattach.md's defect 2.4: a
+    // push made before the preload's own `ipc.on` is registered has no
+    // listener. Clearing `messages` here simulates a renderer that starts
+    // paying attention only from its own `hello` onward.
+    await flushMicrotasks();
+    messages.length = 0;
+
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'instance-1' });
+    expect(messages).toEqual([{ kind: 'state', state: 'connected' }]);
+
+    // A second `hello` (the reload) also gets 'connected' — the connection
+    // itself never changed, so there is no separate transition to observe
+    // in between; the *answer* to hello is what carries the state.
+    messages.length = 0;
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'instance-2' });
+    expect(messages).toEqual([{ kind: 'state', state: 'connected' }]);
+  });
+
+  it("required test 4: a stale response from instance 1 never resolves instance 2's request sharing the same numbered id (docs/specs/m2.6-boot-reattach.md section 2.5)", async () => {
+    const token = randomUUID();
+    const address = uniqueAddress('id-collision');
+    const server = new TransportServer({ token, address });
+    await server.listen();
+    cleanup.push(() => server.close());
+    const held: Array<(value: unknown) => void> = [];
+    server.registerMethod('session.list', () => new Promise((resolve) => held.push(resolve)));
+    const client = new TransportClient({ address, token, handshakeTimeoutMs: 1000 });
+    await client.connect();
+    cleanup.push(() => client.close());
+
+    const { sink, messages } = collectOutbound();
+    const connectionPromise = Promise.resolve<DaemonConnection>({
+      outcome: 'connected',
+      client,
+      info: fakeInfo(),
+    });
+    const gateway = new BridgeGateway({ sendToRenderer: sink, connectionPromise });
+    cleanup.push(() => gateway.dispose());
+    await flushMicrotasks();
+
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'instance-1' });
+    // Instance 1's request — id 'bridge-req-1', matching what `preload/
+    // bridge.ts`'s own per-page counter would generate for its first call —
+    // stays in flight (the daemon hasn't answered it yet).
+    gateway.handleRendererMessage({
+      kind: 'request',
+      id: 'bridge-req-1',
+      instanceId: 'instance-1',
+      method: 'session.list',
+      params: {},
+    });
+    await vi.waitFor(() => expect(held).toHaveLength(1));
+
+    // The reload: instance 2 arrives (superseding instance 1) and its own
+    // preload's counter also starts at 1 — the exact same wire id.
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'instance-2' });
+    gateway.handleRendererMessage({
+      kind: 'request',
+      id: 'bridge-req-1',
+      instanceId: 'instance-2',
+      method: 'session.list',
+      params: {},
+    });
+    await vi.waitFor(() => expect(held).toHaveLength(2));
+
+    // The adversarial order the spec calls out: instance 1's (now stale)
+    // request settles FIRST, after instance 2's is already in flight under
+    // the identical id.
+    held[0]?.({ sessions: [], tag: 'stale-instance-1' });
+    await flushMicrotasks();
+    expect(messages.filter((m) => m.kind === 'response')).toHaveLength(0);
+
+    held[1]?.({ sessions: [], tag: 'instance-2' });
+    await vi.waitFor(() => expect(messages.some((m) => m.kind === 'response')).toBe(true));
+
+    const responses = messages.filter((m) => m.kind === 'response');
+    expect(responses).toHaveLength(1);
+    expect(responses[0]).toEqual({
+      kind: 'response',
+      id: 'bridge-req-1',
+      outcome: { ok: true, result: { sessions: [], tag: 'instance-2' } },
+    });
+  });
+
+  it('required test 5: destroyed/render-process-gone releases the current instance — session.detach is sent, and no chunk reaches the renderer afterward', async () => {
+    const sessionId = 42 as SessionId;
+    const token = randomUUID();
+    const address = uniqueAddress('lifecycle-release');
+    const server = new TransportServer({ token, address });
+    await server.listen();
+    cleanup.push(() => server.close());
+
+    let holderClientId: string | undefined;
+    const detachCalls: SessionId[] = [];
+    server.registerMethod<{ sessionId: SessionId }, SessionAttachResult>(
+      'session.attach',
+      (params, context) => {
+        holderClientId = context.clientId;
+        return {
+          session: {
+            id: params.sessionId,
+            name: 'test',
+            cwd: 'C:\\',
+            shell: 'pwsh.exe',
+            cols: 80,
+            rows: 24,
+            status: 'running',
+            createdAt: 0,
+          },
+        };
+      },
+    );
+    server.registerMethod<{ sessionId: SessionId }, Record<string, never>>(
+      'session.detach',
+      (params) => {
+        detachCalls.push(params.sessionId);
+        return {};
+      },
+    );
+
+    const client = new TransportClient({ address, token, handshakeTimeoutMs: 1000 });
+    await client.connect();
+    cleanup.push(() => client.close());
+
+    const sessionAttachments = Promise.resolve<SessionAttachments | undefined>(
+      new SessionAttachments(client),
+    );
+    const connectionPromise = Promise.resolve<DaemonConnection>({
+      outcome: 'connected',
+      client,
+      info: fakeInfo(),
+    });
+    const { sink, messages } = collectOutbound();
+    const gateway = new BridgeGateway({
+      sendToRenderer: sink,
+      connectionPromise,
+      sessionAttachments,
+    });
+    cleanup.push(() => gateway.dispose());
+    await flushMicrotasks();
+
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'inst-1' });
+    gateway.handleRendererMessage({
+      kind: 'request',
+      id: 'r1',
+      instanceId: 'inst-1',
+      method: 'session.attach',
+      params: { sessionId },
+    });
+    await vi.waitFor(() =>
+      expect(messages.some((m) => m.kind === 'response' && m.id === 'r1')).toBe(true),
+    );
+    if (holderClientId === undefined) {
+      throw new Error('test setup invariant broken: session.attach never reached the daemon');
+    }
+
+    // A chunk reaches the renderer normally while attached.
+    server.sendDataTo(holderClientId, sessionId, new Uint8Array([1]));
+    await vi.waitFor(() => expect(messages.some((m) => m.kind === 'data')).toBe(true));
+    messages.length = 0;
+
+    // Simulate the renderer process crashing — a fake `webContents`-shaped
+    // emitter, exactly `wireWebContentsLifecycle`'s own contract (its doc
+    // comment: narrow enough to fake without any `electron` import).
+    const webContents = new EventEmitter();
+    wireWebContentsLifecycle(webContents, gateway);
+    webContents.emit('render-process-gone');
+
+    await vi.waitFor(() => expect(detachCalls).toEqual([sessionId]));
+
+    // Any chunk arriving after that — even for the same session, even
+    // still addressed to the same underlying daemon client — is dropped:
+    // routing rule 4, docs/specs/m2.6-boot-reattach.md section 3.2.
+    server.sendDataTo(holderClientId, sessionId, new Uint8Array([2]));
+    await flushMicrotasks();
+    expect(messages.some((m) => m.kind === 'data')).toBe(false);
   });
 });
 

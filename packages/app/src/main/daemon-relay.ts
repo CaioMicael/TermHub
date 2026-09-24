@@ -61,6 +61,35 @@ export interface DaemonRelayOptions {
    * whole 8ms if the daemon happens to hand it over in many small frames.
    */
   coalesceByteLimitBytes?: number;
+  /**
+   * Optional per-chunk admission gate (docs/specs/m2.6-boot-reattach.md
+   * section 3.2 routing rule 4), consulted synchronously the instant a data
+   * chunk arrives from `client.onData` — *before* it ever enters this
+   * relay's coalescer — and dropped outright if it returns `false`.
+   *
+   * This is not redundant with gating only at flush time
+   * (`sendToRenderer` only being called for an accepted session, which
+   * `bridge-gateway.ts` also does). The coalescer accumulates every
+   * incoming chunk for a session into *one* buffer regardless of
+   * attachment state; gating only when that buffer is flushed cannot stop
+   * a chunk that arrived *before* a `session.detach` from sitting in the
+   * same buffer as one that arrives *after* a following fresh
+   * `session.attach`, and being flushed together as if both belonged to
+   * the new attachment — reordering stale, pre-detach live output ahead of
+   * (or mixed into) the new attach's own snapshot.
+   *
+   * Gating at admission instead is exactly what the daemon's own FIFO
+   * guarantee (docs/specs/m2.6-boot-reattach.md section 3.2: "o daemon
+   * apaga o anexo de forma síncrona ao processar o detach e só depois
+   * escreve a resposta; o socket é FIFO") makes safe: any chunk the daemon
+   * sent while a connection was still attached arrives at `client.onData`
+   * strictly *before* that `session.detach`'s own response frame — so by
+   * the time this gate is consulted for such a chunk, whatever caller
+   * tracks attachment state (`SessionAttachments`, via `bridge-gateway.ts`)
+   * has not yet processed that response either, and still correctly
+   * reports the chunk as not currently accepted.
+   */
+  admitData?: (sessionId: SessionId) => boolean;
 }
 
 function concatUint8Arrays(chunks: readonly Uint8Array[], totalLength: number): Uint8Array {
@@ -77,8 +106,17 @@ function concatUint8Arrays(chunks: readonly Uint8Array[], totalLength: number): 
   return merged;
 }
 
-/** Converts whatever `TransportClient.request` rejected with into the plain, `contextBridge`-safe shape `ipc-contract.ts`'s `BridgeErrorPayload` documents. */
-function toBridgeError(err: unknown): BridgeErrorPayload {
+/**
+ * Converts whatever `TransportClient.request` rejected with into the plain,
+ * `contextBridge`-safe shape `ipc-contract.ts`'s `BridgeErrorPayload`
+ * documents. Exported (not just used internally) because `bridge-gateway.ts`
+ * needs the exact same mapping for `session.attach`/`session.detach`
+ * failures it now handles itself, via `SessionAttachments`, instead of
+ * forwarding them through this class (docs/specs/m2.6-boot-reattach.md
+ * section 3.2) — the renderer-visible error shape must stay identical
+ * either way.
+ */
+export function toBridgeError(err: unknown): BridgeErrorPayload {
   if (err instanceof ProtocolError) {
     return err.details === undefined
       ? { code: err.code, message: err.message }
@@ -98,6 +136,7 @@ export class DaemonRelay {
   private readonly sendToRenderer: (message: RelayOutboundMessage) => void;
   private readonly coalesceWindowMs: number;
   private readonly coalesceByteLimitBytes: number | undefined;
+  private readonly admitData: ((sessionId: SessionId) => boolean) | undefined;
   private readonly pending = new Map<SessionId, PendingSessionOutput>();
   private readonly subscriptions: Array<{ dispose: () => void }> = [];
   private disposed = false;
@@ -107,6 +146,7 @@ export class DaemonRelay {
     this.sendToRenderer = options.sendToRenderer;
     this.coalesceWindowMs = options.coalesceWindowMs ?? DEFAULT_COALESCE_WINDOW_MS;
     this.coalesceByteLimitBytes = options.coalesceByteLimitBytes;
+    this.admitData = options.admitData;
 
     this.subscriptions.push(
       this.client.onData((sessionId, data) => {
@@ -168,6 +208,31 @@ export class DaemonRelay {
     }
   }
 
+  /**
+   * Discards `sessionId`'s not-yet-flushed coalesced output, without
+   * sending it and without touching any other session's buffer or timer.
+   *
+   * docs/specs/m2.6-boot-reattach.md section 3.2 rule 5: "O relay descarta
+   * também o dado de S que ainda estava no coalescer (M2.2) quando S sai de
+   * attaching/attached para aquele holder." `bridge-gateway.ts` calls this
+   * the instant `SessionAttachments.release`/`releaseAll` stops accepting a
+   * session for the current holder — gating *only* at flush time (checking
+   * `accepts()` right before calling `sendToRenderer`) is not enough on its
+   * own: this coalescer accumulates every incoming chunk for a session into
+   * one buffer regardless of attachment state, so a chunk that arrived
+   * *before* a `release` and one that arrives *after* a following fresh
+   * `attach` can land in the *same* buffer and the *same* eventual flush if
+   * nothing empties it in between — reordering a stale, pre-detach live
+   * chunk ahead of the new attach's own snapshot in what the renderer
+   * receives. Discarding synchronously, right when the session stops being
+   * accepted, is what rules that out; a no-op if nothing is pending for
+   * `sessionId`.
+   */
+  discardPending(sessionId: SessionId): void {
+    this.clearTimer(sessionId);
+    this.pending.delete(sessionId);
+  }
+
   /** Unsubscribes from the `TransportClient`, clears every pending coalescer timer, and stops sending anything further — safe to call from a `webContents`/`BrowserWindow` `'closed'` handler with data still buffered (armadilha 5: no send after this, no timer left running). Idempotent. Does **not** touch `this.client` itself — the daemon connection and its sessions outlive one window's bridge (M2.6's job, not this one's). */
   dispose(): void {
     if (this.disposed) {
@@ -186,6 +251,12 @@ export class DaemonRelay {
 
   private onData(sessionId: SessionId, data: Uint8Array): void {
     if (this.disposed) {
+      return;
+    }
+    if (this.admitData !== undefined && !this.admitData(sessionId)) {
+      // Dropped before ever entering the coalescer — see `DaemonRelayOptions.
+      // admitData`'s doc comment for why this has to happen here, not only
+      // when a session's buffer is eventually flushed.
       return;
     }
     let entry = this.pending.get(sessionId);

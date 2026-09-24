@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
 import { IPC_CHANNEL } from '../main/ipc-contract.js';
-import type { RelayInboundMessage, RelayOutboundMessage } from '../main/ipc-contract.js';
+import type {
+  BridgeRequestMessage,
+  RelayInboundMessage,
+  RelayOutboundMessage,
+} from '../main/ipc-contract.js';
 
 import { createBridge } from './bridge.js';
 import type { MinimalIpcRenderer } from './bridge.js';
@@ -50,15 +54,27 @@ function createFakeIpc(): {
   };
 }
 
+/** Every `'request'`-kind message `sent` so far — filters out the leading `'hello'` (docs/specs/m2.6-boot-reattach.md section 3.3: `createBridge` now sends one, unprompted, before anything else) so these otherwise-M2.2 tests don't have to know or care about it beyond the one test that checks for it explicitly below. */
+function requestsOnly(sent: RelayInboundMessage[]): BridgeRequestMessage[] {
+  return sent.filter((m): m is BridgeRequestMessage => m.kind === 'request');
+}
+
 describe('createBridge', () => {
+  it('sends a hello with its instanceId before anything else (docs/specs/m2.6-boot-reattach.md section 3.3)', () => {
+    const { ipc, sent } = createFakeIpc();
+    createBridge(ipc, 'instance-fixed-1');
+
+    expect(sent).toEqual([{ kind: 'hello', instanceId: 'instance-fixed-1' }]);
+  });
+
   it('request(): sends a correlated request and resolves with the result on a matching response', async () => {
     const { ipc, sent, deliver } = createFakeIpc();
     const bridge = createBridge(ipc);
 
     const resultPromise = bridge.request('session.list', {});
-    expect(sent).toHaveLength(1);
-    const req = sent[0];
-    if (req === undefined || req.kind !== 'request') {
+    expect(requestsOnly(sent)).toHaveLength(1);
+    const req = requestsOnly(sent)[0];
+    if (req === undefined) {
       throw new Error('expected a request message');
     }
     expect(req.method).toBe('session.list');
@@ -73,8 +89,8 @@ describe('createBridge', () => {
     const bridge = createBridge(ipc);
 
     const resultPromise = bridge.request('session.attach', { sessionId: 999 });
-    const req = sent[0];
-    if (req === undefined || req.kind !== 'request') {
+    const req = requestsOnly(sent)[0];
+    if (req === undefined) {
       throw new Error('expected a request message');
     }
 
@@ -110,14 +126,8 @@ describe('createBridge', () => {
 
     const first = bridge.request('session.list', {});
     const second = bridge.request('session.list', {});
-    expect(sent).toHaveLength(2);
-    const [reqA, reqB] = sent;
-    if (
-      reqA === undefined ||
-      reqA.kind !== 'request' ||
-      reqB === undefined ||
-      reqB.kind !== 'request'
-    ) {
+    const [reqA, reqB] = requestsOnly(sent);
+    if (reqA === undefined || reqB === undefined) {
       throw new Error('expected two request messages');
     }
 
@@ -144,8 +154,7 @@ describe('createBridge', () => {
     const data = new Uint8Array([104, 105]); // "hi"
     bridge.sendData(7, data);
 
-    expect(sent).toHaveLength(1);
-    const msg = sent[0];
+    const msg = sent.find((m) => m.kind === 'sendData');
     if (msg === undefined || msg.kind !== 'sendData') {
       throw new Error('expected a sendData message');
     }

@@ -11,6 +11,7 @@ import { IPC_CHANNEL } from '../main/ipc-contract.js';
 import type {
   BridgeConnectionState,
   BridgeErrorPayload,
+  BridgeHelloMessage,
   BridgeRequestMessage,
   BridgeSendDataMessage,
   RelayInboundMessage,
@@ -73,6 +74,34 @@ export interface PreloadBridge {
   onConnectionStateChange(listener: (state: BridgeConnectionStateSnapshot) => void): () => void;
 }
 
+/**
+ * Generates one renderer-instance id (docs/specs/m2.6-boot-reattach.md
+ * section 3.3) — used as the `instanceId` on this bridge's `hello` and on
+ * every message it sends afterward. The only requirement is that it not
+ * repeat between two loads of the *same* window (a fresh boot, a
+ * `webContents.reload()`, a crash-and-recover) — not cryptographic
+ * unguessability, so the fallback below is deliberately weak.
+ *
+ * `crypto.randomUUID()` is available here: this module runs inside the
+ * preload's *isolated world*, which — even with `sandbox: true` — is a
+ * Chromium renderer-process JS context, not Node's, so `crypto` is the Web
+ * Crypto API global every modern browser exposes, not a Node built-in that
+ * would need a `require('node:crypto')` this sandboxed preload can't do for
+ * arbitrary modules. Confirmed against a real Electron window in both
+ * `npm run dev` (renderer served from `http://localhost`) and a built app
+ * (`file://`) — see this task's final report.
+ */
+function generateInstanceId(): string {
+  const webCrypto = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  if (webCrypto?.randomUUID !== undefined) {
+    return webCrypto.randomUUID();
+  }
+  // Fallback per docs/specs/m2.6-boot-reattach.md section 3.3, for a
+  // hypothetical environment without `crypto.randomUUID()` (not observed in
+  // this task's own Electron verification — see the report).
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
 interface PendingRequest {
   // Erased to `unknown` for the same reason `TransportClient.request`'s own
   // `pendingRequests` map is (see that file's comment): one bridge
@@ -84,7 +113,17 @@ interface PendingRequest {
   reject: (error: BridgeErrorPayload) => void;
 }
 
-export function createBridge(ipc: MinimalIpcRenderer): PreloadBridge {
+/**
+ * `instanceId` defaults to a freshly generated one (`generateInstanceId`) —
+ * `preload/index.ts` (the real Electron wiring) always relies on that
+ * default; tests pass an explicit one to make the M2.6 required tests
+ * (multiple instances racing on one gateway) deterministic instead of
+ * depending on two random ids never colliding.
+ */
+export function createBridge(
+  ipc: MinimalIpcRenderer,
+  instanceId: string = generateInstanceId(),
+): PreloadBridge {
   const dataListeners = new Set<(sessionId: SessionId, data: Uint8Array) => void>();
   const eventListeners = new Set<
     (event: JsonEventName, payload: EventPayloadByName[JsonEventName]) => void
@@ -131,6 +170,16 @@ export function createBridge(ipc: MinimalIpcRenderer): PreloadBridge {
     }
   });
 
+  // The very first outbound message, before any request — the main
+  // process's ordered-channel contract (docs/specs/m2.6-boot-reattach.md
+  // section 3.3) depends on nothing else jumping ahead of it. Sent only
+  // now, after the `ipc.on` listener above is already registered: `main`'s
+  // reply to this `hello` (the current connection state, pulled per defect
+  // 2.4) can arrive as early as this same synchronous call, in the fake IPC
+  // this file's own tests and `daemon-relay.integration.test.ts` use.
+  const hello: BridgeHelloMessage = { kind: 'hello', instanceId };
+  ipc.send(IPC_CHANNEL.FROM_RENDERER, hello);
+
   return {
     request<M extends RequestMethod>(
       method: M,
@@ -145,13 +194,13 @@ export function createBridge(ipc: MinimalIpcRenderer): PreloadBridge {
           },
           reject,
         });
-        const message: BridgeRequestMessage = { kind: 'request', id, method, params };
+        const message: BridgeRequestMessage = { kind: 'request', id, instanceId, method, params };
         ipc.send(IPC_CHANNEL.FROM_RENDERER, message);
       });
     },
 
     sendData(sessionId, data) {
-      const message: BridgeSendDataMessage = { kind: 'sendData', sessionId, data };
+      const message: BridgeSendDataMessage = { kind: 'sendData', instanceId, sessionId, data };
       ipc.send(IPC_CHANNEL.FROM_RENDERER, message);
     },
 

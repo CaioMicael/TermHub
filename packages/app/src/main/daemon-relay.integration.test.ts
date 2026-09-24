@@ -250,8 +250,18 @@ describe('daemon bridge — full pipeline (transport -> DaemonRelay -> IPC -> pr
   it("armadilha 1 (RPC): data queued during a request handler arrives at the renderer before that request's response", async () => {
     const { server, bridge } = await buildPipeline('armadilha1-rpc');
 
+    // 'session.resize', not 'session.attach': as of M2.6, 'session.attach'
+    // from the renderer no longer reaches DaemonRelay/this test's server at
+    // all — BridgeGateway routes it to SessionAttachments instead (docs/
+    // specs/m2.6-boot-reattach.md section 3.2), and that path's own
+    // ordering is exercised by boot-reattach.integration.test.ts's required
+    // test 2 (which deliberately does *not* assert the response follows
+    // the data — section 3.2's final paragraph explains why that specific
+    // guarantee no longer matters for session.attach). This test keeps
+    // proving the *general* DaemonRelay guarantee — flushAll() before any
+    // response — for every method that still goes through it.
     server.registerMethod<{ sessionId: number }, { session: { id: number } }>(
-      'session.attach',
+      'session.resize',
       (params, context) => {
         // Mirrors the real daemon's session.attach: the "snapshot" travels
         // as a data frame, written *before* this handler returns (and thus
@@ -265,7 +275,11 @@ describe('daemon bridge — full pipeline (transport -> DaemonRelay -> IPC -> pr
     const order: string[] = [];
     bridge.onData(() => order.push('data'));
 
-    const result = await bridge.request('session.attach', { sessionId: 7 });
+    const result = await bridge.request('session.resize', {
+      sessionId: 7,
+      cols: 80,
+      rows: 24,
+    });
     order.push('response');
 
     expect(result).toEqual({ session: { id: 7 } });

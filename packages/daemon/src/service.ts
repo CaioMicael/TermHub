@@ -421,7 +421,13 @@ export async function attachClient(
   if (runtime.attached.has(clientId)) {
     return;
   }
-  runtime.attached.set(clientId, { phase: 'snapshotting', pending: [] });
+  // Keep a reference to the exact state object *this* call registers.
+  // docs/specs/m2.6-boot-reattach.md section 3.1's fix (below) hinges on
+  // comparing against this same reference after the `await`, not on
+  // re-reading whatever happens to be in `runtime.attached` for `clientId`
+  // at that point.
+  const state: AttachState = { phase: 'snapshotting', pending: [] };
+  runtime.attached.set(clientId, state);
 
   // Do not put an `await` between the line above and the one below. As
   // written, both run in the same synchronous tick — nothing else
@@ -445,18 +451,32 @@ export async function attachClient(
   // stands here).
   const { vt, seq } = await runtime.buffer.serialize();
 
-  const current = runtime.attached.get(clientId);
-  if (current === undefined || current.phase !== 'snapshotting') {
-    // Detached (or somehow already flipped) while the snapshot was being
-    // produced — sendDataTo/sendEventTo would already no-op safely for a
-    // gone client, but there is nothing meaningful left to do here either
-    // way: no attachment to complete.
-    return;
+  // docs/specs/m2.6-boot-reattach.md section 3.1 ("attach -> detach ->
+  // attach perde output"): re-reading `runtime.attached.get(clientId)` and
+  // checking only its *phase* is wrong when a `detach` *and a brand new
+  // attach* both land while this `serialize()` was in flight — the re-read
+  // then finds the *second* attach's state object, which is also
+  // `snapshotting`, and this (the first, stale) call would complete it with
+  // its own, older snapshot and drain the second call's `pending` queue,
+  // silently dropping every chunk between the two `seq`s (M2.6 required
+  // test 1, above the M1.7 tests, constructs this exact race and was seen
+  // failing against that phase-only check).
+  //
+  // Comparing by *identity* against `state` (captured above, before the
+  // `await`) instead of by phase is what tells the two calls apart: a
+  // detach-then-reattach always installs a *new* object for `clientId`, so
+  // `runtime.attached.get(clientId) !== state` is true precisely when this
+  // call has been superseded — by a detach with no reattach yet (removed
+  // from the map), or by a detach followed by a newer attach (a different
+  // object present) — and in both cases this call has nothing left to
+  // complete.
+  if (runtime.attached.get(clientId) !== state) {
+    return; // detached, and possibly re-attached by a newer call, while serializing
   }
 
   transport.sendDataTo(clientId, sessionId, Buffer.from(vt, 'utf8'));
 
-  for (const chunk of current.pending) {
+  for (const chunk of state.pending) {
     if (chunk.seq > seq) {
       transport.sendDataTo(clientId, sessionId, chunk.data);
     }

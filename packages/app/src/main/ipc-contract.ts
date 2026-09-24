@@ -72,23 +72,58 @@ export interface BridgeErrorPayload {
   details?: unknown;
 }
 
+/**
+ * Renderer -> main: the first message a freshly loaded preload sends,
+ * before anything else (docs/specs/m2.6-boot-reattach.md section 3.3). Each
+ * page load (initial boot, a `webContents.reload()`, a crash-and-recover)
+ * gets its own `instanceId`, generated in the preload — see
+ * `preload/bridge.ts`'s `createBridge` for how, and this task's report for
+ * whether `crypto.randomUUID()` is actually available there.
+ *
+ * `main`'s job on `hello`: adopt `instanceId` as the current instance for
+ * this `webContents` (`bridge-gateway.ts`'s `BridgeGateway`), release
+ * whatever the *previous* instance (if any) still held via
+ * `SessionAttachments.releaseAll`, discard that previous instance's
+ * still-in-flight request bookkeeping, and answer with the connection's
+ * current state over the same ordered channel — closing defect 2.4 ("o
+ * renderer novo não descobre o estado da conexão") by making state
+ * *pullable*, not just pushed.
+ */
+export interface BridgeHelloMessage {
+  kind: 'hello';
+  instanceId: string;
+}
+
 /** Renderer -> main: an RPC call. `params` stays `unknown` on the wire — the typed `request<M>` surface lives only in `preload/bridge.ts`'s `PreloadBridge` interface, the layer a renderer consumer actually calls. */
 export interface BridgeRequestMessage {
   kind: 'request';
-  /** Correlates with the matching `BridgeResponseMessage.id`. Generated in the preload, per call. */
+  /** Correlates with the matching `BridgeResponseMessage.id`. Generated in the preload, per call — and, since the preload's own id counter restarts at every page load (M2.2's original design), no longer unique *across* instances on its own (docs/specs/m2.6-boot-reattach.md section 2.5). */
   id: string;
+  /**
+   * The `hello` instance this request came from (`BridgeHelloMessage`'s
+   * `instanceId`) — optional at the *type* level only so tests exercising
+   * `DaemonRelay`/`BridgeGateway` directly, without a `hello` handshake at
+   * all (`daemon-relay.test.ts`, several of `bridge-gateway.test.ts`'s own
+   * cases), don't have to fabricate one: `BridgeGateway` treats "no
+   * `instanceId` on the message" and "no `hello` ever received" as the same
+   * (both `undefined`) instance, so those tests keep working unmodified.
+   * The real preload (`preload/bridge.ts`) always sets it, on every
+   * request, once its own `hello` has gone out.
+   */
+  instanceId?: string;
   method: string;
   params: unknown;
 }
 
-/** Renderer -> main: PTY keyboard/paste input. No response, no coalescing (see `DaemonRelay.sendData`'s doc comment) — this is the latency-sensitive path the M2.2 prompt calls out by name. */
+/** Renderer -> main: PTY keyboard/paste input. No response, no coalescing (see `DaemonRelay.sendData`'s doc comment) — this is the latency-sensitive path the M2.2 prompt calls out by name. `instanceId` is optional for the same reason `BridgeRequestMessage.instanceId` is (see its doc comment). */
 export interface BridgeSendDataMessage {
   kind: 'sendData';
+  instanceId?: string;
   sessionId: SessionId;
   data: Uint8Array;
 }
 
-export type RelayInboundMessage = BridgeRequestMessage | BridgeSendDataMessage;
+export type RelayInboundMessage = BridgeHelloMessage | BridgeRequestMessage | BridgeSendDataMessage;
 
 /** Main -> renderer: the reply to one `BridgeRequestMessage`. */
 export interface BridgeResponseMessage {

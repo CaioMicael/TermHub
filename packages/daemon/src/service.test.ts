@@ -1007,3 +1007,88 @@ describe('session.attach / session.detach (M1.7)', () => {
     runtime.buffer.dispose();
   });
 });
+
+// ---------------------------------------------------------------------------
+// M2.6 required test 1 (parte A, docs/specs/m2.6-boot-reattach.md section
+// 5): "attach -> detach -> attach com output" não pode perder nada.
+//
+// The race (section 2.1): `attachClient`'s first call registers `clientId`
+// as `snapshotting` and starts `buffer.serialize()`. Before that resolves,
+// `detachClient` removes it and a *second* `attachClient` call (same
+// `clientId`) registers a brand new `AttachState` object and starts its own
+// `serialize()`. `TerminalBuffer.serialize()` (docs/specs/
+// m1.7-attach-detach.md section 3.1) chains every call's read behind
+// `pendingWrites`, so the second call's read only starts once the first's
+// has resolved — which is exactly what makes this reproduce
+// deterministically, with no artificial "holding" of the buffer needed: by
+// construction, the first call always resumes *before* the second one does,
+// with the second call's (different) state object already sitting in
+// `runtime.attached` under the same `clientId`.
+// ---------------------------------------------------------------------------
+
+describe('session.attach: attach -> detach -> attach loses nothing (M2.6 required test 1)', () => {
+  const COLS = 24;
+  const ROWS = 8;
+
+  it('every chunk emitted before, between, during and after the detach/reattach reaches the client exactly once, in order', async () => {
+    const sessionId = 1 as SessionId;
+    const clientId = 'client-A';
+    const session = new FakeSession();
+    const runtime: SessionRuntime = {
+      buffer: new TerminalBuffer({ cols: COLS, rows: ROWS }),
+      attached: new Map(),
+    };
+    const transport = new RecordingTransport();
+    wireSessionDelivery(transport, sessionId, session, runtime);
+
+    const chunks: string[] = [];
+    const emit = (text: string): void => {
+      chunks.push(text);
+      session.emitData(text);
+    };
+
+    emit('BOOT-1\r\n'); // before the first attach — only reachable via a snapshot
+
+    // First attach: registers, starts its own (in-flight) serialize().
+    const firstAttach = attachClient(transport, sessionId, runtime, clientId);
+
+    // Detach, then reattach — synchronously, in the same tick, before the
+    // first attach's serialize() has any chance to resolve. Section 2.1's
+    // exact scenario.
+    detachClient(runtime, clientId);
+    emit('MID-1\r\n'); // written to the buffer while nobody is attached — still owed via the *second* attach's eventual snapshot, since TerminalBuffer.write() (wireSessionDelivery, unconditionally) never depends on anyone being attached (section 3.6)
+    const secondAttach = attachClient(transport, sessionId, runtime, clientId);
+
+    emit('MID-2\r\n'); // during the second attach's own in-flight serialize() — only reachable via its flushed pending queue
+
+    await Promise.all([firstAttach, secondAttach]);
+
+    emit('AFTER\r\n'); // a normal live chunk once everything has settled
+
+    const received = transport.sentData.get(clientId) ?? [];
+    const reconstructed = new Terminal({ cols: COLS, rows: ROWS, ...COMPARISON_OPTS });
+    for (const frame of received) {
+      await writeAndWait(reconstructed, frame.toString('utf8'));
+    }
+
+    const groundTruth = new Terminal({ cols: COLS, rows: ROWS, ...COMPARISON_OPTS });
+    for (const chunk of chunks) {
+      await writeAndWait(groundTruth, chunk);
+    }
+
+    expect(linesOf(reconstructed)).toEqual(linesOf(groundTruth));
+
+    // Belt-and-suspenders on top of the line-by-line comparison above: each
+    // marker reaches the client exactly once (not zero — lost, section
+    // 2.1's own failure mode — and not two — the naive "just don't ever
+    // discard" fix would duplicate MID-2).
+    const combined = Buffer.concat(received).toString('utf8');
+    for (const marker of ['BOOT-1', 'MID-1', 'MID-2', 'AFTER']) {
+      expect(combined.split(marker).length - 1).toBe(1);
+    }
+
+    reconstructed.dispose();
+    groundTruth.dispose();
+    runtime.buffer.dispose();
+  });
+});

@@ -2,11 +2,12 @@ import { join } from 'node:path';
 import { app, BrowserWindow, ipcMain, Menu } from 'electron';
 import type { IpcMainEvent } from 'electron';
 
-import { BridgeGateway } from './bridge-gateway.js';
+import { BridgeGateway, wireWebContentsLifecycle } from './bridge-gateway.js';
 import { connectToDaemon } from './daemon-client.js';
 import type { DaemonConnection } from './daemon-client.js';
 import { IPC_CHANNEL } from './ipc-contract.js';
 import type { RelayInboundMessage, RelayOutboundMessage } from './ipc-contract.js';
+import { SessionAttachments } from './session-attachments.js';
 
 // packages/app has its own package.json without "type": "module" (unlike
 // the repo root), so main and preload build as CommonJS and __dirname is
@@ -121,6 +122,7 @@ async function logDaemonConnectionOutcome(
 function attachDaemonBridge(
   window: BrowserWindow,
   connectionPromise: Promise<DaemonConnection>,
+  sessionAttachments: Promise<SessionAttachments | undefined>,
 ): { dispose: () => void } {
   const sendToRenderer = (message: RelayOutboundMessage): void => {
     if (window.isDestroyed()) {
@@ -129,7 +131,7 @@ function attachDaemonBridge(
     window.webContents.send(IPC_CHANNEL.TO_RENDERER, message);
   };
 
-  const gateway = new BridgeGateway({ sendToRenderer, connectionPromise });
+  const gateway = new BridgeGateway({ sendToRenderer, connectionPromise, sessionAttachments });
 
   const onFromRenderer = (event: IpcMainEvent, message: RelayInboundMessage): void => {
     if (event.sender !== window.webContents) {
@@ -138,6 +140,30 @@ function attachDaemonBridge(
     gateway.handleRendererMessage(message);
   };
   ipcMain.on(IPC_CHANNEL.FROM_RENDERER, onFromRenderer);
+
+  // docs/specs/m2.6-boot-reattach.md section 3.3: a crashed/gone renderer
+  // process releases whatever the current instance held, without tearing
+  // this bridge down — the window (and its webContents) can still recover
+  // with a fresh `hello`. `'closed'` (wired by this function's caller, on
+  // the *window*, not `webContents`) is what fully disposes the gateway.
+  wireWebContentsLifecycle(window.webContents, gateway);
+
+  // Optional early release (section 3.3: "Você pode também chamar
+  // releaseAll em did-start-navigation do frame principal, para soltar o
+  // daemon mais cedo, mas a correção não pode depender disso") — a full
+  // page navigation (dev HMR's occasional full reload, or a real
+  // `webContents.reload()`) is about to tear down this instance's JS
+  // context well before its own `hello` fires from the new one, so this
+  // just frees the daemon-side attachment sooner. Ignored for any non-main
+  // frame — an iframe navigating (none exist in this app today, but the
+  // event fires for any frame) must never release the whole window's
+  // instance.
+  window.webContents.on('did-start-navigation', (details) => {
+    if (details.isSameDocument || !details.isMainFrame) {
+      return;
+    }
+    gateway.releaseCurrentInstance();
+  });
 
   return {
     dispose(): void {
@@ -157,8 +183,23 @@ async function main(): Promise<void> {
     console.error('[TermHub] unexpected error while connecting to the daemon', error);
   });
 
+  // docs/specs/m2.6-boot-reattach.md section 3.2: one `SessionAttachments`
+  // for the whole app, derived from the *same* `connectionPromise` every
+  // window's `BridgeGateway` already shares — never one per window.
+  // `.then()` on a single promise memoizes its result, so every gateway
+  // that awaits `sessionAttachmentsPromise` observes the identical
+  // instance. `undefined` when the daemon connection itself never reached
+  // `'connected'` (blocked/failed) — there is no `TransportClient` to hand
+  // it in that case, and `BridgeGateway`/`handleAttachmentRequest` already
+  // handle an absent book by rejecting `session.attach`/`session.detach`
+  // the same way every other method fails without a connection.
+  const sessionAttachmentsPromise: Promise<SessionAttachments | undefined> = connectionPromise.then(
+    (result) =>
+      result.outcome === 'connected' ? new SessionAttachments(result.client) : undefined,
+  );
+
   const mainWindow = createWindow();
-  const bridge = attachDaemonBridge(mainWindow, connectionPromise);
+  const bridge = attachDaemonBridge(mainWindow, connectionPromise, sessionAttachmentsPromise);
   mainWindow.on('closed', () => {
     bridge.dispose();
   });
@@ -170,7 +211,7 @@ async function main(): Promise<void> {
     }
 
     const nextWindow = createWindow();
-    const nextBridge = attachDaemonBridge(nextWindow, connectionPromise);
+    const nextBridge = attachDaemonBridge(nextWindow, connectionPromise, sessionAttachmentsPromise);
     nextWindow.on('closed', () => {
       nextBridge.dispose();
     });
