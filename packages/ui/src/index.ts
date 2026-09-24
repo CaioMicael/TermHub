@@ -1,6 +1,15 @@
 export { Terminal } from './Terminal.js';
 export type { TerminalProps } from './Terminal.js';
 
+export { TabBar } from './TabBar.js';
+export type { TabBarProps } from './TabBar.js';
+
+export { SplitTree } from './SplitTree.js';
+export type { SplitTreeProps } from './SplitTree.js';
+
+export { PaneHeader } from './PaneHeader.js';
+export type { PaneHeaderProps } from './PaneHeader.js';
+
 export {
   attachTerminalSession,
   encodeTerminalBinaryInput,
@@ -27,3 +36,73 @@ export type {
   WebglFallbackReason,
   WebglRendererHandle,
 } from './terminal-webgl.js';
+
+// ─── Store (M3.1): workspace/pane-tree model, reducers, selectors ─────────
+
+export {
+  clampRatio,
+  collectSessionIds,
+  closePane,
+  makeLeaf,
+  movePane,
+  setRatio,
+  splitPane,
+  treeFromSessions,
+  treeLeaves,
+  DEFAULT_RATIO,
+  MAX_RATIO,
+  MIN_RATIO,
+} from './store/tree.js';
+export type {
+  CloseOutcome,
+  MoveEdge,
+  MoveOutcome,
+  PaneLeaf,
+  PaneNode,
+  PaneSplitNode,
+  SetRatioOutcome,
+  SplitDirection,
+  SplitOutcome,
+} from './store/tree.js';
+
+export {
+  addWorkspace,
+  closePaneInWorkspace,
+  closeWorkspace,
+  focusPane,
+  movePaneInWorkspace,
+  removeSession,
+  renameWorkspace,
+  reorderWorkspaces,
+  setActiveWorkspace,
+  setRatioInWorkspace,
+  splitInWorkspace,
+  toggleMaximize,
+  upsertSession,
+} from './store/workspace.js';
+export type { StoreState, Workspace } from './store/workspace.js';
+
+export {
+  selectAggregatedWorkspaceStatus,
+  selectSessionCount,
+  selectWorkspaceLeaves,
+} from './store/selectors.js';
+
+export { initialStoreState, useTermhubStore } from './store/store.js';
+export type { TermhubStore, TermhubStoreActions } from './store/store.js';
+
+export {
+  closePaneAction,
+  createWorkspaceWithNewSession,
+  estimateSplitSize,
+  splitPaneWithNewSession,
+  NEW_SESSION_SHELL,
+} from './store/session-actions.js';
+export type {
+  SessionActionsBridge,
+  SessionActionsMethod,
+  SessionActionsRequestParams,
+  SessionActionsRequestResult,
+  SessionActionsStoreApi,
+  Size,
+} from './store/session-actions.js';

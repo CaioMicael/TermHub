@@ -7,11 +7,13 @@
   "types": "./src/index.ts",
   "scripts": {},
   "dependencies": {
+    "@termhub/shared": "*",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-unicode11": "^0.9.0",
     "@xterm/addon-web-links": "^0.12.0",
     "@xterm/addon-webgl": "^0.19.0",
-    "@xterm/xterm": "^6.0.0"
+    "@xterm/xterm": "^6.0.0",
+    "zustand": "^5.0.15"
   },
   "peerDependencies": {
     "react": "^19.3.0"
