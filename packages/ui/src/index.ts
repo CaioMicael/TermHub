@@ -16,3 +16,14 @@ export type {
 
 export { measureFitSize } from './fit-size.js';
 export type { FitSize } from './fit-size.js';
+
+export { TERMINAL_SOLO_PADDING, terminalTheme, ensureTerminalFontReady } from './terminal-theme.js';
+
+export { attachWebglRenderer } from './terminal-webgl.js';
+export type {
+  DisposableLike,
+  TerminalForWebgl,
+  WebglAddonLike,
+  WebglFallbackReason,
+  WebglRendererHandle,
+} from './terminal-webgl.js';

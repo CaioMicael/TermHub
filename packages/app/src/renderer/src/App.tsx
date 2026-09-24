@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Terminal, measureFitSize } from '@termhub/ui';
+import { Terminal, measureFitSize, TERMINAL_SOLO_PADDING } from '@termhub/ui';
 
 import { resolveBootSession } from './session-boot.js';
 
@@ -10,6 +10,21 @@ import { resolveBootSession } from './session-boot.js';
 // warning strip the prototype shows for daemon trouble is also not this
 // task's (a plain status line stands in for it here); see this task's final
 // report.
+//
+// M2.4 addendum (this task): `soloPaneStyle` below applies the prototype's
+// `.pane.solo .term { padding: 8px 14px 14px }` — `TERMINAL_SOLO_PADDING`,
+// the same constant `@termhub/ui` exports for anything measuring the same
+// space. It wraps `containerRef` (the div `measureFitSize` measures and
+// `Terminal` mounts into) rather than applying padding directly to
+// `containerRef` itself: `@xterm/addon-fit` reads padding off xterm's own
+// generated `.xterm` element and reads width/height off *that element's
+// parent* — so padding on `containerRef` (which becomes that parent) would
+// double-count against `@xterm/addon-fit`'s own arithmetic, while an
+// unpadded `containerRef` inset by an *outer* padded wrapper (CSS
+// percentage sizing resolves against the parent's content box regardless of
+// `box-sizing`) keeps `containerRef`'s measured box identical to the space
+// actually available to the terminal, for both `measureFitSize`'s probe and
+// the real `Terminal`.
 
 type SessionBootState =
   | { phase: 'measuring' }
@@ -31,6 +46,14 @@ const statusStyle = {
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'center',
+} as const;
+
+const soloPaneStyle = {
+  width: '100%',
+  height: '100%',
+  backgroundColor: '#1e1e1e',
+  boxSizing: 'border-box',
+  padding: `${TERMINAL_SOLO_PADDING.top}px ${TERMINAL_SOLO_PADDING.right}px ${TERMINAL_SOLO_PADDING.bottom}px ${TERMINAL_SOLO_PADDING.left}px`,
 } as const;
 
 /** Renders whatever `window.termhub`'s current connection state warrants when it isn't `'connected'`, or `null` once it is (the caller then proceeds to session boot). */
@@ -78,9 +101,12 @@ export function App() {
     // Measured before session.create so a freshly spawned PTY is born the
     // size it will actually render into, instead of a fixed default that
     // `session.resize` would otherwise have to correct on the first real
-    // resize (M2.5) — see `measureFitSize`'s own doc comment.
-    const { cols, rows } = measureFitSize(container);
-    resolveBootSession(window.termhub, { cols, rows })
+    // resize (M2.5) — see `measureFitSize`'s own doc comment. `measureFitSize`
+    // is async as of M2.4 (it awaits the configured font before measuring —
+    // `terminal-theme.ts`'s `ensureTerminalFontReady`), so `resolveBootSession`
+    // is chained off it instead of running in parallel.
+    measureFitSize(container)
+      .then(({ cols, rows }) => resolveBootSession(window.termhub, { cols, rows }))
       .then((session) => {
         if (!cancelled) {
           setSessionState({ phase: 'ready', sessionId: session.id });
@@ -110,14 +136,16 @@ export function App() {
 
   return (
     <div style={shellStyle}>
-      <div ref={containerRef} style={{ width: '100%', height: '100%' }}>
-        {sessionState.phase === 'measuring' && <div style={statusStyle}>Preparando sessão…</div>}
-        {sessionState.phase === 'error' && (
-          <div style={statusStyle}>Não foi possível abrir uma sessão: {sessionState.message}</div>
-        )}
-        {sessionState.phase === 'ready' && (
-          <Terminal sessionId={sessionState.sessionId} bridge={window.termhub} />
-        )}
+      <div style={soloPaneStyle}>
+        <div ref={containerRef} style={{ width: '100%', height: '100%' }}>
+          {sessionState.phase === 'measuring' && <div style={statusStyle}>Preparando sessão…</div>}
+          {sessionState.phase === 'error' && (
+            <div style={statusStyle}>Não foi possível abrir uma sessão: {sessionState.message}</div>
+          )}
+          {sessionState.phase === 'ready' && (
+            <Terminal sessionId={sessionState.sessionId} bridge={window.termhub} />
+          )}
+        </div>
       </div>
     </div>
   );
