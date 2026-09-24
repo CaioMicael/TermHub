@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { Terminal } from '@xterm/headless';
 import { PROTOCOL_ERROR_CODE, ProtocolError } from '@termhub/shared';
 import type {
+  SessionAttachResult,
   SessionCreateResult,
   SessionExitPayload,
   SessionId,
@@ -1090,5 +1091,82 @@ describe('session.attach: attach -> detach -> attach loses nothing (M2.6 require
     reconstructed.dispose();
     groundTruth.dispose();
     runtime.buffer.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M2.6 part B, required test 9a (docs/specs/m2.6-boot-reattach.md section
+// 3.6): after session.resize, session.list() and session.attach's own
+// response must both report the *new* cols/rows, and the snapshot they
+// describe must actually be wrapped for that new geometry — not the
+// session's creation size.
+//
+// Before Registry#resize existed, session.resize's handler resized the
+// underlying session and the buffer directly, but never touched the
+// registry's own summary. A boot-time Terminal (packages/ui/src/Terminal.tsx,
+// section 3.5) constructs its xterm using exactly the cols/rows this
+// response carries — so a stale summary here would size that xterm to the
+// session's *old* geometry while the snapshot bytes it receives are already
+// wrapped for the *new* one, corrupting the line wrap on reattach.
+// ---------------------------------------------------------------------------
+describe('session.resize keeps the summary in sync with the buffer (M2.6 required test 9a)', () => {
+  it('session.list and session.attach report the resized cols/rows, and the snapshot is wrapped for that new size', async () => {
+    const { factory, sessions } = fakeFactory();
+    const { client } = await startHarness({ sessionFactory: factory });
+
+    const created = await client.request<SessionCreateResult>('session.create', baseCreateParams());
+    const sessionId = created.session.id;
+    const fake = sessions[0]!;
+
+    // A line that wraps differently at 80 cols (one line) than at 20 cols
+    // (two lines) — the geometry mismatch this test exists to catch would
+    // otherwise be invisible if every emitted line fit inside both widths.
+    const longLine = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'; // 37 chars
+    fake.emitData(`${longLine}\r\n`);
+
+    await client.request('session.resize', { sessionId, cols: 20, rows: 24 });
+
+    // session.list must report the resized geometry, not the creation one.
+    const listed = await client.request<SessionListResult>('session.list', {});
+    const listedSession = listed.sessions.find((s) => s.id === sessionId);
+    expect(listedSession?.cols).toBe(20);
+    expect(listedSession?.rows).toBe(24);
+
+    let received = Buffer.alloc(0);
+    client.onData((sid, data) => {
+      if (sid === sessionId) {
+        received = Buffer.concat([received, Buffer.from(data)]);
+      }
+    });
+    // session.attach's own response must also report the resized geometry —
+    // it's what a boot-time Terminal actually constructs its xterm with
+    // (section 3.5), not session.list's.
+    const attached = await client.request<SessionAttachResult>('session.attach', { sessionId });
+    expect(attached.session.cols).toBe(20);
+    expect(attached.session.rows).toBe(24);
+
+    // Reconstruct the snapshot using the geometry the response itself
+    // reported — exactly what Terminal.tsx does — and compare it, line by
+    // line, against ground truth built directly at the real (post-resize)
+    // 20-column geometry fed the same raw bytes. If the reported geometry
+    // were stale (80, pre-fix), the reconstructed terminal would wrap
+    // `longLine` onto one line while the daemon's buffer had already
+    // wrapped it onto two — a mismatch this comparison catches.
+    const reconstructed = new Terminal({
+      cols: attached.session.cols,
+      rows: attached.session.rows,
+      ...COMPARISON_OPTS,
+    });
+    await writeAndWait(reconstructed, received.toString('utf8'));
+
+    const groundTruth = new Terminal({ cols: 20, rows: 24, ...COMPARISON_OPTS });
+    await writeAndWait(groundTruth, received.toString('utf8'));
+
+    expect(linesOf(reconstructed)).toEqual(linesOf(groundTruth));
+    expect(linesOf(reconstructed).join('\n')).toContain('ABCDEFGHIJKLMNOPQRST');
+    expect(linesOf(reconstructed).join('\n')).toContain('UVWXYZ0123456789');
+
+    reconstructed.dispose();
+    groundTruth.dispose();
   });
 });

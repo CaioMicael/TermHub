@@ -77,6 +77,41 @@ describe('resolveBootSession', () => {
     expect(listCalls).toHaveLength(1);
   });
 
+  // docs/specs/m2.6-boot-reattach.md section 3.4, required test 8: among
+  // several live sessions, boot picks the one with the highest `createdAt`
+  // — not just "the first one `session.list` happened to return".
+  it('reuses the live session with the highest createdAt when several are live', async () => {
+    const older = summary({ id: 5, status: 'idle', createdAt: 1_000 });
+    const newest = summary({ id: 7, status: 'running', createdAt: 3_000 });
+    const middle = summary({ id: 6, status: 'awaiting-input', createdAt: 2_000 });
+    // Deliberately out of createdAt order, so a naive `.find()`/"first
+    // non-exited" policy would pick `older` instead.
+    const { bridge, createCalls } = createFakeBridge([older, newest, middle], summary({ id: 99 }));
+
+    const result = await resolveBootSession(bridge, { cols: 80, rows: 24 });
+
+    expect(result).toEqual(newest);
+    expect(createCalls).toHaveLength(0);
+  });
+
+  // Exited sessions are left alone (M4's graveyard), never picked over a
+  // live one, however new their own createdAt might be.
+  it('ignores exited sessions even when their createdAt is the highest', async () => {
+    const live = summary({ id: 5, status: 'idle', createdAt: 1_000 });
+    const exitedButNewer = summary({
+      id: 6,
+      status: 'exited',
+      exitCode: 0,
+      createdAt: 5_000,
+    });
+    const { bridge, createCalls } = createFakeBridge([live, exitedButNewer], summary({ id: 99 }));
+
+    const result = await resolveBootSession(bridge, { cols: 80, rows: 24 });
+
+    expect(result).toEqual(live);
+    expect(createCalls).toHaveLength(0);
+  });
+
   it('does not reuse an exited session — creates a new one instead', async () => {
     const exited = summary({ id: 5, status: 'exited', exitCode: 0 });
     const created = summary({ id: 6, status: 'running' });

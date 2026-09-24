@@ -28,7 +28,7 @@ import { resolveBootSession } from './session-boot.js';
 
 type SessionBootState =
   | { phase: 'measuring' }
-  | { phase: 'ready'; sessionId: number }
+  | { phase: 'ready'; sessionId: number; cols: number; rows: number }
   | { phase: 'error'; message: string };
 
 const shellStyle = {
@@ -109,7 +109,22 @@ export function App() {
       .then(({ cols, rows }) => resolveBootSession(window.termhub, { cols, rows }))
       .then((session) => {
         if (!cancelled) {
-          setSessionState({ phase: 'ready', sessionId: session.id });
+          // `session.cols`/`session.rows` — never the `measureFitSize`
+          // result computed just above — are what `Terminal` constructs its
+          // xterm with (docs/specs/m2.6-boot-reattach.md section 3.5). For
+          // a freshly created session the two happen to be equal (`session-
+          // boot.ts` sizes `session.create` with exactly this window's
+          // measured fit), but for a *reused* session they're the daemon's
+          // real, possibly-different, current geometry (the last
+          // `session.resize`) — using the window's fresh measurement there
+          // instead would size the xterm to the wrong geometry for a
+          // snapshot already serialized at the session's own.
+          setSessionState({
+            phase: 'ready',
+            sessionId: session.id,
+            cols: session.cols,
+            rows: session.rows,
+          });
         }
         return undefined;
       })
@@ -143,7 +158,12 @@ export function App() {
             <div style={statusStyle}>Não foi possível abrir uma sessão: {sessionState.message}</div>
           )}
           {sessionState.phase === 'ready' && (
-            <Terminal sessionId={sessionState.sessionId} bridge={window.termhub} />
+            <Terminal
+              sessionId={sessionState.sessionId}
+              cols={sessionState.cols}
+              rows={sessionState.rows}
+              bridge={window.termhub}
+            />
           )}
         </div>
       </div>

@@ -299,4 +299,45 @@ describe('Registry', () => {
     // to spawn a session for an id that couldn't be issued.
     expect(sessions).toHaveLength(0);
   });
+
+  // docs/specs/m2.6-boot-reattach.md section 3.6 / test 9a: before this
+  // method existed, session.resize's handler (service.ts) called
+  // `registered.session.resize(...)` directly and never touched the
+  // registry's own summary, so `session.list`/`session.attach` kept
+  // reporting the session's *creation* geometry forever. A boot-time
+  // Terminal sizes its xterm construction from that summary (section 3.5),
+  // so a stale one there would create the xterm at the wrong geometry and
+  // then write a snapshot serialized at the new one — the exact line-wrap
+  // corruption section 3.5 exists to avoid.
+  it('resize() resizes the session AND updates the summary registry.list()/get() report', () => {
+    const { factory } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    const created = registry.create(baseParams({ cols: 80, rows: 24 }));
+    const fake = registry.get(created.id)?.session as FakeSession;
+
+    registry.resize(created.id, 120, 40);
+
+    expect(fake.resizes).toEqual([{ cols: 120, rows: 40 }]);
+    expect(registry.get(created.id)?.summary).toMatchObject({ cols: 120, rows: 40 });
+    expect(registry.list().find((s) => s.id === created.id)).toMatchObject({
+      cols: 120,
+      rows: 40,
+    });
+  });
+
+  it('resize() on an unknown id throws SESSION_NOT_FOUND, same as the handler used to throw itself', () => {
+    const { factory } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    let thrown: unknown;
+    try {
+      registry.resize(999_999, 80, 24);
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(ProtocolError);
+    expect((thrown as ProtocolError).code).toBe(PROTOCOL_ERROR_CODE.SESSION_NOT_FOUND);
+  });
 });

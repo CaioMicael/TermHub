@@ -217,4 +217,33 @@ export class Registry {
     record.session.kill();
     this.sessions.delete(id);
   }
+
+  /**
+   * Resizes `id`'s underlying session and updates its `summary` to the new
+   * `cols`/`rows` in the same call — the same "swap the whole summary
+   * object" approach `onExit`'s listener above already uses for `status`.
+   *
+   * Before this method existed, `session.resize`'s handler
+   * (packages/daemon/src/service.ts) called `registered.session.resize(...)`
+   * directly and never touched the registry's own copy of the summary, so
+   * `session.list`/`session.attach` kept reporting the session's *creation*
+   * size forever (M2.5's own final report flagged this gap; docs/specs/
+   * m2.6-boot-reattach.md section 3.6 is where it gets closed). The
+   * `SessionSummary.cols`/`rows` a boot-time `Terminal` uses to size its
+   * xterm construction (section 3.5) come from exactly this summary, so a
+   * stale one there would make a reattached terminal born at the wrong
+   * geometry — the very line-wrap corruption section 3.5 exists to avoid.
+   *
+   * Throws the same `session_not_found` `ProtocolError` the caller already
+   * throws today for an unknown id, so `service.ts`'s handler can rely on
+   * this method for that check too.
+   */
+  resize(id: SessionId, cols: number, rows: number): void {
+    const record = this.sessions.get(id);
+    if (record === undefined) {
+      throw new ProtocolError(PROTOCOL_ERROR_CODE.SESSION_NOT_FOUND, `no session with id ${id}`);
+    }
+    record.session.resize(cols, rows);
+    record.summary = { ...record.summary, cols, rows };
+  }
 }

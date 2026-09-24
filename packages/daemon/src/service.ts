@@ -183,13 +183,12 @@ export function registerSessionService(
   });
 
   server.registerMethod<SessionResizeParams, SessionResizeResult>('session.resize', (params) => {
-    const registered = registry.get(params.sessionId);
-    if (registered === undefined) {
-      throw new ProtocolError(
-        PROTOCOL_ERROR_CODE.SESSION_NOT_FOUND,
-        `no session with id ${params.sessionId}`,
-      );
-    }
+    // `Registry#resize` both resizes the underlying session and updates the
+    // registry's own `summary` copy (docs/specs/m2.6-boot-reattach.md
+    // section 3.6) — it throws the same `session_not_found` `ProtocolError`
+    // this handler used to throw itself for an unknown id, so there's no
+    // separate existence check here anymore.
+    //
     // Synchronous on purpose (no `await` anywhere in this handler): a
     // `MethodHandler` may return a plain value or a `Promise`, and
     // `TransportServer.handleRequest` invokes it synchronously before its
@@ -199,8 +198,11 @@ export function registerSessionService(
     // `registerDataHandler`'s handler (wired to `writeSessionInput` below)
     // makes the same promise for binary input frames, which together is
     // what keeps a resize and the keystrokes sent right after it applied in
-    // the order they arrived on the wire.
-    registered.session.resize(params.cols, params.rows);
+    // the order they arrived on the wire. It's also what keeps the
+    // registry's `summary` and the buffer's geometry from ever diverging
+    // between one `await` and another (section 3.6): no `await` separates
+    // `registry.resize` from `buffer.resize` below.
+    registry.resize(params.sessionId, params.cols, params.rows);
     // The buffer's geometry has to track the real terminal's, or a client
     // attaching later gets a snapshot sized for the *old* dimensions
     // (docs/specs/m1.7-attach-detach.md section 3.2).

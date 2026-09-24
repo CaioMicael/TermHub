@@ -18,8 +18,19 @@ import { TERMINAL_FONT_OPTIONS, ensureTerminalFontReady, terminalTheme } from '.
 import { attachWebglRenderer, type WebglRendererHandle } from './terminal-webgl.js';
 
 export interface TerminalProps {
-  /** The daemon session this terminal attaches to. Assumed to already exist — creating one is the app's job (see `packages/app/src/renderer/src`'s provisional boot policy), not this component's. */
+  /** The daemon session this terminal attaches to. Assumed to already exist — creating one is the app's job (see `packages/app/src/renderer/src`'s boot policy), not this component's. */
   sessionId: number;
+  /**
+   * The session's own geometry — its `SessionSummary.cols`/`rows`, straight
+   * from `session.list`/`session.create` (docs/specs/m2.6-boot-reattach.md
+   * section 3.5). The xterm instance below is *constructed* with these
+   * (never with xterm's 80x24 default), because the snapshot `session.
+   * attach` writes into it is already serialized at this exact geometry —
+   * see the constructor call below for why that has to happen before
+   * `open()`, not just before `fit()`.
+   */
+  cols: number;
+  rows: number;
   /** Pass a stable reference (e.g. `window.termhub` itself) — a new object identity every render would tear down and re-attach the effect below for no reason. */
   bridge: TerminalBridge;
 }
@@ -39,17 +50,15 @@ export interface TerminalProps {
  * - Multi-session reattach-on-boot and detach-on-window-close policy are
  *   M2.6; this component itself is reattach-agnostic — it just attaches to
  *   whatever `sessionId` it's given, whenever it's given one. M2.6 part B
- *   (after this task) makes this component receive the session's own
- *   initial `cols`/`rows` instead of always starting from `fit()`'s guess
- *   — see this task's final report for what that changes about the resize
- *   wiring below.
+ *   is what makes this component receive the session's own `cols`/`rows`
+ *   (below) instead of always starting from `fit()`'s guess.
  * - WebGL is attached unconditionally on mount (this milestone renders
  *   exactly one, always-visible terminal). Deciding whether to attach WebGL
  *   based on pane visibility, and juggling the ~16-context Chromium budget
  *   across many simultaneously-mounted panes, is M3.5's job
  *   (`terminal-webgl.ts`'s header comment) — not this component's.
  */
-export function Terminal({ sessionId, bridge }: TerminalProps) {
+export function Terminal({ sessionId, cols, rows, bridge }: TerminalProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -69,6 +78,8 @@ export function Terminal({ sessionId, bridge }: TerminalProps) {
       cursorBlink: true,
       allowProposedApi: true,
       theme: terminalTheme,
+      cols,
+      rows,
       ...TERMINAL_FONT_OPTIONS,
     });
     const fitAddon = new FitAddon();
@@ -182,14 +193,22 @@ export function Terminal({ sessionId, bridge }: TerminalProps) {
     );
     const resizeController = createTerminalResizeController({
       ready: resizeReady,
+      // The session's own geometry, known before this component ever fits
+      // anything (docs/specs/m2.6-boot-reattach.md section 3.5) — so the
+      // first post-`ready` fit that comes out equal to it (the common case:
+      // the pane hasn't actually changed size since boot) sends no
+      // redundant `session.resize` at all.
+      initialSize: { cols, rows },
       fit: () => {
         fitAddon.fit();
         return { cols: term.cols, rows: term.rows };
       },
-      resize: ({ cols, rows }) => {
-        bridge.request('session.resize', { sessionId, cols, rows }).catch((err: unknown) => {
-          console.error('[Terminal] session.resize failed', sessionId, err);
-        });
+      resize: ({ cols: newCols, rows: newRows }) => {
+        bridge
+          .request('session.resize', { sessionId, cols: newCols, rows: newRows })
+          .catch((err: unknown) => {
+            console.error('[Terminal] session.resize failed', sessionId, err);
+          });
       },
     });
     // `ResizeObserver` on `container` itself — the same element `fitAddon`
@@ -240,13 +259,17 @@ export function Terminal({ sessionId, bridge }: TerminalProps) {
           return;
         }
         term.open(container);
-        // One eager fit right at open, so the terminal isn't left at
-        // xterm's 80x24 construction default until the first `ResizeObserver`
-        // callback fires — M2.5's debounced fit/resize flow (`resizeController`
-        // above) takes over from here for every size change after this.
-        fitAddon.fit();
-        // Only now does `resizeController` above become allowed to run
-        // (still also gated on `session.ready` — see its own comment).
+        // No eager `fit()` here on purpose (docs/specs/m2.6-boot-reattach.md
+        // section 3.5, required test 9): `term` was already constructed
+        // with the session's own `cols`/`rows` above, so there is no
+        // "still at xterm's 80x24 default" gap left to close before the
+        // first real fit — and fitting here, ahead of the attach's `ready`,
+        // is exactly the race section 3.5 forbids (a fit measures the
+        // container's *current* pixel size, which may differ from the
+        // session's geometry, and moves `term.cols`/`rows` before the
+        // snapshot — sized for the *old* geometry — has been written).
+        // `resizeController` below is the only thing allowed to fit/resize,
+        // and only once `ready` settles.
         openedResolve();
 
         // Loaded after `open()` (WebGL needs a live canvas/DOM element),
@@ -289,7 +312,13 @@ export function Terminal({ sessionId, bridge }: TerminalProps) {
       // a `term` that was never `open()`ed.
       term.dispose();
     };
-  }, [sessionId, bridge]);
+    // `cols`/`rows` are read once, at mount, to construct `term` and seed
+    // `resizeController`'s `initialSize` — they're listed here so a caller
+    // that ever re-renders this component with a genuinely different
+    // session geometry (e.g. `App.tsx` picking a different boot session for
+    // the same `sessionId` slot, which doesn't happen today) gets a fresh
+    // mount instead of a stale xterm instance built for the old one.
+  }, [sessionId, cols, rows, bridge]);
 
   return <div ref={containerRef} style={{ width: '100%', height: '100%' }} />;
 }
