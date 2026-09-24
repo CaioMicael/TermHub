@@ -78,13 +78,20 @@ function toControlMessage(message: WireControlMessage): ControlMessage {
   return message as unknown as ControlMessage;
 }
 
-/** Encodes any generic control message (request, response, event, handshake, or handshake-ack) into wire bytes via protocol.ts's `encodeControlFrame`. */
-export function encodeWireControl(message: WireControlMessage): Buffer {
+/**
+ * Encodes any generic control message (request, response, event, handshake,
+ * or handshake-ack) into wire bytes via protocol.ts's `encodeControlFrame`.
+ * Returns `Uint8Array`, not `Buffer` — protocol.ts's framing is Buffer-free
+ * (see its file header) so it runs unmodified in browser code too;
+ * `net.Socket#write` (this transport's only consumer) accepts `Uint8Array`
+ * directly, no conversion needed.
+ */
+export function encodeWireControl(message: WireControlMessage): Uint8Array {
   return encodeControlFrame(toControlMessage(message));
 }
 
 /** Encodes a PTY data frame. Thin re-export so callers of this module never need to import `@termhub/shared` directly just for framing. */
-export function encodeWireData(sessionId: SessionId, data: Uint8Array): Buffer {
+export function encodeWireData(sessionId: SessionId, data: Uint8Array): Uint8Array {
   return encodeDataFrame(sessionId, data);
 }
 

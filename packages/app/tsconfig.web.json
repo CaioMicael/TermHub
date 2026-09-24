@@ -8,20 +8,15 @@
     "declarationMap": true,
     "outDir": "dist/types-web",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "jsx": "react-jsx",
-    // M2.2: `index.d.ts`'s typed `window.termhub` surface (`request<M extends
-    // RequestMethod>`, etc. — see `src/preload/bridge.ts`'s `PreloadBridge`)
-    // reaches into `@termhub/shared`'s `protocol.ts` for those method/event
-    // types, via `bridge.ts` and `src/main/ipc-contract.ts` below. Because
-    // `@termhub/shared`'s package.json points `types`/`main` straight at its
-    // *source* (no build step consumed here — same as every other package
-    // in this monorepo), this project ends up type-checking protocol.ts's
-    // whole implementation (Buffer-based framing, not just the types this
-    // project actually needs), the same way `packages/shared/tsconfig.json`
-    // itself does — see that file's own comment for the identical root
-    // cause ("without an explicit `types` array, TS's automatic @types
-    // inclusion was not resolving @types/node for this project").
-    "types": ["node"]
+    "jsx": "react-jsx"
+    // M2.2 used to need `"types": ["node"]` here because `@termhub/shared`'s
+    // package.json points `types`/`main` straight at its *source*, so this
+    // project's program ended up type-checking protocol.ts's whole
+    // implementation, including its old `Buffer`-based framing, not just
+    // the types this project actually needs. The framing was rewritten
+    // (see protocol.ts's file header) to use only `Uint8Array`/`DataView`/
+    // `TextEncoder`/`TextDecoder`, which exist identically without Node's
+    // globals, so this project no longer needs `@types/node` at all.
   },
   "include": [
     "src/renderer/src/**/*",

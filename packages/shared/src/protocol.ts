@@ -1,9 +1,16 @@
 // Wire protocol between the termhub-daemon (owner of the PTYs) and its
 // clients (the Electron app's main process today; a CLI diagnostic tool and,
 // per plan.md's "fora do escopo do v1" note, potentially a web/mobile viewer
-// later). Everything here is pure TypeScript over `Buffer` — no dependency
-// on `net`, Electron, or a schema library. The transport (named pipe server,
-// actually reading off a `net.Socket`) is packages/daemon's job (M1.2).
+// later). Everything here is pure TypeScript over `Uint8Array`/`DataView`/
+// `TextEncoder`/`TextDecoder` — no dependency on `Buffer`, `net`, Electron,
+// or a schema library. This module is consumed as source by every workspace
+// that imports `@termhub/shared` (its package.json points `main`/`types` at
+// `src/`, not a build output), including browser-side code (`packages/ui`,
+// the Electron renderer) that has no Node globals — so it deliberately
+// sticks to APIs that exist identically in both environments. The transport
+// (named pipe server, actually reading off a `net.Socket`) is
+// packages/daemon's job (M1.2); `Buffer` is fine there, since the daemon is
+// Node-only.
 //
 // Frame format, fixed by docs/plan.md section 3 ("Framing"):
 //
@@ -389,7 +396,40 @@ function assertValidSessionId(sessionId: SessionId): void {
   }
 }
 
-function buildFrame(type: FrameType, payload: Buffer): Buffer {
+// ---------------------------------------------------------------------------
+// Byte-level helpers (Buffer-free: DataView reads/writes are what let this
+// module run unmodified in a browser program with no Node globals)
+// ---------------------------------------------------------------------------
+
+function readUInt8(buf: Uint8Array, offset: number): number {
+  return new DataView(buf.buffer, buf.byteOffset + offset, 1).getUint8(0);
+}
+
+function writeUInt8(buf: Uint8Array, offset: number, value: number): void {
+  new DataView(buf.buffer, buf.byteOffset + offset, 1).setUint8(0, value);
+}
+
+function readUInt32BE(buf: Uint8Array, offset: number): number {
+  return new DataView(buf.buffer, buf.byteOffset + offset, 4).getUint32(0, false);
+}
+
+function writeUInt32BE(buf: Uint8Array, offset: number, value: number): void {
+  new DataView(buf.buffer, buf.byteOffset + offset, 4).setUint32(0, value, false);
+}
+
+/** Concatenates several `Uint8Array`s into one freshly allocated one, copying each in order. */
+function concatBytes(chunks: readonly Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return result;
+}
+
+function buildFrame(type: FrameType, payload: Uint8Array): Uint8Array {
   const bodyLength = TYPE_FIELD_BYTES + payload.length;
   if (bodyLength > MAX_FRAME_LENGTH) {
     throw new ProtocolError(
@@ -397,24 +437,27 @@ function buildFrame(type: FrameType, payload: Buffer): Buffer {
       `frame body of ${bodyLength} bytes exceeds MAX_FRAME_LENGTH (${MAX_FRAME_LENGTH})`,
     );
   }
-  const frame = Buffer.allocUnsafe(LENGTH_FIELD_BYTES + bodyLength);
-  frame.writeUInt32BE(bodyLength, 0);
-  frame.writeUInt8(type, LENGTH_FIELD_BYTES);
-  payload.copy(frame, LENGTH_FIELD_BYTES + TYPE_FIELD_BYTES);
+  const frame = new Uint8Array(LENGTH_FIELD_BYTES + bodyLength);
+  writeUInt32BE(frame, 0, bodyLength);
+  writeUInt8(frame, LENGTH_FIELD_BYTES, type);
+  frame.set(payload, LENGTH_FIELD_BYTES + TYPE_FIELD_BYTES);
   return frame;
 }
 
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder('utf-8');
+
 /** Encodes a control frame: `type` 0, payload is `message` as UTF-8 JSON. */
-export function encodeControlFrame(message: ControlMessage): Buffer {
-  return buildFrame(FRAME_TYPE.CONTROL, Buffer.from(JSON.stringify(message), 'utf8'));
+export function encodeControlFrame(message: ControlMessage): Uint8Array {
+  return buildFrame(FRAME_TYPE.CONTROL, textEncoder.encode(JSON.stringify(message)));
 }
 
 /** Encodes a data frame: `type` 1, payload is `[uint32 sessionId][data]`. `data` is copied verbatim — no JSON, no base64. */
-export function encodeDataFrame(sessionId: SessionId, data: Uint8Array): Buffer {
+export function encodeDataFrame(sessionId: SessionId, data: Uint8Array): Uint8Array {
   assertValidSessionId(sessionId);
-  const sessionIdBuf = Buffer.allocUnsafe(SESSION_ID_FIELD_BYTES);
-  sessionIdBuf.writeUInt32BE(sessionId, 0);
-  return buildFrame(FRAME_TYPE.DATA, Buffer.concat([sessionIdBuf, Buffer.from(data)]));
+  const sessionIdBuf = new Uint8Array(SESSION_ID_FIELD_BYTES);
+  writeUInt32BE(sessionIdBuf, 0, sessionId);
+  return buildFrame(FRAME_TYPE.DATA, concatBytes([sessionIdBuf, data]));
 }
 
 /**
@@ -423,7 +466,7 @@ export function encodeDataFrame(sessionId: SessionId, data: Uint8Array): Buffer 
  * / `encodeDataFrame` above are thin convenience wrappers over it for
  * callers that already know which kind they have.
  */
-export function encodeFrame(frame: Frame): Buffer {
+export function encodeFrame(frame: Frame): Uint8Array {
   switch (frame.type) {
     case FRAME_TYPE.CONTROL:
       return encodeControlFrame(frame.message);
@@ -432,10 +475,13 @@ export function encodeFrame(frame: Frame): Buffer {
   }
 }
 
-function parseControlPayload(payload: Buffer): ControlMessage {
+function parseControlPayload(payload: Uint8Array): ControlMessage {
   let json: unknown;
   try {
-    json = JSON.parse(payload.toString('utf8')) as unknown;
+    // `fatal: false` (the default) mirrors the old `Buffer#toString('utf8')`
+    // behavior: invalid byte sequences become U+FFFD instead of throwing, so
+    // this still only fails below at `JSON.parse`/`isControlMessage`.
+    json = JSON.parse(textDecoder.decode(payload)) as unknown;
   } catch (err) {
     throw new ProtocolError(
       PROTOCOL_ERROR_CODE.MALFORMED_JSON,
@@ -452,8 +498,8 @@ function parseControlPayload(payload: Buffer): ControlMessage {
   return json;
 }
 
-function decodeBody(body: Buffer): Frame {
-  const type = body.readUInt8(0);
+function decodeBody(body: Uint8Array): Frame {
+  const type = readUInt8(body, 0);
   const payload = body.subarray(TYPE_FIELD_BYTES);
   switch (type) {
     case FRAME_TYPE.CONTROL:
@@ -467,7 +513,7 @@ function decodeBody(body: Buffer): Frame {
       }
       return {
         type: FRAME_TYPE.DATA,
-        sessionId: payload.readUInt32BE(0),
+        sessionId: readUInt32BE(payload, 0),
         data: payload.subarray(SESSION_ID_FIELD_BYTES),
       };
     }
@@ -503,7 +549,7 @@ type DecoderPhase = { phase: 'length' } | { phase: 'body'; bodyLength: number };
  * connection and, if they reconnect, construct a fresh `FrameDecoder`.
  */
 export class FrameDecoder {
-  private readonly queue: Buffer[] = [];
+  private readonly queue: Uint8Array[] = [];
   private queuedBytes = 0;
   private state: DecoderPhase = { phase: 'length' };
   private failed = false;
@@ -526,7 +572,7 @@ export class FrameDecoder {
             break;
           }
           const header = this.consume(LENGTH_FIELD_BYTES);
-          const bodyLength = header.readUInt32BE(0);
+          const bodyLength = readUInt32BE(header, 0);
           if (bodyLength < TYPE_FIELD_BYTES) {
             throw new ProtocolError(
               PROTOCOL_ERROR_CODE.INVALID_FRAME,
@@ -565,17 +611,18 @@ export class FrameDecoder {
     if (chunk.length === 0) {
       return;
     }
-    const buf = Buffer.isBuffer(chunk)
-      ? chunk
-      : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-    this.queue.push(buf);
-    this.queuedBytes += buf.length;
+    // No copy needed here regardless of the concrete Uint8Array subtype
+    // (Buffer on the Node side, a plain Uint8Array in a browser context):
+    // we only ever read this chunk via `subarray`/`DataView`, both of which
+    // work zero-copy against whatever `ArrayBuffer` already backs it.
+    this.queue.push(chunk);
+    this.queuedBytes += chunk.length;
   }
 
   /** Removes and returns exactly `n` bytes from the front of the queue. Caller must have already confirmed `this.queuedBytes >= n`. */
-  private consume(n: number): Buffer {
+  private consume(n: number): Uint8Array {
     if (n === 0) {
-      return Buffer.alloc(0);
+      return new Uint8Array(0);
     }
     const first = this.queue[0];
     if (first !== undefined && first.length >= n) {
@@ -590,7 +637,7 @@ export class FrameDecoder {
     }
 
     // Spans multiple queued buffers: this is the only path that copies.
-    const result = Buffer.allocUnsafe(n);
+    const result = new Uint8Array(n);
     let offset = 0;
     while (offset < n) {
       const head = this.queue[0];
@@ -604,7 +651,7 @@ export class FrameDecoder {
         );
       }
       const take = Math.min(head.length, n - offset);
-      head.copy(result, offset, 0, take);
+      result.set(head.subarray(0, take), offset);
       offset += take;
       if (take === head.length) {
         this.queue.shift();

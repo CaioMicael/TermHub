@@ -82,9 +82,9 @@ function fullByteRangePayload(): Buffer {
   return buf;
 }
 
-/** Splits `buf` into chunks of exactly `size` bytes (last chunk may be shorter). */
-function chunkBy(buf: Buffer, size: number): Buffer[] {
-  const chunks: Buffer[] = [];
+/** Splits `buf` into chunks of exactly `size` bytes (last chunk may be shorter). Accepts `Uint8Array` since that's what `encodeControlFrame`/`encodeDataFrame` return now (framing is Buffer-free, see protocol.ts's file header). */
+function chunkBy(buf: Uint8Array, size: number): Uint8Array[] {
+  const chunks: Uint8Array[] = [];
   for (let offset = 0; offset < buf.length; offset += size) {
     chunks.push(buf.subarray(offset, Math.min(offset + size, buf.length)));
   }
@@ -102,6 +102,116 @@ function expectFrameEqual(actual: Frame, expected: Frame): void {
     throw new Error('frame type mismatch');
   }
 }
+
+// ---------------------------------------------------------------------------
+// Wire format: exact bytes
+// ---------------------------------------------------------------------------
+
+// These two fix the on-the-wire byte sequence, not just "decodes back to what
+// was encoded" (the round-trip tests below would pass even if encode and
+// decode agreed on a *different* wrong format together). Both frames' bytes
+// are computed by hand from the framing doc comment at the top of
+// protocol.ts (`[uint32 length][uint8 type][payload]`, big-endian) and would
+// come out identical from the pre-M3.4 `Buffer`-based implementation, since
+// the M3.4 rewrite (Buffer -> Uint8Array/DataView/TextEncoder/TextDecoder)
+// is explicitly a same-bytes-on-the-wire change.
+describe('wire format: exact bytes', () => {
+  it('encodes a known control frame to its exact expected byte sequence', () => {
+    const message: ControlMessage = { kind: 'handshake-ack', ok: true, protocolVersion: 1 };
+    const encoded = encodeControlFrame(message);
+
+    // JSON.stringify(message) === '{"kind":"handshake-ack","ok":true,"protocolVersion":1}'
+    // (54 UTF-8 bytes) => body = 1 (type) + 54 = 55 bytes.
+    const expected = new Uint8Array([
+      0x00,
+      0x00,
+      0x00,
+      0x37, // length = 55, big-endian uint32
+      0x00, // type = FRAME_TYPE.CONTROL
+      // '{"kind":"handshake-ack","ok":true,"protocolVersion":1}' as UTF-8
+      0x7b,
+      0x22,
+      0x6b,
+      0x69,
+      0x6e,
+      0x64,
+      0x22,
+      0x3a,
+      0x22,
+      0x68,
+      0x61,
+      0x6e,
+      0x64,
+      0x73,
+      0x68,
+      0x61,
+      0x6b,
+      0x65,
+      0x2d,
+      0x61,
+      0x63,
+      0x6b,
+      0x22,
+      0x2c,
+      0x22,
+      0x6f,
+      0x6b,
+      0x22,
+      0x3a,
+      0x74,
+      0x72,
+      0x75,
+      0x65,
+      0x2c,
+      0x22,
+      0x70,
+      0x72,
+      0x6f,
+      0x74,
+      0x6f,
+      0x63,
+      0x6f,
+      0x6c,
+      0x56,
+      0x65,
+      0x72,
+      0x73,
+      0x69,
+      0x6f,
+      0x6e,
+      0x22,
+      0x3a,
+      0x31,
+      0x7d,
+    ]);
+
+    expect(Array.from(encoded)).toEqual(Array.from(expected));
+  });
+
+  it('encodes a known data frame to its exact expected byte sequence', () => {
+    const encoded = encodeDataFrame(7, new Uint8Array([1, 2, 3, 4, 5]));
+
+    // body = 1 (type) + 4 (sessionId) + 5 (data) = 10 bytes.
+    const expected = new Uint8Array([
+      0x00,
+      0x00,
+      0x00,
+      0x0a, // length = 10, big-endian uint32
+      0x01, // type = FRAME_TYPE.DATA
+      0x00,
+      0x00,
+      0x00,
+      0x07, // sessionId = 7, big-endian uint32
+      0x01,
+      0x02,
+      0x03,
+      0x04,
+      0x05, // raw data, verbatim
+    ]);
+
+    expect(Array.from(encoded)).toEqual(Array.from(expected));
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Round trips
