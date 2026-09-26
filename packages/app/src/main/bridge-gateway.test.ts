@@ -701,7 +701,7 @@ describe('BridgeGateway — M2.5 clipboard/context menu', () => {
 
   // Pinned on purpose: every change to what the renderer may reach in the
   // daemon has to show up here. M2.5 kept clipboard/menu out of it; M4.4
-  // added the three graveyard methods.
+  // added the three graveyard methods, M4.6 the shell profiles.
   it('REQUEST_METHODS is exactly the daemon methods the renderer may call — clipboard/menu are not daemon methods', async () => {
     const { REQUEST_METHODS } = await import('./ipc-contract.js');
     expect(REQUEST_METHODS).toEqual([
@@ -714,6 +714,7 @@ describe('BridgeGateway — M2.5 clipboard/context menu', () => {
       'session.kill',
       'session.restore',
       'graveyard.list',
+      'profiles.list',
     ]);
   });
 });

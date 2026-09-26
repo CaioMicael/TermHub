@@ -284,4 +284,6 @@ export const REQUEST_METHODS: readonly RequestMethod[] = [
   'session.kill',
   'session.restore',
   'graveyard.list',
+  // M4.6: the shell profiles the daemon detected, for the new-session menu.
+  'profiles.list',
 ];
