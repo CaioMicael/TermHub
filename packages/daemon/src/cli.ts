@@ -254,8 +254,11 @@ export async function runDiagnostic(options: DiagnosticOptions = {}): Promise<Di
     await waitFor(() => hasStandaloneLine(reattachBuffer, 'hi'), timeoutMs);
 
     // Cleanup hygiene: this diagnostic's session shouldn't outlive it,
-    // whether or not this call owns the daemon it ran against.
-    await client.request('session.close', { sessionId });
+    // whether or not this call owns the daemon it ran against. session.kill,
+    // not session.close (M4.4): session.close now buries the session for a
+    // TTL (10 minutes by default) instead of killing it, which would leave
+    // this diagnostic's shell process running long after the tool exits.
+    await client.request('session.kill', { sessionId });
     await client.close();
 
     return { sessionId, firstConnectionOutput, reattachBuffer };

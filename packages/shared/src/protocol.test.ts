@@ -71,6 +71,73 @@ const SAMPLE_CONTROL_MESSAGES: ControlMessage[] = [
     event: 'session.status',
     payload: { sessionId: 7, status: 'awaiting-input', since: 1700000001000 },
   },
+  // M4.4: session.close's new optional ttlMs, and the three new methods
+  // (session.kill, session.restore, graveyard.list). Appended at the end so
+  // the fixed indices the tests above already rely on (e.g. index 3 for
+  // "also round-trips via the unified encodeFrame entry point") don't shift.
+  {
+    kind: 'request',
+    id: 'req-3',
+    method: 'session.close',
+    params: { sessionId: 7, ttlMs: 120_000 },
+  },
+  {
+    kind: 'request',
+    id: 'req-4',
+    method: 'session.kill',
+    params: { sessionId: 7 },
+  },
+  {
+    kind: 'response',
+    id: 'req-4',
+    method: 'session.kill',
+    ok: true,
+    result: {},
+  },
+  {
+    kind: 'request',
+    id: 'req-5',
+    method: 'session.restore',
+    params: { sessionId: 7 },
+  },
+  {
+    kind: 'response',
+    id: 'req-5',
+    method: 'session.restore',
+    ok: false,
+    error: { code: PROTOCOL_ERROR_CODE.SESSION_NOT_FOUND, message: 'no buried session with id 7' },
+  },
+  {
+    kind: 'request',
+    id: 'req-6',
+    method: 'graveyard.list',
+    params: {},
+  },
+  {
+    kind: 'response',
+    id: 'req-6',
+    method: 'graveyard.list',
+    ok: true,
+    result: {
+      entries: [
+        {
+          session: {
+            id: 7,
+            name: 'agent-1',
+            cwd: 'C:\\repo',
+            shell: 'pwsh',
+            createdAt: 1700000000000,
+            cols: 120,
+            rows: 30,
+            status: 'exited',
+            exitCode: 0,
+          },
+          closedAt: 1700000002000,
+          expiresAt: 1700000602000,
+        },
+      ],
+    },
+  },
 ];
 
 /** Builds a buffer of every byte value 0x00-0xff repeated, including 0x00 runs and lone bytes that are invalid UTF-8 continuation/lead bytes on their own (e.g. 0x80, 0xff). */

@@ -238,4 +238,10 @@ export const REQUEST_METHODS: readonly RequestMethod[] = [
   'session.list',
   'session.attach',
   'session.detach',
+  // M4.4: the graveyard RPCs, added for M4.5 (the graveyard UI) to call —
+  // this task only extends the allowlist, it does not build anything that
+  // calls these yet.
+  'session.kill',
+  'session.restore',
+  'graveyard.list',
 ];

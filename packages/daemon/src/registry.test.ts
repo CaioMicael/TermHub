@@ -340,4 +340,87 @@ describe('Registry', () => {
     expect(thrown).toBeInstanceOf(ProtocolError);
     expect((thrown as ProtocolError).code).toBe(PROTOCOL_ERROR_CODE.SESSION_NOT_FOUND);
   });
+
+  // ---------------------------------------------------------------------------
+  // M4.4: evict()/reinstate() — the graveyard building blocks close()'s own
+  // doc comment predicted. Not exercised through a Graveyard here (that's
+  // graveyard.test.ts's job); these tests only prove the registry's own two
+  // new methods do exactly what they promise, standing alone.
+  // ---------------------------------------------------------------------------
+
+  it('evict() removes the record without killing the session, and it is gone from get()/list()', () => {
+    const { factory, sessions } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    const summary = registry.create(baseParams({ name: 'buried-1' }));
+    const fake = sessions[0];
+
+    const evicted = registry.evict(summary.id);
+
+    expect(evicted?.summary).toEqual(summary);
+    expect(evicted?.session).toBe(fake);
+    expect(fake?.killCalls).toBe(0); // evict never kills
+    expect(fake?.isAlive).toBe(true);
+    expect(registry.get(summary.id)).toBeUndefined();
+    expect(registry.list()).toEqual([]);
+  });
+
+  it('evict() on an unknown id returns undefined and does not throw', () => {
+    const { factory } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    expect(registry.evict(999_999)).toBeUndefined();
+  });
+
+  it('reinstate() puts an evicted session back under the same id, visible again in get()/list()', () => {
+    const { factory } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    const summary = registry.create(baseParams({ name: 'buried-2' }));
+    const evicted = registry.evict(summary.id);
+    expect(evicted).toBeDefined();
+    if (evicted === undefined) throw new Error('unreachable');
+
+    // Simulates the graveyard reporting the session died while buried.
+    const revivedSummary = { ...evicted.summary, status: 'exited' as const };
+    registry.reinstate(revivedSummary, evicted.session);
+
+    expect(registry.get(summary.id)?.summary).toEqual(revivedSummary);
+    expect(registry.list().map((s) => s.id)).toEqual([summary.id]);
+  });
+
+  it('reinstate() re-wires exit tracking: a later exit updates the summary just like a never-buried session', () => {
+    const { factory, sessions } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    const summary = registry.create(baseParams());
+    const evicted = registry.evict(summary.id);
+    if (evicted === undefined) throw new Error('unreachable');
+    registry.reinstate(evicted.summary, evicted.session);
+
+    const fake = sessions[0];
+    fake?.emitExit({ exitCode: 7 });
+
+    expect(registry.get(summary.id)?.summary.status).toBe('exited');
+    expect(registry.get(summary.id)?.exit).toEqual({ exitCode: 7 });
+  });
+
+  it('reinstate() throws INTERNAL_ERROR if the id is already registered', () => {
+    const { factory, sessions } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    const summary = registry.create(baseParams());
+    const fake = sessions[0];
+    if (fake === undefined) throw new Error('unreachable');
+
+    let thrown: unknown;
+    try {
+      registry.reinstate(summary, fake);
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(ProtocolError);
+    expect((thrown as ProtocolError).code).toBe(PROTOCOL_ERROR_CODE.INTERNAL_ERROR);
+  });
 });

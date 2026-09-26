@@ -1,5 +1,7 @@
 import { PROTOCOL_ERROR_CODE, ProtocolError } from '@termhub/shared';
 import type {
+  GraveyardListParams,
+  GraveyardListResult,
   SessionAttachParams,
   SessionAttachResult,
   SessionCloseParams,
@@ -10,14 +12,19 @@ import type {
   SessionDetachResult,
   SessionExitPayload,
   SessionId,
+  SessionKillParams,
+  SessionKillResult,
   SessionListParams,
   SessionListResult,
   SessionResizeParams,
   SessionResizeResult,
+  SessionRestoreParams,
+  SessionRestoreResult,
   SessionSummary,
 } from '@termhub/shared';
 
 import { TerminalBuffer } from './buffer.js';
+import { Graveyard, resolveTtlMs } from './graveyard.js';
 import type { Registry, SessionLike } from './registry.js';
 import type { Disposable } from './session.js';
 import type { TransportServer } from './transport.js';
@@ -28,6 +35,21 @@ import type { TransportServer } from './transport.js';
 // output/exit live — but only to the clients actually `session.attach`ed to
 // that session, not to every connected client. This is the only file that
 // knows about the transport, the registry, and the buffer all at once.
+//
+// ## `session.close` / `session.kill` / `session.restore` / `graveyard.list` (M4.4)
+//
+// `session.close` no longer kills — it moves the session to the daemon's
+// graveyard (graveyard.ts) for a TTL, via `registry.evict()` +
+// `graveyard.bury()`. The session's `SessionRuntime` (buffer + attached
+// clients, below) is deliberately left untouched while buried: it keeps
+// mirroring output and delivering to whoever's still attached, exactly as
+// before. `session.kill` is "kill it right now" for either a live or buried
+// session; `session.restore` is `session.close`'s reverse
+// (`graveyard.restore()` + `registry.reinstate()`); `graveyard.list` is the
+// only way to see what's buried, since `session.list` deliberately excludes
+// it. `disposeRuntime`/`graveyard.onDeath` (below) are what actually tear
+// down a session's runtime once it's truly dead, whether that death was an
+// explicit `session.kill`, a TTL expiring on its own, or daemon shutdown.
 //
 // ## `session.attach` / `session.detach` (M1.7)
 //
@@ -143,25 +165,74 @@ export interface SessionService {
    * callers that care use `session.list`/`session.attach` for that.
    */
   attachedCount(sessionId: SessionId): number;
+  /**
+   * M4.4: whether the graveyard currently holds at least one buried
+   * session. `daemon-runtime.ts`'s idle-shutdown wiring reads this so a
+   * daemon with zero clients and only buried sessions never shuts itself
+   * down and kills what the user might still want back — the same premise
+   * `hasLiveSessions` already protects for the registry's own sessions.
+   */
+  hasBuriedSessions(): boolean;
+  /**
+   * M4.4: kills and permanently removes every currently buried session,
+   * canceling their TTL timers. What `daemon-runtime.ts`'s shutdown does to
+   * the graveyard, mirroring what it already does to every live session in
+   * the registry.
+   */
+  killAllBuried(): void;
 }
 
 /**
  * Registers `session.create` / `session.resize` / `session.close` /
- * `session.list` / `session.attach` / `session.detach` on `server`,
- * delegating to `registry`, and wires every session's output/exit through
- * its `SessionRuntime` to whichever clients are attached to it. Call once
- * per `TransportServer` instance (mirrors `registerMethod`'s own "no
- * duplicate registration" contract).
+ * `session.list` / `session.attach` / `session.detach` / `session.kill` /
+ * `session.restore` / `graveyard.list` on `server`, delegating to `registry`
+ * and (for the M4.4 methods) `graveyard`, and wires every session's
+ * output/exit through its `SessionRuntime` to whichever clients are attached
+ * to it. Call once per `TransportServer` instance (mirrors
+ * `registerMethod`'s own "no duplicate registration" contract).
+ *
+ * `graveyard` defaults to a fresh `Graveyard()` (the real system clock) —
+ * production callers (`daemon-runtime.ts`) never need to pass one. Tests
+ * that need to control the graveyard's clock (or share a `Graveyard`
+ * instance to assert on directly) construct their own and pass it in, the
+ * same `SessionFactory`-style injection `Registry` already uses.
  */
 export function registerSessionService(
   server: TransportServer,
   registry: Registry,
+  graveyard: Graveyard = new Graveyard(),
 ): SessionService {
   // One entry per live-or-not-yet-closed session, created in session.create
-  // and removed in session.close — this module's own bookkeeping alongside
-  // (never inside) the registry, exactly like buffer.ts's own module doc
-  // comment says M1.7 would need to add.
+  // and removed only once the session is truly dead (killed live, or its
+  // buried copy killed by the graveyard — see `disposeRuntime` below) — this
+  // module's own bookkeeping alongside (never inside) the registry, exactly
+  // like buffer.ts's own module doc comment says M1.7 would need to add. A
+  // session moved to the graveyard by `session.close` keeps its entry here
+  // untouched: its buffer keeps mirroring output, and any client still
+  // attached keeps receiving it, exactly as if nothing happened — M4.4 only
+  // changes whether the session shows up in `registry.list()`.
   const runtimes = new Map<SessionId, { runtime: SessionRuntime; delivery: Disposable }>();
+
+  /**
+   * Tears down whatever this module owns for `sessionId` once it's truly
+   * gone — not merely buried. Shared by `session.kill`'s handler (for a
+   * still-live session) and `graveyard.onDeath` (for a buried one, however
+   * it died: TTL expiry, an explicit `session.kill`, or daemon shutdown) so
+   * there's exactly one place that disposes a `SessionRuntime`, not two
+   * copies that could drift.
+   */
+  function disposeRuntime(sessionId: SessionId): void {
+    const entry = runtimes.get(sessionId);
+    if (entry !== undefined) {
+      entry.delivery.dispose();
+      entry.runtime.buffer.dispose();
+      runtimes.delete(sessionId);
+    }
+  }
+
+  graveyard.onDeath((sessionId) => {
+    disposeRuntime(sessionId);
+  });
 
   server.registerMethod<SessionCreateParams, SessionCreateResult>('session.create', (params) => {
     const summary = registry.create(params);
@@ -211,25 +282,79 @@ export function registerSessionService(
   });
 
   server.registerMethod<SessionCloseParams, SessionCloseResult>('session.close', (params) => {
-    // registry.close() is already idempotent (see registry.ts) — closing an
-    // unknown or already-closed id is a no-op, not an error, so this handler
-    // doesn't need its own existence check.
-    registry.close(params.sessionId);
-    const entry = runtimes.get(params.sessionId);
-    if (entry !== undefined) {
-      // Unsubscribe before disposing the buffer: without this, a PTY event
-      // that fires after close() (a real process's exit can arrive well
-      // after `kill()` returns — registry.ts's own doc comment on `close()`
-      // notes `kill()` doesn't wait for it) would otherwise call
-      // `buffer.write()` on an already-disposed `TerminalBuffer`.
-      entry.delivery.dispose();
-      entry.runtime.buffer.dispose();
-      runtimes.delete(params.sessionId);
+    // M4.4: session.close no longer kills — it buries. Validated up front,
+    // even along the idempotent no-op paths below (an unknown id, or one
+    // already buried): a caller's malformed ttlMs is a mistake worth
+    // reporting regardless of whether this particular call would otherwise
+    // have done anything.
+    const ttlMs = resolveTtlMs(params.ttlMs);
+
+    if (graveyard.has(params.sessionId)) {
+      // Already buried: idempotent, and — per docs/milestones.md M4.4 —
+      // does NOT reset expiresAt/the timer. graveyard.bury() already
+      // encodes this itself; the early return here just avoids evicting a
+      // session that isn't even in the registry anymore to ask it to.
+      return {};
     }
+
+    const evicted = registry.evict(params.sessionId);
+    if (evicted === undefined) {
+      // Unknown id: idempotent no-op, same philosophy registry.close()
+      // always had for this case.
+      return {};
+    }
+    graveyard.bury(params.sessionId, evicted.session, evicted.summary, ttlMs);
+    // Deliberately does NOT touch `runtimes`: the session's TerminalBuffer
+    // and any client still attached to it keep working exactly as before —
+    // only registry.list()/session.list stop mentioning this id. Disposal
+    // only happens once the session is truly dead (`disposeRuntime`, wired
+    // to `graveyard.onDeath` above and to `session.kill` below).
     return {};
   });
 
+  server.registerMethod<SessionKillParams, SessionKillResult>('session.kill', (params) => {
+    // M4.4: kills right now, whether `sessionId` is buried or still live.
+    // Idempotent for an unknown id either way.
+    if (graveyard.kill(params.sessionId)) {
+      // graveyard.kill() already killed the session and fired onDeath,
+      // which disposeRuntime() above already handled.
+      return {};
+    }
+    // Not buried: same "kill if alive, remove the registry record" contract
+    // session.close had before M4.4. This is what a caller that means
+    // "right now, no grace period" uses instead now that session.close
+    // means "bury" (cli.ts is one such caller).
+    registry.close(params.sessionId);
+    disposeRuntime(params.sessionId);
+    return {};
+  });
+
+  server.registerMethod<SessionRestoreParams, SessionRestoreResult>('session.restore', (params) => {
+    const restored = graveyard.restore(params.sessionId);
+    if (restored === undefined) {
+      throw new ProtocolError(
+        PROTOCOL_ERROR_CODE.SESSION_NOT_FOUND,
+        `no buried session with id ${params.sessionId}`,
+      );
+    }
+    // The runtime (TerminalBuffer + attached clients) was never touched
+    // while buried — session.attach works immediately afterward, same as
+    // for a session that was never closed at all.
+    registry.reinstate(restored.summary, restored.session);
+    return { session: restored.summary };
+  });
+
+  server.registerMethod<GraveyardListParams, GraveyardListResult>('graveyard.list', () => ({
+    entries: graveyard.list(),
+  }));
+
   server.registerMethod<SessionListParams, SessionListResult>('session.list', () => ({
+    // Never includes a buried session: registry.evict() (called from
+    // session.close's handler above) already removed it from `registry`'s
+    // own bookkeeping, so listWithExit()'s registry.list() naturally leaves
+    // it out — graveyard.list is the only way to see what's buried
+    // (docs/milestones.md M4.4's own named pitfall: don't add a flag here
+    // that shows everything, that's what graveyard.list is for).
     sessions: listWithExit(registry),
   }));
 
@@ -299,6 +424,8 @@ export function registerSessionService(
 
   return {
     attachedCount: (sessionId) => runtimes.get(sessionId)?.runtime.attached.size ?? 0,
+    hasBuriedSessions: () => graveyard.size > 0,
+    killAllBuried: () => graveyard.disposeAll(),
   };
 }
 

@@ -15,10 +15,13 @@ import type {
 // (packages/daemon/transport.ts, M1.2/M1.5), does not buffer PTY output for
 // replay (M1.6), and does not detect "running"/"awaiting-input"/"idle"
 // (M5's status-detector) — as far as this module is concerned a session is
-// only ever "running" or "exited". It also does not implement a
-// close-with-TTL graveyard (M4.4): `close()` removes the session outright,
-// see that method's doc comment for why that's still safe to build on top
-// of later.
+// only ever "running" or "exited". It also does not itself implement the
+// close-with-TTL graveyard (M4.4, packages/daemon/src/graveyard.ts):
+// `close()` still kills+removes outright, unchanged, exactly as its own doc
+// comment always promised. `evict()`/`reinstate()` below are the two
+// building blocks that doc comment predicted — service.ts uses them to move
+// a session's record out of this registry and back in around a `Graveyard`,
+// without this class's own close()/list() contracts ever having to change.
 
 /**
  * The subset of `Session`'s (./session.ts, M1.3) public surface the registry
@@ -161,17 +164,25 @@ export class Registry {
 
     const record: InternalRecord = { session, summary };
     this.sessions.set(id, record);
+    this.wireExitTracking(record);
 
-    // The registry marks a session exited on its own — nobody needs to poll
-    // the OS to find out a shell died. This stays registered (not removed)
-    // so a caller who never asked for `close()` can still observe that it
-    // died and how; only an explicit `close()` call removes the record.
-    session.onExit((exit) => {
+    return summary;
+  }
+
+  /**
+   * The registry marks a session exited on its own — nobody needs to poll
+   * the OS to find out a shell died. This stays registered (not removed) so
+   * a caller who never asked for `close()` can still observe that it died
+   * and how; only an explicit `close()` call removes the record. Shared by
+   * `create()` and `reinstate()` (M4.4) so a session re-registered after a
+   * `session.restore` gets exactly the same live tracking a never-buried one
+   * has, instead of a second, possibly-diverging copy of this logic.
+   */
+  private wireExitTracking(record: InternalRecord): void {
+    record.session.onExit((exit) => {
       record.exit = exit;
       record.summary = { ...record.summary, status: 'exited' };
     });
-
-    return summary;
   }
 
   /** Looks up a session by id. Returns `undefined` if it was never created, or was `close()`d. */
@@ -245,5 +256,58 @@ export class Registry {
     }
     record.session.resize(cols, rows);
     record.summary = { ...record.summary, cols, rows };
+  }
+
+  /**
+   * Removes `id`'s record from the registry WITHOUT killing the underlying
+   * process — the graveyard building block this class's own `close()` doc
+   * comment predicted (M4.4, `packages/daemon/src/graveyard.ts`). Returns
+   * the removed record (same shape `get()` hands back) so the caller
+   * (`service.ts`, via `Graveyard#bury`) can keep the session running and
+   * observable while it's no longer part of `list()`. Returns `undefined`
+   * for an unknown id, same as `get()` — this method doesn't kill anything,
+   * so there's no idempotent "no-op" story to tell here the way `close()`
+   * has; the caller decides what "nothing to evict" means.
+   */
+  evict(id: SessionId): RegisteredSession | undefined {
+    const record = this.sessions.get(id);
+    if (record === undefined) {
+      return undefined;
+    }
+    this.sessions.delete(id);
+    return {
+      summary: record.summary,
+      session: record.session,
+      ...(record.exit !== undefined ? { exit: record.exit } : {}),
+    };
+  }
+
+  /**
+   * Reinstates a previously `evict()`ed session under its original id — the
+   * other half of the graveyard's `session.restore` (M4.4). `summary` is
+   * trusted verbatim (it should be the graveyard's own up-to-date copy,
+   * which may already show `status: 'exited'` if the process died on its
+   * own while buried) rather than re-derived from `session` here. Re-wires
+   * the same exit tracking `create()` sets up, so a *later* exit — after
+   * being reinstated live — keeps updating `summary.status` exactly as it
+   * would for a session that was never buried.
+   *
+   * Throws `ProtocolError(INTERNAL_ERROR)` if `summary.id` is already
+   * registered: `evict()` (or `close()`) must run first. Not reachable from
+   * a client request on its own — `Graveyard#restore` never hands back an
+   * id still present in its own map, so the only way to trip this is a bug
+   * in the graveyard/service wiring, not a shape of misuse `session.restore`
+   * itself has to guard against.
+   */
+  reinstate(summary: SessionSummary, session: SessionLike): void {
+    if (this.sessions.has(summary.id)) {
+      throw new ProtocolError(
+        PROTOCOL_ERROR_CODE.INTERNAL_ERROR,
+        `cannot reinstate session ${summary.id}: an id with the same value is already registered`,
+      );
+    }
+    const record: InternalRecord = { session, summary };
+    this.sessions.set(summary.id, record);
+    this.wireExitTracking(record);
   }
 }

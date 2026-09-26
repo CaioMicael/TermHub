@@ -9,6 +9,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { runDaemon } from './daemon-runtime.js';
 import type { DaemonRuntime } from './daemon-runtime.js';
 import { readDaemonInfo } from './daemon.js';
+import { Graveyard } from './graveyard.js';
+import type { GraveyardClock } from './graveyard.js';
 import type { SessionFactory, SessionLike } from './registry.js';
 import { resolvePipeAddress } from './transport-address.js';
 import { TransportClient } from './transport-client.js';
@@ -212,7 +214,115 @@ describe('runDaemon', () => {
       runtime = undefined; // already shut itself down; afterEach's cleanup call becomes a harmless idempotent no-op via `?.`
     },
   );
+
+  // M4.4: a buried session must hold the daemon up exactly like a live one
+  // does above — the "cemitério" is worthless if an idle daemon kills it
+  // before the user gets a chance to session.restore it. The graveyard's own
+  // TTL is made to elapse via a hand-stepped `GraveyardClock` (see this
+  // file's own `manualGraveyardClock` below) instead of a real wait, since
+  // `session.close`'s `ttlMs` has an enforced 60-second floor
+  // (graveyard.ts's `MIN_TTL_MS`) that would otherwise make this test far
+  // slower than the short *idle-timeout* boundary it actually cares about.
+  it(
+    'zero clients + only a buried (graveyard) session keeps the daemon up past the idle timeout; once its TTL ' +
+      'elapses, idleness resumes counting and the daemon shuts itself down on its own (short real idle timers; ' +
+      'the graveyard TTL itself is driven by a fake clock, not real time)',
+    async () => {
+      const manual = manualGraveyardClock();
+      const graveyard = new Graveyard({ clock: manual.clock });
+      const { factory } = fakeSessionFactory();
+      const address = uniqueAddress('graveyard-idle');
+      const daemonJsonPath = daemonJsonPathFor('graveyard-idle');
+
+      const result = await runDaemon({
+        address,
+        daemonJsonPath,
+        sessionFactory: factory,
+        graveyard,
+        idleTimeoutMs: 150,
+        idleCheckIntervalMs: 20,
+      });
+      expect(result.outcome).toBe('started');
+      if (result.outcome !== 'started') {
+        throw new Error('unreachable');
+      }
+      let runtime: DaemonRuntime | undefined = result.runtime;
+      cleanup.push(() => runtime?.shutdown());
+
+      const client = new TransportClient({ address, token: result.runtime.info.token });
+      cleanup.push(() => client.close());
+      await client.connect();
+
+      const created = await client.request<SessionCreateResult>('session.create', {
+        shell: 'fake-shell',
+        cwd: process.cwd(),
+        cols: 80,
+        rows: 24,
+      });
+      // Buries it — the minimum allowed ttlMs, though its exact value is
+      // irrelevant here since the fake clock's own `fire()` is what actually
+      // triggers the expiry below, not real elapsed time.
+      await client.request('session.close', { sessionId: created.session.id, ttlMs: 60_000 });
+
+      // No clients from here on: closing this connection is what actually
+      // exercises "zero clients AND a buried session" — with the client
+      // still connected, hasClients() alone would already hold the daemon
+      // up, which would prove nothing about the graveyard.
+      await client.close();
+
+      // Comfortably longer than the idle timeout: with zero clients but a
+      // still-buried session, shutdown must never fire.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(await readDaemonInfo(daemonJsonPath)).toBeDefined();
+
+      // The graveyard's TTL elapses (simulated, not waited for): the
+      // buried session is killed and removed from the graveyard.
+      manual.fire();
+
+      // Now zero clients AND the graveyard is empty — idleness resumes
+      // counting from here, and shutdown() should run on its own shortly
+      // after, same as the live-session test above.
+      await waitForFileRemoved(daemonJsonPath, 2_000);
+      runtime = undefined;
+    },
+  );
 });
+
+/**
+ * A `GraveyardClock` this test steps by hand instead of waiting on real
+ * time — see graveyard.ts's own header comment for why an injectable clock
+ * (not `vi.useFakeTimers()`) is what this module needs: `runDaemon` here
+ * still relies on real, short-interval `setInterval`/`setTimeout` polling
+ * (idle-shutdown.ts) and a real named pipe, both of which a globally faked
+ * clock would freeze right along with the graveyard's own timer.
+ */
+function manualGraveyardClock(): { clock: GraveyardClock; fire: () => void } {
+  let currentTime = 0;
+  const pending: Array<() => void> = [];
+  const clock: GraveyardClock = {
+    now: () => currentTime,
+    setTimeout: (handler) => {
+      pending.push(handler);
+      return handler;
+    },
+    clearTimeout: (handle) => {
+      const idx = pending.indexOf(handle as () => void);
+      if (idx !== -1) {
+        pending.splice(idx, 1);
+      }
+    },
+  };
+  return {
+    clock,
+    fire: () => {
+      currentTime += 1;
+      const toFire = pending.splice(0);
+      for (const handler of toFire) {
+        handler();
+      }
+    },
+  };
+}
 
 async function waitForFileRemoved(path: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
