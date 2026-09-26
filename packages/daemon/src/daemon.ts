@@ -118,13 +118,27 @@ export function defaultDaemonJsonPath(): string {
  * just for reading — with `EPERM` (occasionally `EBUSY`/`EACCES`). A reader
  * of `daemon.json` (a client resolving the daemon to connect to) that
  * happens to have the file open at the exact instant a daemon rewrites it
- * can trigger this. It clears on its own within milliseconds once that
- * reader's `readFile` closes the handle, so a short bounded retry is the
- * right response — not surfacing it as a real write failure, and not
- * retrying forever either.
+ * can trigger this. It clears on its own once that reader's `readFile`
+ * closes the handle, but "once" is not bounded to a few milliseconds in
+ * practice: AV/indexer activity on Windows can hold a file open far longer,
+ * and this is why the retry below budgets *seconds*, not hundreds of
+ * milliseconds, before giving up.
+ *
+ * The retry is exponential backoff with jitter, not a fixed interval. A
+ * fixed interval has a real failure mode this project hit directly: a
+ * periodic reader (daemon.test.ts's required-test-5 readers, sampling on a
+ * timer) can end up in phase with a fixed-delay writer, so every retry
+ * lands while the reader's handle happens to be open — starving the rename
+ * outright regardless of how many attempts are budgeted. Randomizing each
+ * wait (rather than a phase-locked constant) breaks that resonance;
+ * doubling the cap on each attempt means a persistent holder gets
+ * increasingly long gaps to actually let go, without spending the whole
+ * budget on tiny, ineffective waits up front.
  */
-const RENAME_RETRY_ATTEMPTS = 20;
-const RENAME_RETRY_DELAY_MS = 20;
+const RENAME_RETRY_BASE_DELAY_MS = 10;
+const RENAME_RETRY_MAX_DELAY_MS = 320;
+/** Total time budget across all retries — seconds, not the previous ~400ms, per docs/specs/m1.8-single-instance.md section 3.2 and Windows AV/indexer hold times observed in practice. */
+const RENAME_RETRY_BUDGET_MS = 4000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -136,16 +150,73 @@ function isTransientRenameError(err: unknown): boolean {
   );
 }
 
-async function renameWithRetry(tmpPath: string, destPath: string): Promise<void> {
-  for (let attempt = 1; attempt <= RENAME_RETRY_ATTEMPTS; attempt += 1) {
+/**
+ * Delay for a given (1-indexed) retry attempt: exponential backoff, capped
+ * at `maxDelayMs`, with "equal jitter" (half fixed, half random) rather than
+ * full jitter — this keeps the wait strictly growing attempt-over-attempt
+ * (in its lower bound) instead of letting randomness occasionally pick a
+ * later attempt a shorter wait than an earlier one, which is what
+ * daemon.test.ts's unit test on this function asserts ("as esperas
+ * crescem").
+ */
+function backoffDelayMs(attempt: number, baseDelayMs: number, maxDelayMs: number): number {
+  const cap = Math.min(maxDelayMs, baseDelayMs * 2 ** (attempt - 1));
+  const half = cap / 2;
+  return half + Math.random() * half;
+}
+
+type RenameFn = (oldPath: string, newPath: string) => Promise<void>;
+type SleepFn = (ms: number) => Promise<void>;
+type NowFn = () => number;
+
+export interface RenameWithRetryOptions {
+  /** Test-only seam: inject a fake `rename` to simulate transient/persistent failures without touching a real filesystem. Defaults to `node:fs/promises`'s `rename`. */
+  rename?: RenameFn;
+  /** Test-only seam: inject a fake sleep to exercise the retry loop without real wall-clock waits. Defaults to a real `setTimeout`-based sleep. */
+  sleep?: SleepFn;
+  /** Test-only seam: inject a fake clock so the retry budget can be exercised deterministically. Defaults to `Date.now`. */
+  now?: NowFn;
+  /**
+   * Test-only seam: override the backoff's starting cap, its ceiling, and
+   * the total retry budget — all three default to the production constants
+   * below. daemon.test.ts's atomicity test (required test 5) uses this to
+   * keep the *same* real-timer retry mechanism under real reader contention
+   * while scaling the numbers down, so a real-world-realistic but
+   * comparatively rare NTFS lock doesn't force that test to run for the
+   * production budget's full multi-second ceiling on every contended write.
+   */
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+  budgetMs?: number;
+}
+
+async function renameWithRetry(
+  tmpPath: string,
+  destPath: string,
+  options: RenameWithRetryOptions = {},
+): Promise<void> {
+  const renameFn = options.rename ?? rename;
+  const sleepFn = options.sleep ?? sleep;
+  const now = options.now ?? Date.now;
+  const baseDelayMs = options.baseDelayMs ?? RENAME_RETRY_BASE_DELAY_MS;
+  const maxDelayMs = options.maxDelayMs ?? RENAME_RETRY_MAX_DELAY_MS;
+  const budgetMs = options.budgetMs ?? RENAME_RETRY_BUDGET_MS;
+
+  const start = now();
+  let attempt = 0;
+  for (;;) {
+    attempt += 1;
     try {
-      await rename(tmpPath, destPath);
+      await renameFn(tmpPath, destPath);
       return;
     } catch (err) {
-      if (attempt === RENAME_RETRY_ATTEMPTS || !isTransientRenameError(err)) {
+      if (!isTransientRenameError(err)) {
         throw err;
       }
-      await sleep(RENAME_RETRY_DELAY_MS);
+      if (now() - start >= budgetMs) {
+        throw err;
+      }
+      await sleepFn(backoffDelayMs(attempt, baseDelayMs, maxDelayMs));
     }
   }
 }
@@ -162,13 +233,24 @@ async function renameWithRetry(tmpPath: string, destPath: string): Promise<void>
  * temporary file at `path`'s name at all. See `renameWithRetry`'s doc
  * comment for the one Windows-specific wrinkle this needed on top of a
  * plain `rename`.
+ *
+ * `retryOptions` is an optional pass-through to `renameWithRetry` — absent
+ * for every real caller (`startDaemon` calls this with two arguments, so
+ * production behavior is exactly `renameWithRetry`'s own defaults), and
+ * used only by daemon.test.ts's atomicity test to scale the retry timing
+ * down (see `RenameWithRetryOptions`'s doc comment) without touching
+ * anything about *how* the retry works.
  */
-async function writeDaemonJsonAtomic(path: string, info: DaemonInfo): Promise<void> {
+async function writeDaemonJsonAtomic(
+  path: string,
+  info: DaemonInfo,
+  retryOptions?: RenameWithRetryOptions,
+): Promise<void> {
   const dir = dirname(path);
   await mkdir(dir, { recursive: true });
   const tmpPath = join(dir, `.daemon.json.${process.pid}.${randomBytes(6).toString('hex')}.tmp`);
   await writeFile(tmpPath, JSON.stringify(info, null, 2), 'utf8');
-  await renameWithRetry(tmpPath, path);
+  await renameWithRetry(tmpPath, path, retryOptions);
 }
 
 /**
@@ -320,3 +402,9 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Sta
 // directory rather than a direct write to `path` — the property that gives
 // writeDaemonJsonAtomic its name.
 export { writeDaemonJsonAtomic };
+
+// Exported for daemon.test.ts's unit test of the retry policy itself
+// (budget exhaustion, non-transient errors not retried, growing waits),
+// which injects a fake `rename`/`sleep`/`now` via `RenameWithRetryOptions`
+// rather than exercising the real filesystem and real wall-clock time.
+export { renameWithRetry, RENAME_RETRY_BUDGET_MS, RENAME_RETRY_BASE_DELAY_MS, RENAME_RETRY_MAX_DELAY_MS };

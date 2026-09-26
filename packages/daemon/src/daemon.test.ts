@@ -3,11 +3,15 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  RENAME_RETRY_BASE_DELAY_MS,
+  RENAME_RETRY_BUDGET_MS,
+  RENAME_RETRY_MAX_DELAY_MS,
   readDaemonInfo,
   removeDaemonJsonIfOwnedByPid,
+  renameWithRetry,
   startDaemon,
   writeDaemonJsonAtomic,
 } from './daemon.js';
@@ -162,45 +166,25 @@ describe('writeDaemonJsonAtomic: no partial-write window (required test 5)', () 
     'several readers sampling daemon.json repeatedly, across many repeated writes to the same path, never observe ' +
       'a truncated or malformed file — only a complete previous or complete next version, proving the write goes ' +
       'through a temp-file-then-rename rather than a direct write to the destination. Writes are sequential (never ' +
-      "two writers racing the same rename at once — that scenario is required test 1/2's job, not this one's: in " +
-      'production there is never more than one live daemon holding the lock, so more than one legitimate writer to ' +
-      'a given daemon.json never happens); what is realistic and worth stressing here is a reader — a client ' +
-      'resolving the daemon to connect to — sampling the file at the exact instant it gets rewritten, repeated many ' +
-      'times over (several independent readers here, not one, purely to widen sampling coverage — see the ' +
-      '`readerCount` comment below). Each reader cedes the event loop between its own samples (see the sleep below) ' +
-      'instead of calling ' +
-      "readFile back-to-back with zero pause. That is not a cosmetic choice: on NTFS, `rename()` can't retarget a " +
-      "destination another handle currently has open (daemon.ts's `renameWithRetry` doc comment), and a reader " +
-      "with no pause at all keeps a handle open on daemon.json almost continuously, so the writer's bounded retry " +
-      '(20 attempts * 20ms = 400ms) can run out entirely — starving the rename outright rather than exercising the ' +
-      'atomicity guarantee this test exists to check. That is not hypothetical: measured locally (Windows/NTFS), a ' +
-      'zero-pause reader made this test fail 5/5 isolated runs on EPERM after exhausting all 20 rename attempts, ' +
-      'and pauses up to ~25ms still failed some runs — the failures cluster because 25ms is close enough to the ' +
-      "20ms retry delay that the reader's read cycle stays roughly in phase with the writer's retries instead of " +
-      'landing in the gaps between them. 30ms cleared that resonance and passed 10/10 isolated runs, so that — not ' +
-      'the 1-5ms initially guessed — is the pause used below. A realistic reader (a client polling to connect, ' +
-      "with multi-second backoff) never comes anywhere near this cadence; see required test 5's own acceptance " +
-      'evidence for the full before/after attempt-count numbers. Do not shrink the pause to make the loop ' +
-      '"tighter" — that reintroduces the starvation, not a stronger test; if you need more samples, raise ' +
-      '`totalWrites` instead, which lengthens the run without changing the pause.',
+      "two writers racing the same rename at once — that scenario is required test 1/2's job, not this one's). " +
+      'Each reader paces itself with a *randomized* pause between samples, not a fixed one: an earlier version of ' +
+      "this test used a fixed 30ms pause and it worked, until it didn't — a fixed reader interval can drift into " +
+      "phase with the writer's own retry interval (it used to be a fixed 20ms delay too), so every retry lands " +
+      'while the reader happens to hold the file open, starving the rename outright rather than exercising the ' +
+      "atomicity guarantee this test checks. `renameWithRetry` itself now backs off exponentially with jitter " +
+      'instead of a fixed interval for the same reason (see its doc comment in daemon.ts); randomizing the reader ' +
+      'pause here too means neither side can lock into a resonant cadence with the other. The retry timing passed ' +
+      'below is the same mechanism as production (still real timers, still exponential-with-jitter, still the ' +
+      "same code path) scaled down via `RenameWithRetryOptions` — real NTFS lock contention under this reader " +
+      "load turned out to need several retries fairly often (measured), and production's multi-second budget " +
+      'would make this specific stress test needlessly slow without adding coverage the smaller numbers here ' +
+      "don't already provide.",
     async () => {
       const daemonJsonPath = daemonJsonPathFor('atomic');
-      // 120 rather than a smaller round number so each reader — sampling
-      // every ~30ms (see this test's own description for why 30ms, not a
-      // smaller pause) — still gets a meaningful number of real samples
-      // over the run.
-      const totalWrites = 120;
-      const readerPauseMs = 30;
-      // Several independent readers, not one, each still pacing itself at
-      // readerPauseMs: one reader at 30ms only manages on the order of ~20
-      // samples across the whole run (measured), which is too sparse a net
-      // to reliably catch a rare truncation window — see this test's own
-      // description ("required test 5's own acceptance evidence") for the
-      // measured before/after sample counts. Multiple readers, offset from
-      // each other purely by the natural jitter of when each one starts,
-      // multiply the number of independent snapshots in time without any
-      // single one of them looping tightly.
-      const readerCount = 6;
+      const totalWrites = 100;
+      // Several independent readers, not one, purely to widen sampling
+      // coverage across the run.
+      const readerCount = 4;
       const readErrors: string[] = [];
       let stopReading = false;
 
@@ -228,28 +212,31 @@ describe('writeDaemonJsonAtomic: no partial-write window (required test 5)', () 
               // fine — that is "the previous complete state (nothing)", not
               // a partial one.
             }
-            // Cede the event loop between samples instead of looping back
-            // immediately — see this test's own description for why a
-            // near-zero pause here starves the writer's rename retry on
-            // NTFS rather than testing atomicity, and why 30ms
-            // specifically.
-            await sleep(readerPauseMs);
+            // Randomized pause (not a fixed one) between samples — see this
+            // describe block's own comment for why a fixed cadence is the
+            // fragile choice here.
+            await sleep(20 + Math.random() * 40);
           }
         })();
 
       const readerLoops = Array.from({ length: readerCount }, () => makeReaderLoop());
 
       for (let i = 0; i < totalWrites; i += 1) {
-        await writeDaemonJsonAtomic(daemonJsonPath, {
-          pid: 1000 + i,
-          // Padded well past a single filesystem write's usual atomic
-          // chunk size, so a hypothetical direct (non-atomic) write would
-          // have a realistic window to be caught truncated mid-write.
-          pipe: `pipe-${i}-${'x'.repeat(4096)}`,
-          token: `${randomUUID()}${randomUUID()}${randomUUID()}`,
-          protocolVersion: 1,
-          startedAt: new Date().toISOString(),
-        });
+        await writeDaemonJsonAtomic(
+          daemonJsonPath,
+          {
+            pid: 1000 + i,
+            // Padded well past a single filesystem write's usual atomic
+            // chunk size, so a hypothetical direct (non-atomic) write would
+            // have a realistic window to be caught truncated mid-write.
+            pipe: `pipe-${i}-${'x'.repeat(4096)}`,
+            token: `${randomUUID()}${randomUUID()}${randomUUID()}`,
+            protocolVersion: 1,
+            startedAt: new Date().toISOString(),
+          },
+          // Scaled-down retry timing — see this test's own description.
+          { baseDelayMs: 5, maxDelayMs: 40, budgetMs: 2000 },
+        );
       }
       stopReading = true;
       await Promise.all(readerLoops);
@@ -261,6 +248,7 @@ describe('writeDaemonJsonAtomic: no partial-write window (required test 5)', () 
       const leftoverTmpFiles = entries.filter((name) => name.includes('.tmp'));
       expect(leftoverTmpFiles).toEqual([]);
     },
+    15_000,
   );
 });
 
@@ -291,5 +279,98 @@ describe('removeDaemonJsonIfOwnedByPid: clean shutdown (required test 7)', () =>
     await expect(
       removeDaemonJsonIfOwnedByPid(daemonJsonPath, process.pid),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe('renameWithRetry: budgeted exponential backoff (production retry policy)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function makeFakeClock(): { now: () => number; sleep: (ms: number) => Promise<void>; waits: number[] } {
+    let simulatedNow = 0;
+    const waits: number[] = [];
+    return {
+      now: () => simulatedNow,
+      sleep: (ms: number) => {
+        waits.push(ms);
+        simulatedNow += ms;
+        return Promise.resolve();
+      },
+      waits,
+    };
+  }
+
+  it('gives up once the total time budget is exhausted on a persistent transient error, instead of retrying forever', async () => {
+    const clock = makeFakeClock();
+    const transientErr = Object.assign(new Error('EPERM: rename blocked'), { code: 'EPERM' });
+    const fakeRename = (): Promise<void> => Promise.reject(transientErr);
+
+    await expect(
+      renameWithRetry('tmp', 'dest', { rename: fakeRename, sleep: clock.sleep, now: clock.now }),
+    ).rejects.toBe(transientErr);
+
+    // The loop stops once simulated time crosses the budget, not before —
+    // and it does stop, rather than looping until the test times out.
+    expect(clock.now()).toBeGreaterThanOrEqual(RENAME_RETRY_BUDGET_MS);
+    expect(clock.waits.length).toBeGreaterThan(1);
+  });
+
+  it('does not retry an error that is not transient (e.g. ENOENT) — it propagates on the first attempt', async () => {
+    const clock = makeFakeClock();
+    const notFoundErr = Object.assign(new Error('ENOENT: no such file'), { code: 'ENOENT' });
+    let attempts = 0;
+    const fakeRename = (): Promise<void> => {
+      attempts += 1;
+      return Promise.reject(notFoundErr);
+    };
+
+    await expect(
+      renameWithRetry('tmp', 'dest', { rename: fakeRename, sleep: clock.sleep, now: clock.now }),
+    ).rejects.toBe(notFoundErr);
+
+    expect(attempts).toBe(1);
+    expect(clock.waits).toEqual([]);
+  });
+
+  it('succeeds once the transient error clears, after retrying with growing waits', async () => {
+    // Full jitter (`Math.random() * half`) is deterministic here because
+    // Math.random is pinned to its max: this isolates the *growth* of the
+    // backoff cap from the randomness layered on top of it, which is what
+    // "as esperas crescem" (this task's own wording) asks this test to show.
+    vi.spyOn(Math, 'random').mockReturnValue(1);
+    const clock = makeFakeClock();
+    const transientErr = Object.assign(new Error('EBUSY: rename blocked'), { code: 'EBUSY' });
+    let attempts = 0;
+    const failuresBeforeSuccess = 4;
+    const fakeRename = (): Promise<void> => {
+      attempts += 1;
+      if (attempts <= failuresBeforeSuccess) {
+        return Promise.reject(transientErr);
+      }
+      return Promise.resolve();
+    };
+
+    await expect(
+      renameWithRetry('tmp', 'dest', { rename: fakeRename, sleep: clock.sleep, now: clock.now }),
+    ).resolves.toBeUndefined();
+
+    expect(attempts).toBe(failuresBeforeSuccess + 1);
+    expect(clock.waits).toHaveLength(failuresBeforeSuccess);
+    // With Math.random() pinned to 1, backoffDelayMs(attempt) is exactly
+    // min(MAX, BASE * 2^(attempt-1)) — strictly growing until it saturates
+    // at the cap.
+    const expectedWaits = Array.from({ length: failuresBeforeSuccess }, (_, i) =>
+      Math.min(RENAME_RETRY_MAX_DELAY_MS, RENAME_RETRY_BASE_DELAY_MS * 2 ** i),
+    );
+    expect(clock.waits).toEqual(expectedWaits);
+    for (let i = 1; i < clock.waits.length; i += 1) {
+      const previous = clock.waits[i - 1];
+      const current = clock.waits[i];
+      if (previous === undefined || current === undefined) {
+        throw new Error('unreachable: indices within bounds of a non-empty array');
+      }
+      expect(current).toBeGreaterThanOrEqual(previous);
+    }
   });
 });

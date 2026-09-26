@@ -19,6 +19,36 @@ export type { SplitTreeProps } from './SplitTree.js';
 export { PaneHeader } from './PaneHeader.js';
 export type { PaneHeaderProps } from './PaneHeader.js';
 
+// ─── M3.6: drag-and-drop (pane move + tab reorder) pure logic ─────────────
+
+export {
+  computePaneDrop,
+  decodePaneDragPayload,
+  edgeForPoint,
+  encodePaneDragPayload,
+  isPaneDragDisabled,
+  PaneDragContext,
+  EDGE_DEAD_ZONE_FRACTION,
+  PANE_DRAG_MIME,
+} from './pane-drag.js';
+export type {
+  DragPoint,
+  DragRect,
+  PaneDragApi,
+  PaneDragState,
+  PaneDropResult,
+  PaneDropTarget,
+} from './pane-drag.js';
+
+export {
+  decodeTabDragPayload,
+  encodeTabDragPayload,
+  reorderWorkspaceIds,
+  tabInsertionIndex,
+  TAB_DRAG_MIME,
+} from './tab-drag.js';
+export type { TabRect } from './tab-drag.js';
+
 export {
   attachTerminalSession,
   encodeTerminalBinaryInput,
