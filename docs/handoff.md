@@ -7,48 +7,19 @@ Estado em 2026-09-26, escrito para quem assumir a coordenação em outra sessão
 | Branch | Conteúdo | Estado |
 |---|---|---|
 | `main` | M0, M1 e M2 mergeados | CI verde. Gate do M2 fechado pelo dono em 24/09 |
-| `m3-tabs-splits` | M3.1 a M3.5 e três correções, **tudo verificado** | CI verde. PR #2 em draft |
-| `wip/m3.6-e-retry-rename` | Trabalho **não verificado**, interrompido no meio (abaixo) | Não mergear sem verificar |
+| `m3-tabs-splits` | M3.1 a M3.6 e quatro correções, **tudo verificado** | PR #2 em draft. Falta só o gate manual do M3 |
 
-## Como retomar o trabalho da branch `wip/`
+A branch `wip/m3.6-e-retry-rename` foi desmontada em dois commits verificados, um por tarefa: `cf706fb` (retry do rename) e `6ed3c0f` (M3.6). O que ficou provado e o que não ficou está na mensagem de cada um.
 
-**Não trabalhe na `wip/`, e não a mergeie como está.** O commit dela junta duas tarefas (M3.6 e a correção do retry) com uma mensagem que só diz "não verificado", e o processo do projeto é um commit por tarefa, com mensagem explicando o porquê. A `wip/` é um depósito para o código não se perder, não uma branch de trabalho.
+## Onde o M3 está
 
-O fluxo:
+O código do M3 está completo. A M3.6 foi exercitada num Chromium real, com os componentes montados numa ponte falsa, e os gestos nativos de drag funcionaram: divisória, painel solto na borda de outro, reordenação de abas e troca de aba. No fim, cada painel tinha o próprio conteúdo, e cada sessão teve um `session.attach` só. **Não** foi provada em Electron real com daemon: a sessão de retomada rodou num container Linux, sem o binário do Electron, e toda sessão nova nasce em `powershell.exe` fixo (M4.6).
 
-1. Continue na `m3-tabs-splits`: `git checkout m3-tabs-splits && git pull`.
-2. Traga os arquivos de **uma** tarefa da `wip/` para a árvore, sem commitar:
-   - M3.6: `git restore --source=origin/wip/m3.6-e-retry-rename -- packages/ui/src/TabBar.tsx packages/ui/src/PaneHeader.tsx packages/ui/src/SplitTree.tsx packages/ui/src/index.ts packages/ui/src/tab-bar.css packages/ui/src/pane-header.css packages/ui/src/split-tree.css packages/ui/src/pane-drag.ts packages/ui/src/pane-drag.test.ts packages/ui/src/tab-drag.ts packages/ui/src/tab-drag.test.ts`
-   - Retry do rename: `git restore --source=origin/wip/m3.6-e-retry-rename -- packages/daemon/src/daemon.ts packages/daemon/src/daemon.test.ts`
-3. Complete e verifique a tarefa (o que falta está abaixo). Ou dispare um subagente com o escopo dela, dizendo que o código de partida já está na árvore.
-4. Commite **essa tarefa só**, com a mensagem de sempre, em português e explicando o porquê. Faça push e confira o CI.
-5. Repita para a outra tarefa. As duas mexem em arquivos disjuntos e podem ser verificadas em paralelo.
-6. Com as duas na `m3-tabs-splits`, apague a `wip/`: `git push origin --delete wip/m3.6-e-retry-rename`.
-
-## O que falta no M3
-
-### M3.6: arrastar abas e painéis (na branch `wip/`)
-
-O agente foi interrompido logo depois de o typecheck passar. Está implementado: `pane-drag.ts`, `tab-drag.ts` e os testes deles, mais mudanças em `TabBar.tsx`, `PaneHeader.tsx`, `SplitTree.tsx` e nos `.css`. **Falta:** lint, format, os testes vistos falhando com a lógica quebrada, e a prova do gate do M3 em Electron real. O prompt original pedia:
-
-- 4 sessões em 2×2 com conteúdo distinto; arrastar a divisória; mover um painel para a borda de outro; reordenar abas; trocar de aba;
-- no fim, cada painel com o próprio conteúdo e a contagem de `session.attach` igual ao número de sessões;
-- o drag sintético do HTML5 pode não disparar na automação. Nesse caso, o movimento é feito pela store, e o gesto fica declarado para o teste manual do dono.
-
-Para retomar: ou reverifica o que está na `wip/` e completa, ou dispara um subagente novo com o mesmo escopo, partindo do código da `wip/`.
-
-### Correção do retry do `rename` do `daemon.json` (na branch `wip/`)
-
-O teste 5 de `packages/daemon/src/daemon.test.ts` (escrita atômica) passa isolado e falha às vezes no suite completo, sob carga. A pausa fixa de 30ms dos leitores (`d302f7b`) era empírica e frágil. A decisão tomada:
-
-- em **produção**, `renameWithRetry` com backoff exponencial e jitter, e orçamento total de 3 a 5 segundos, em vez dos 400ms fixos. No Windows, o antivírus pode segurar um arquivo recém-escrito por mais tempo que isso;
-- no **teste**, pausa dos leitores com jitter.
-
-Está implementado na `wip/` (`daemon.ts` e `daemon.test.ts`). **Falta:** provar a estabilidade (suite completo 5 vezes seguidas e o teste isolado 10 vezes), mostrar o teste ainda falhando com uma escrita direta no destino, e o teste unitário do retry com o `rename` injetado.
+O protótipo da UI não estava disponível nessa sessão. O realce da zona de soltura e o indicador de inserção da aba não foram conferidos contra ele.
 
 ### Fechar o M3
 
-Depois das duas acima, o gate é teste manual do dono: 4 agentes (`claude` de verdade) em grade 2×2, divisórias arrastáveis, troca de aba sem perder scrollback. Com o ok dele: tirar o PR #2 do draft, merge `--no-ff` na `main`, confirmar o CI na `main`.
+O gate é teste manual do dono, no Windows: 4 agentes (`claude` de verdade) em grade 2×2, divisórias arrastáveis, troca de aba sem perder scrollback. Com o ok dele: tirar o PR #2 do draft, merge `--no-ff` na `main`, confirmar o CI na `main`.
 
 ## Depois: M4
 
@@ -67,6 +38,7 @@ A M4.1 é ⬥ e precisa de techspec antes de disparar.
 - **Nunca matar daemon sem conferir o PID contra o `daemon.json`, e nunca matar o do dono.** Um agente já chamou o daemon do dono de "órfão de teste".
 - **O `@termhub/ui` recebe a ponte por prop.** Nunca lê `window.termhub`.
 - **Os terminais vivem no registro** (`terminal-registry.ts`, M3.5), fora da árvore do React. Qualquer layout novo usa `TerminalSlot`; nunca monte xterm dentro de componente de layout. O motivo está em `docs/specs/m3.5-terminal-lifecycle.md`, seção 2.
+- **Container Linux (sessão na nuvem).** Os 3 testes que abrem PTY real (`session`, `service`, `cli`) exigem `powershell.exe` e falham em Linux, na base também. Quem os roda é o CI em Windows. O rename do `daemon.json` também nunca falha com `EPERM` em Linux, então flake de NTFS não se reproduz aqui.
 - **Uma sessão por folha.** O segundo terminal da mesma sessão não recebe snapshot (spec da M2.6, seção 6).
 
 ## Pendências conhecidas, registradas nos commits
