@@ -1,35 +1,44 @@
 import { useEffect, useRef, useState } from 'react';
-import { Terminal, measureFitSize, TERMINAL_SOLO_PADDING } from '@termhub/ui';
+import {
+  createTerminalRegistry,
+  measureFitSize,
+  SplitTree,
+  TabBar,
+  useTermhubStore,
+  type TerminalRegistry,
+} from '@termhub/ui';
 
-import { resolveBootSession } from './session-boot.js';
+import { resolveBootWorkspace } from './session-boot.js';
 
-// Full-window, single-terminal shell for M2.3's milestone gate (docs/
-// milestones.md M2, "rodar `claude` dentro do TermHub e conversar com ele").
-// Solo-pane layout per the prototype (docs/plan.md section 2, `.pane.solo
-// .term`): no sidebar, no tabs, no split tree — those are M3/M4. The amber
-// warning strip the prototype shows for daemon trouble is also not this
-// task's (a plain status line stands in for it here); see this task's final
-// report.
+// M3.1's casca: a tab strip (one workspace = one tab, docs/plan.md section
+// 2) over a grid of panes for the active workspace, everything read from
+// `useTermhubStore` (`@termhub/ui`'s store). `TabBar`/`SplitTree` are M3.1's
+// own minimal placeholders — see their doc comments for what M3.2/M3.3/M3.4
+// replace and why this file only wires them together instead of styling
+// anything itself.
 //
-// M2.4 addendum (this task): `soloPaneStyle` below applies the prototype's
-// `.pane.solo .term { padding: 8px 14px 14px }` — `TERMINAL_SOLO_PADDING`,
-// the same constant `@termhub/ui` exports for anything measuring the same
-// space. It wraps `containerRef` (the div `measureFitSize` measures and
-// `Terminal` mounts into) rather than applying padding directly to
-// `containerRef` itself: `@xterm/addon-fit` reads padding off xterm's own
-// generated `.xterm` element and reads width/height off *that element's
-// parent* — so padding on `containerRef` (which becomes that parent) would
-// double-count against `@xterm/addon-fit`'s own arithmetic, while an
-// unpadded `containerRef` inset by an *outer* padded wrapper (CSS
-// percentage sizing resolves against the parent's content box regardless of
-// `box-sizing`) keeps `containerRef`'s measured box identical to the space
-// actually available to the terminal, for both `measureFitSize`'s probe and
-// the real `Terminal`.
+// Boot still measures a probe container before ever touching the store
+// (`measureFitSize`, unchanged from M2.3/M2.6): `resolveBootWorkspace`'s
+// fresh-session path needs a `cols`/`rows` guess for a PTY that doesn't
+// exist yet, the same reasoning `session-boot.ts`'s header comment already
+// covers. Once boot resolves, this component never goes back to the
+// measuring/status screen — the store is hydrated once
+// (`useTermhubStore.getState().hydrate`) and every render after that reads
+// live store state.
+//
+// Every workspace's `SplitTree` stays mounted, all the time, switched only
+// via `display: none` (M3.1's prompt, section 3.5) — so switching tabs
+// never re-attaches a session or drops xterm's scrollback. As of M3.5, the
+// terminal instances themselves aren't even in this tree any more: `App`
+// creates one `TerminalRegistry` (`@termhub/ui`'s `terminal-registry.ts`)
+// for the page's whole lifetime, and every `SplitTree` below only renders
+// `TerminalSlot`s that ask the registry to place/park its already-alive
+// host — see docs/specs/m3.5-terminal-lifecycle.md section 4.1 for why
+// birth/death now tracks the store (`split`/`closePane`/`closeWorkspace`/
+// `removeSession`), not React mounts, and section 4.5 for why this
+// component is the one that creates and disposes it.
 
-type SessionBootState =
-  | { phase: 'measuring' }
-  | { phase: 'ready'; sessionId: number; cols: number; rows: number }
-  | { phase: 'error'; message: string };
+type BootState = { phase: 'measuring' } | { phase: 'ready' } | { phase: 'error'; message: string };
 
 const shellStyle = {
   width: '100vw',
@@ -37,7 +46,9 @@ const shellStyle = {
   backgroundColor: '#1e1e1e',
   color: '#cccccc',
   fontFamily: '"Segoe UI", system-ui, sans-serif',
-  fontSize: '14px',
+  fontSize: '13px',
+  display: 'flex',
+  flexDirection: 'column',
 } as const;
 
 const statusStyle = {
@@ -48,12 +59,11 @@ const statusStyle = {
   justifyContent: 'center',
 } as const;
 
-const soloPaneStyle = {
-  width: '100%',
-  height: '100%',
-  backgroundColor: '#1e1e1e',
-  boxSizing: 'border-box',
-  padding: `${TERMINAL_SOLO_PADDING.top}px ${TERMINAL_SOLO_PADDING.right}px ${TERMINAL_SOLO_PADDING.bottom}px ${TERMINAL_SOLO_PADDING.left}px`,
+const gridAreaStyle = {
+  flex: 1,
+  minHeight: 0,
+  minWidth: 0,
+  position: 'relative',
 } as const;
 
 /** Renders whatever `window.termhub`'s current connection state warrants when it isn't `'connected'`, or `null` once it is (the caller then proceeds to session boot). */
@@ -84,8 +94,27 @@ function ConnectionStatus({
 
 export function App() {
   const [connection, setConnection] = useState(() => window.termhub.getConnectionState());
-  const [sessionState, setSessionState] = useState<SessionBootState>({ phase: 'measuring' });
-  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [bootState, setBootState] = useState<BootState>({ phase: 'measuring' });
+  const probeRef = useRef<HTMLDivElement | null>(null);
+
+  const workspaces = useTermhubStore((s) => s.workspaces);
+  const activeWorkspaceId = useTermhubStore((s) => s.activeWorkspaceId);
+  const sessions = useTermhubStore((s) => s.sessions);
+  const setActiveWorkspace = useTermhubStore((s) => s.setActiveWorkspace);
+  const focusPaneAction = useTermhubStore((s) => s.focusPane);
+  const setRatioAction = useTermhubStore((s) => s.setRatio);
+
+  // Created once, for the whole life of this page — never recreated on a
+  // re-render (docs/specs/m3.5-terminal-lifecycle.md section 4.5). `useState`'s
+  // lazy initializer runs exactly once, on the very first render; the
+  // registry itself subscribes to `useTermhubStore` immediately (it doesn't
+  // need to wait for boot to hydrate the store — an empty store simply has
+  // nothing placed yet). Disposed on this component's own unmount, i.e. the
+  // end of the page's life, not on every render.
+  const [registry] = useState<TerminalRegistry>(() =>
+    createTerminalRegistry({ bridge: window.termhub, store: useTermhubStore }),
+  );
+  useEffect(() => () => registry.dispose(), [registry]);
 
   useEffect(() => window.termhub.onConnectionStateChange(setConnection), []);
 
@@ -93,44 +122,44 @@ export function App() {
     if (connection.state !== 'connected') {
       return;
     }
-    const container = containerRef.current;
-    if (container === null) {
+    if (bootState.phase !== 'measuring') {
+      // Boot already resolved (or failed) in an earlier pass over this
+      // effect — `resolveBootWorkspace`'s own singleton would no-op a
+      // second call anyway, but this also skips re-measuring a probe
+      // container that no longer renders once boot is `'ready'`.
+      return;
+    }
+    const probe = probeRef.current;
+    if (probe === null) {
       return;
     }
     let cancelled = false;
-    // Measured before session.create so a freshly spawned PTY is born the
-    // size it will actually render into, instead of a fixed default that
-    // `session.resize` would otherwise have to correct on the first real
-    // resize (M2.5) — see `measureFitSize`'s own doc comment. `measureFitSize`
-    // is async as of M2.4 (it awaits the configured font before measuring —
-    // `terminal-theme.ts`'s `ensureTerminalFontReady`), so `resolveBootSession`
-    // is chained off it instead of running in parallel.
-    measureFitSize(container)
-      .then(({ cols, rows }) => resolveBootSession(window.termhub, { cols, rows }))
-      .then((session) => {
-        if (!cancelled) {
-          // `session.cols`/`session.rows` — never the `measureFitSize`
-          // result computed just above — are what `Terminal` constructs its
-          // xterm with (docs/specs/m2.6-boot-reattach.md section 3.5). For
-          // a freshly created session the two happen to be equal (`session-
-          // boot.ts` sizes `session.create` with exactly this window's
-          // measured fit), but for a *reused* session they're the daemon's
-          // real, possibly-different, current geometry (the last
-          // `session.resize`) — using the window's fresh measurement there
-          // instead would size the xterm to the wrong geometry for a
-          // snapshot already serialized at the session's own.
-          setSessionState({
-            phase: 'ready',
-            sessionId: session.id,
-            cols: session.cols,
-            rows: session.rows,
-          });
+    measureFitSize(probe)
+      .then(({ cols, rows }) => resolveBootWorkspace(window.termhub, { cols, rows }))
+      .then((result) => {
+        if (cancelled) {
+          return undefined;
         }
+        const current = useTermhubStore.getState();
+        const nextSessions = { ...current.sessions };
+        for (const session of result.sessions) {
+          nextSessions[session.id] = session;
+        }
+        // One `hydrate` call instead of an `upsertSession` per session plus
+        // an `addWorkspace` — so a subscriber never observes an
+        // intermediate render where the workspace's tree already
+        // references a session that isn't in `sessions` yet.
+        useTermhubStore.getState().hydrate({
+          workspaces: [...current.workspaces, result.workspace],
+          activeWorkspaceId: result.workspace.id,
+          sessions: nextSessions,
+        });
+        setBootState({ phase: 'ready' });
         return undefined;
       })
       .catch((err: unknown) => {
         if (!cancelled) {
-          setSessionState({
+          setBootState({
             phase: 'error',
             message: err instanceof Error ? err.message : String(err),
           });
@@ -139,7 +168,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [connection.state]);
+  }, [connection.state, bootState.phase]);
 
   if (connection.state !== 'connected') {
     return (
@@ -149,23 +178,56 @@ export function App() {
     );
   }
 
-  return (
-    <div style={shellStyle}>
-      <div style={soloPaneStyle}>
-        <div ref={containerRef} style={{ width: '100%', height: '100%' }}>
-          {sessionState.phase === 'measuring' && <div style={statusStyle}>Preparando sessão…</div>}
-          {sessionState.phase === 'error' && (
-            <div style={statusStyle}>Não foi possível abrir uma sessão: {sessionState.message}</div>
-          )}
-          {sessionState.phase === 'ready' && (
-            <Terminal
-              sessionId={sessionState.sessionId}
-              cols={sessionState.cols}
-              rows={sessionState.rows}
-              bridge={window.termhub}
-            />
+  if (bootState.phase !== 'ready') {
+    return (
+      <div style={shellStyle}>
+        <div ref={probeRef} style={{ width: '100%', height: '100%' }}>
+          {bootState.phase === 'measuring' && <div style={statusStyle}>Preparando sessão…</div>}
+          {bootState.phase === 'error' && (
+            <div style={statusStyle}>Não foi possível abrir uma sessão: {bootState.message}</div>
           )}
         </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={shellStyle}>
+      <TabBar
+        workspaces={workspaces}
+        activeWorkspaceId={activeWorkspaceId}
+        onSelect={(workspaceId) => {
+          setActiveWorkspace(workspaceId);
+        }}
+        bridge={window.termhub}
+      />
+      <div style={gridAreaStyle}>
+        {workspaces.map((workspace) => (
+          <div
+            key={workspace.id}
+            style={{
+              position: 'absolute',
+              inset: 0,
+              display: workspace.id === activeWorkspaceId ? 'block' : 'none',
+            }}
+          >
+            <SplitTree
+              workspaceId={workspace.id}
+              root={workspace.root}
+              sessions={sessions}
+              focusedSessionId={workspace.focusedSessionId}
+              maximizedSessionId={workspace.maximizedSessionId}
+              registry={registry}
+              bridge={window.termhub}
+              onFocusPane={(sessionId) => {
+                focusPaneAction(workspace.id, sessionId);
+              }}
+              onSetRatio={(nodeId, ratio) => {
+                setRatioAction(workspace.id, nodeId, ratio);
+              }}
+            />
+          </div>
+        ))}
       </div>
     </div>
   );

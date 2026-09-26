@@ -2,6 +2,8 @@ import { pathToFileURL } from 'node:url';
 
 import { ALREADY_RUNNING_EXIT_CODE } from './daemon.js';
 import { runDaemon } from './daemon-runtime.js';
+import type { RunDaemonOptions } from './daemon-runtime.js';
+import { resolvePipeAddress } from './transport-address.js';
 
 // The daemon's real OS-process entrypoint (docs/milestones.md M1.8's own
 // "packages/daemon/index.ts", and docs/specs/m1.8-single-instance.md
@@ -20,8 +22,69 @@ import { runDaemon } from './daemon-runtime.js';
 // to know any of that: it only needs to behave correctly when *something*
 // runs it as `node index.ts` (or, in production, the Electron equivalent).
 
+/**
+ * Reads `TERMHUB_PIPE_SUFFIX`, the one env var this entrypoint (and only
+ * this entrypoint — daemon-runtime.ts stays a library that never touches
+ * `process.env`) understands for test isolation: a test app with its own
+ * `APPDATA` reads a `daemon.json` from its own isolated directory, but
+ * without this, the daemon it spawns would still resolve the *same* pipe
+ * name a real daemon on the same machine uses (`derivePipeName` /
+ * `resolvePipeAddress` in transport-address.ts key only off the OS
+ * username), so the two would collide on `listen()` — the test daemon
+ * either loses the race and never starts, or wins it and silently steals
+ * the real daemon's address. Folding an extra suffix into the same hash
+ * (transport-address.ts's own `suffix` option, already used by every test
+ * in this package) gives the test daemon a distinct pipe end to end,
+ * without the app itself needing to change: it just connects to whatever
+ * pipe the daemon it spawned announces in its own `daemon.json`.
+ *
+ * Unset (the default), this returns `undefined` and `main()` below passes
+ * no `address` to `runDaemon`, which falls through to `startDaemon`'s own
+ * default (`resolvePipeAddress()` with no suffix) — byte-identical to
+ * today's behavior.
+ *
+ * Exported for index.test.ts's isolation test to exercise directly, in
+ * addition to that same test spawning two real daemon processes with
+ * distinct suffixes end to end.
+ */
+export function resolveAddressOverride(): string | undefined {
+  const suffix = process.env.TERMHUB_PIPE_SUFFIX;
+  if (suffix === undefined || suffix.length === 0) {
+    return undefined;
+  }
+  return resolvePipeAddress({ suffix });
+}
+
+/**
+ * Reads `TERMHUB_IDLE_TIMEOUT_MS`/`TERMHUB_IDLE_CHECK_INTERVAL_MS` —
+ * entrypoint-only escape hatches (same reasoning as
+ * `resolveAddressOverride` above) so a test can spawn this file as a real
+ * process with a short idle timeout, rather than waiting out the real
+ * 10-minute default. `runDaemon` already accepts both as options; nothing
+ * about their meaning changes here, this just plumbs them from the
+ * environment. Unset, both are `undefined` and `runDaemon` falls through to
+ * its own real defaults, exactly as today.
+ */
+function readOptionalMs(envVar: string): number | undefined {
+  const raw = process.env[envVar];
+  if (raw === undefined || raw.length === 0) {
+    return undefined;
+  }
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
 async function main(): Promise<void> {
-  const result = await runDaemon();
+  const address = resolveAddressOverride();
+  const idleTimeoutMs = readOptionalMs('TERMHUB_IDLE_TIMEOUT_MS');
+  const idleCheckIntervalMs = readOptionalMs('TERMHUB_IDLE_CHECK_INTERVAL_MS');
+  const runDaemonOptions: RunDaemonOptions = {
+    ...(address !== undefined ? { address } : {}),
+    ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
+    ...(idleCheckIntervalMs !== undefined ? { idleCheckIntervalMs } : {}),
+  };
+
+  const result = await runDaemon(runDaemonOptions);
   if (result.outcome === 'already-running') {
     // Section 3.1: losing the race is an expected, quiet outcome, not a
     // failure — a distinct exit code lets a caller (M2.1's spawn logic)
@@ -34,25 +97,36 @@ async function main(): Promise<void> {
   const { runtime } = result;
   let shuttingDown = false;
 
+  // The single place this process decides to exit, for *any* shutdown
+  // trigger — signal or idle-shutdown alike. Before this fix, only the
+  // signal path below called `process.exit` explicitly; the idle path
+  // (daemon-runtime.ts's `onIdleTimeout`, which only calls
+  // `runtime.shutdown()`) relied on the event loop draining once
+  // `shutdown()`'s own steps finished, which never happened in practice —
+  // a daemon idled out this way stayed alive indefinitely (see this task's
+  // final report for what was actually still holding the event loop open).
+  // Registering this before either trigger can fire (nothing above this
+  // line awaits) makes both paths converge on the exact same exit
+  // behavior the old signal-only code had, without duplicating it.
+  runtime.onShutdownComplete((err) => {
+    if (err !== undefined) {
+      // Section 3.5's shutdown steps (kill live sessions, close the
+      // transport, remove daemon.json if it's still ours) are each
+      // individually best-effort/idempotent already — this is only a
+      // safety net for something unexpected in that chain, so the process
+      // still exits deliberately instead of hanging on a shutdown that's
+      // supposed to mean "stop".
+      console.error('error while shutting down', err);
+    }
+    process.exit(0);
+  });
+
   const handleSignal = (): void => {
     if (shuttingDown) {
       return;
     }
     shuttingDown = true;
-    runtime
-      .shutdown()
-      .catch((err: unknown) => {
-        // Section 3.5's shutdown steps (kill live sessions, close the
-        // transport, remove daemon.json if it's still ours) are each
-        // individually best-effort/idempotent already — this is only a
-        // safety net for something unexpected in that chain, so the
-        // process still exits deliberately instead of hanging on a signal
-        // that's supposed to mean "stop".
-        console.error('error while shutting down', err);
-      })
-      .finally(() => {
-        process.exit(0);
-      });
+    void runtime.shutdown();
   };
 
   process.once('SIGINT', handleSignal);

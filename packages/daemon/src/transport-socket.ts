@@ -43,7 +43,7 @@ export interface FramedSocketHandlers {
 
 export class FramedSocket {
   private readonly decoder = new FrameDecoder();
-  private readonly outQueue: Buffer[] = [];
+  private readonly outQueue: Uint8Array[] = [];
   private writable = true;
   private closed = false;
   private pendingEnd = false;
@@ -91,7 +91,7 @@ export class FramedSocket {
   }
 
   /** Queues (or writes, if there's room) one already-encoded frame. Order is always preserved relative to other `send()` calls on this instance. No-op once the connection is closed. */
-  send(buf: Buffer): void {
+  send(buf: Uint8Array): void {
     if (this.closed || this.pendingEnd) {
       return;
     }
@@ -102,7 +102,7 @@ export class FramedSocket {
     this.writeNow(buf);
   }
 
-  private writeNow(buf: Buffer): void {
+  private writeNow(buf: Uint8Array): void {
     let ok: boolean;
     try {
       ok = this.socket.write(buf);

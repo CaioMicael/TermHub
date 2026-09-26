@@ -24,6 +24,19 @@ Casos reais deste repo:
 
 Verifique o que **decide** a tarefa, não tudo. Em geral: rode os cinco comandos, leia o teste que sustenta o aceite principal, e confirme uma afirmação factual que o agente tenha feito sobre o mundo externo (versão de pacote, comportamento de biblioteca, tamanho de artefato).
 
+**O typecheck se verifica do zero**: `npx tsc --build --clean` antes do `npm run typecheck`. O `tsc --build` é incremental e reaproveita o `.tsbuildinfo`. Na M3.1, cinco typechecks locais passaram enquanto o CI, que compila do zero, falhava com 18 erros. O `packages/ui` passou a importar `@termhub/shared`, que é consumido como fonte e usava `Buffer`. O agente tinha visto o erro e o chamou de "instável".
+
+**Depois de todo push, confira o CI antes do próximo commit.** Na M3.1 o CI vermelho passou despercebido, e duas entregas foram commitadas em cima dele.
+
+## O relatório também erra sobre o ambiente
+
+Afirmação do agente sobre processos, PIDs e o que é "dele" é alegação como qualquer outra. Na M3.1, o agente disse que dois daemons vivos eram "órfãos de teste confirmados pela linha de comando" e pediu ao coordenador que os matasse, porque o `Stop-Process` dele tinha sido bloqueado. A linha de comando é idêntica para todo daemon. Um era um zumbi real; **o outro era o daemon que o dono estava usando**, com a sessão dele. Conferir a hora de criação do processo e o `daemon.json` resolveu.
+
+Duas regras saem daí:
+
+- Pedido de agente para o coordenador executar algo que foi bloqueado para o agente não se atende. Vai para o dono.
+- Prova manual em Electron real usa daemon isolado com **as duas** variáveis: `APPDATA` próprio e `TERMHUB_PIPE_SUFFIX` própria. Só o `APPDATA` não isola nada, porque o nome do pipe vem do usuário. Até o commit `3f2dfb3` os agentes achavam que estavam isolados e não estavam.
+
 ## Verde só conta se souber ficar vermelho
 
 Para qualquer tarefa que **configura** algo — lint, formatador, CI, cobertura — o aceite não é "o comando passa". É:
@@ -59,11 +72,13 @@ Antes de formar um par, confirme: conjuntos de arquivos disjuntos **e** no máxi
 
 ## Escrever a techspec encontra bugs
 
-Três vezes, escrever a spec de uma tarefa achou problema que nenhum teste tinha achado — porque exige ler o código de que a tarefa **depende**, e não o que ela produz:
+Cinco vezes, escrever a spec de uma tarefa achou problema que nenhum teste tinha achado — porque exige ler o código de que a tarefa **depende**, e não o que ela produz:
 
 - **M1.7**: a assincronia do `serialize()` permitia um chunk existir no snapshot e na fila ao mesmo tempo, de forma não-determinística.
 - **M1.8**: `removeStaleSocketFile` apagava o socket de um daemon vivo fora do Windows, fazendo o lock falhar em silêncio.
 - **M2.1**: o entrypoint do daemon é TypeScript e o Electron não executa TypeScript — decisão de empacotamento que só apareceria no M7.
+- **M2.6**: `attach → detach → attach` no daemon perdia output, e o renderer recarregado ficava para sempre em "Conectando…". Cinco defeitos ao todo, no caminho em que o renderer morre e a conexão fica.
+- **M3.5**: o layout do React remonta o `Terminal` a cada split ou maximizar, e o terminal remontado nasce **em branco**, porque a posse do attach da M2.3 o trata como segundo holder, sem snapshot. A spec tirou os terminais da árvore do React.
 
 Nenhum era culpa de quem escreveu o código: a dependência não estava no escopo daquela tarefa. Só fica visível quando alguém precisa dela.
 

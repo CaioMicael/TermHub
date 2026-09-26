@@ -1,0 +1,148 @@
+/*
+ * `PaneHeader.tsx` visuals, matching `termhub-prototipo.html`'s `.pane-head`
+ * rule block (colors below are that file's `:root` variables — same
+ * "hex value + comment naming the prototype var" convention
+ * `split-tree.css`/`tab-bar.css` already use). Side-effect CSS import, same
+ * pattern as those two files.
+ *
+ * Selectors are scoped under a `th-` prefix (`th-pane-head`, `th-dot`, ...)
+ * instead of reusing the prototype's bare `.pane-head`/`.dot`/`.state`
+ * names, and state/focus/solo are BEM-style modifier classes
+ * (`th-pane-head--focused`, `th-dot--run`, ...) rather than the prototype's
+ * ancestor selectors (`.pane.focused .pane-head`) — this component has no
+ * `.pane`/`.focused`/`.solo` ancestor to key off (see `PaneHeader.tsx`'s own
+ * doc comment), so every modifier is a class this component itself decides
+ * to add, from its own props.
+ */
+
+.th-pane-head {
+  height: 26px;
+  flex: 0 0 26px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 4px 0 9px;
+  background: #212121;
+  border-bottom: 1px solid #2b2b2b;
+  font-size: 11.5px;
+  color: #a9a9a9;
+  user-select: none;
+  /* Without this, a flex child (`.th-pmeta`) can never shrink below its
+     content's intrinsic width, which is exactly what pushes the action
+     buttons out of a narrow pane (M3.4's prompt, armadilha 4). */
+  min-width: 0;
+}
+
+.th-pane-head--focused {
+  background: #232a31; /* prototype .pane.focused .pane-head */
+  color: #dcdcdc;
+}
+
+.th-pane-head--solo {
+  background: transparent; /* prototype .pane.solo .pane-head */
+  border-bottom-color: #232323;
+}
+
+/* M3.6: only a header this drag-enabled (`PaneHeader.tsx`'s `dragDisabled`
+   — off for solo/maximized, section 2's last bullet) gets the "grab"
+   cursor; the icon buttons inside still get their own pointer cursor from
+   `.th-icon-btn` below, unaffected by this. */
+.th-pane-head--draggable {
+  cursor: grab;
+}
+
+.th-pane-head .th-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: #6e7681; /* prototype --st-idle, the base .dot's color */
+}
+
+.th-pane-head .th-dot--run {
+  background: #89d185; /* prototype --st-run */
+}
+
+.th-pane-head .th-dot--wait {
+  background: #ffcc00; /* prototype --st-wait */
+}
+
+.th-pane-head .th-dot--err {
+  background: #f14c4c; /* prototype --st-err */
+}
+
+.th-pane-head .th-pname {
+  font-weight: 600;
+  color: #d4d4d4;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.th-pane-head .th-pmeta {
+  color: #858585; /* prototype --fg-dim */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.th-pane-head .th-state {
+  flex: 0 0 auto;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 9px;
+  border: 1px solid #3a3a3a;
+  color: #9d9d9d;
+  white-space: nowrap;
+}
+
+.th-pane-head .th-state--wait {
+  color: #ffcc00; /* prototype .pane-head .state.wait */
+  border-color: #6b5500;
+  background: #3a2f00;
+}
+
+.th-pane-head .th-state--run {
+  color: #89d185; /* prototype .pane-head .state.run */
+  border-color: #2d4a2d;
+  background: #1e2d1e;
+}
+
+/*
+ * `.state.err` has no rule in the prototype (its sample data never shows an
+ * `exited` pane) — extrapolated from the `.wait`/`.run` pattern above using
+ * the prototype's own `--st-err` red (`#f14c4c`, the same value `.dot.err`
+ * and `TabBar.tsx`'s `STATUS_DOT_COLOR.exited` already use), so "saiu com
+ * erro" gets the badge's red the same way "esperando você"/"rodando" get
+ * yellow/green instead of staying visually identical to "ocioso".
+ */
+.th-pane-head .th-state--err {
+  color: #f14c4c;
+  border-color: #6b1f1f;
+  background: #3a1414;
+}
+
+.th-pane-head .th-acts {
+  margin-left: auto;
+  display: flex;
+  gap: 1px;
+  flex: 0 0 auto;
+}
+
+.th-pane-head .th-icon-btn {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 5px;
+  color: #c5c5c5;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+.th-pane-head .th-icon-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+}

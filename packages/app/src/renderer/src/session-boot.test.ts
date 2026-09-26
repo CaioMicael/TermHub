@@ -1,11 +1,13 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { SessionSummary } from '@termhub/shared';
+import { collectSessionIds, treeLeaves, type PaneNode } from '@termhub/ui';
 
 import {
   DEFAULT_CWD,
   DEFAULT_SHELL,
+  DEFAULT_WORKSPACE_ID,
   resetSessionBootForTests,
-  resolveBootSession,
+  resolveBootWorkspace,
   type SessionBootBridge,
   type SessionBootMethod,
   type SessionBootRequestParams,
@@ -26,15 +28,6 @@ function summary(overrides: Partial<SessionSummary> = {}): SessionSummary {
   };
 }
 
-/**
- * A fake `SessionBootBridge`. `request` is implemented as a real generic
- * function (not a plain arrow typed by context) so the two branches can
- * each return their own method's result shape — the same "erase to the
- * union, cast back" pattern `packages/app/src/preload/bridge.ts`'s real
- * `request` implementation uses for the identical reason (a generic method
- * body can't otherwise return a type that depends on the type parameter it
- * closes over per-call).
- */
 function createFakeBridge(
   initialSessions: SessionSummary[],
   createdSession: SessionSummary,
@@ -50,7 +43,8 @@ function createFakeBridge(
       listCalls.push(1);
       const result: SessionBootRequestResult['session.list'] = { sessions: initialSessions };
       // as: this function's return type depends on `M`, which isn't known
-      // inside the branch — see this function's own doc comment.
+      // inside the branch — see `session-boot.ts`'s own doc comment on the
+      // identical pattern in `packages/app/src/preload/bridge.ts`.
       return Promise.resolve(result) as Promise<SessionBootRequestResult[M]>;
     }
     createCalls.push(params);
@@ -61,81 +55,87 @@ function createFakeBridge(
   return { bridge: { request }, listCalls, createCalls };
 }
 
-describe('resolveBootSession', () => {
+describe('resolveBootWorkspace', () => {
   beforeEach(() => {
     resetSessionBootForTests();
   });
 
-  it('reuses the first non-exited session instead of creating one', async () => {
-    const alive = summary({ id: 5, status: 'idle' });
-    const { bridge, listCalls, createCalls } = createFakeBridge([alive], summary({ id: 99 }));
+  it('with no live session: creates one and returns a single-leaf workspace focused on it', async () => {
+    const created = summary({ id: 6, status: 'running' });
+    const { bridge, createCalls } = createFakeBridge([], created);
 
-    const result = await resolveBootSession(bridge, { cols: 80, rows: 24 });
+    const result = await resolveBootWorkspace(bridge, { cols: 120, rows: 40 });
 
-    expect(result).toEqual(alive);
-    expect(createCalls).toHaveLength(0);
-    expect(listCalls).toHaveLength(1);
+    expect(result.workspace.id).toBe(DEFAULT_WORKSPACE_ID);
+    expect(result.workspace.root).toEqual({ kind: 'leaf', sessionId: 6 });
+    expect(result.workspace.focusedSessionId).toBe(6);
+    expect(result.sessions).toEqual([created]);
+    expect(createCalls).toEqual([{ shell: DEFAULT_SHELL, cwd: DEFAULT_CWD, cols: 120, rows: 40 }]);
   });
 
-  // docs/specs/m2.6-boot-reattach.md section 3.4, required test 8: among
-  // several live sessions, boot picks the one with the highest `createdAt`
-  // — not just "the first one `session.list` happened to return".
-  it('reuses the live session with the highest createdAt when several are live', async () => {
-    const older = summary({ id: 5, status: 'idle', createdAt: 1_000 });
-    const newest = summary({ id: 7, status: 'running', createdAt: 3_000 });
-    const middle = summary({ id: 6, status: 'awaiting-input', createdAt: 2_000 });
-    // Deliberately out of createdAt order, so a naive `.find()`/"first
-    // non-exited" policy would pick `older` instead.
-    const { bridge, createCalls } = createFakeBridge([older, newest, middle], summary({ id: 99 }));
-
-    const result = await resolveBootSession(bridge, { cols: 80, rows: 24 });
-
-    expect(result).toEqual(newest);
-    expect(createCalls).toHaveLength(0);
-  });
-
-  // Exited sessions are left alone (M4's graveyard), never picked over a
-  // live one, however new their own createdAt might be.
-  it('ignores exited sessions even when their createdAt is the highest', async () => {
-    const live = summary({ id: 5, status: 'idle', createdAt: 1_000 });
-    const exitedButNewer = summary({
-      id: 6,
-      status: 'exited',
-      exitCode: 0,
-      createdAt: 5_000,
-    });
-    const { bridge, createCalls } = createFakeBridge([live, exitedButNewer], summary({ id: 99 }));
-
-    const result = await resolveBootSession(bridge, { cols: 80, rows: 24 });
-
-    expect(result).toEqual(live);
-    expect(createCalls).toHaveLength(0);
-  });
-
-  it('does not reuse an exited session — creates a new one instead', async () => {
-    const exited = summary({ id: 5, status: 'exited', exitCode: 0 });
+  it('with exited sessions only: still creates a fresh one, ignoring the exited ones for the tree', async () => {
+    const exited = summary({ id: 5, status: 'exited', exitCode: 0, createdAt: 9_999 });
     const created = summary({ id: 6, status: 'running' });
     const { bridge, createCalls } = createFakeBridge([exited], created);
 
-    const result = await resolveBootSession(bridge, { cols: 80, rows: 24 });
+    const result = await resolveBootWorkspace(bridge, { cols: 80, rows: 24 });
 
-    expect(result).toEqual(created);
+    expect(result.workspace.root).toEqual({ kind: 'leaf', sessionId: 6 });
     expect(createCalls).toHaveLength(1);
+    // The exited session's metadata is still handed back for the store.
+    expect(result.sessions).toEqual([exited, created]);
   });
 
-  it('sizes a freshly created session with the given cols/rows and the default shell/cwd', async () => {
-    const { bridge, createCalls } = createFakeBridge([], summary());
+  it('with N live sessions: builds treeFromSessions over all of them, no session.create', async () => {
+    const s1 = summary({ id: 1, createdAt: 1_000 });
+    const s2 = summary({ id: 2, createdAt: 2_000 });
+    const s3 = summary({ id: 3, createdAt: 3_000 });
+    const s4 = summary({ id: 4, createdAt: 4_000 });
+    const { bridge, createCalls } = createFakeBridge([s1, s2, s3, s4], summary({ id: 99 }));
 
-    await resolveBootSession(bridge, { cols: 120, rows: 40 });
+    const result = await resolveBootWorkspace(bridge, { cols: 80, rows: 24 });
 
-    expect(createCalls).toEqual([{ shell: DEFAULT_SHELL, cwd: DEFAULT_CWD, cols: 120, rows: 40 }]);
+    expect(createCalls).toHaveLength(0);
+    expect(collectSessionIds(result.workspace.root).size).toBe(4);
+    expect(
+      treeLeaves(result.workspace.root)
+        .map((l) => l.sessionId)
+        .sort(),
+    ).toEqual([1, 2, 3, 4]);
+    // 2x2: root is a split of two column splits, per treeFromSessions.
+    const root = result.workspace.root as Extract<PaneNode, { kind: 'split' }>;
+    expect(root.a.kind).toBe('split');
+    expect(root.b.kind).toBe('split');
+  });
+
+  it('focuses the live session with the highest createdAt, regardless of session.list order', async () => {
+    const older = summary({ id: 5, createdAt: 1_000 });
+    const newest = summary({ id: 7, createdAt: 3_000 });
+    const middle = summary({ id: 6, createdAt: 2_000 });
+    const { bridge } = createFakeBridge([older, newest, middle], summary({ id: 99 }));
+
+    const result = await resolveBootWorkspace(bridge, { cols: 80, rows: 24 });
+
+    expect(result.workspace.focusedSessionId).toBe(7);
+  });
+
+  it('ignores exited sessions even when their createdAt is the highest, both for the tree and for focus', async () => {
+    const live = summary({ id: 5, status: 'idle', createdAt: 1_000 });
+    const exitedButNewer = summary({ id: 6, status: 'exited', exitCode: 0, createdAt: 5_000 });
+    const { bridge, createCalls } = createFakeBridge([live, exitedButNewer], summary({ id: 99 }));
+
+    const result = await resolveBootWorkspace(bridge, { cols: 80, rows: 24 });
+
+    expect(result.workspace.root).toEqual({ kind: 'leaf', sessionId: 5 });
+    expect(result.workspace.focusedSessionId).toBe(5);
+    expect(createCalls).toHaveLength(0);
   });
 
   it('StrictMode-shaped double call: two synchronous calls before the first settles result in exactly one session.create', async () => {
     const { bridge, createCalls, listCalls } = createFakeBridge([], summary());
 
-    const first = resolveBootSession(bridge, { cols: 80, rows: 24 });
-    const second = resolveBootSession(bridge, { cols: 80, rows: 24 });
+    const first = resolveBootWorkspace(bridge, { cols: 80, rows: 24 });
+    const second = resolveBootWorkspace(bridge, { cols: 80, rows: 24 });
     const [a, b] = await Promise.all([first, second]);
 
     expect(a).toEqual(b);
@@ -143,12 +143,12 @@ describe('resolveBootSession', () => {
     expect(listCalls).toHaveLength(1);
   });
 
-  it('StrictMode-shaped double call with an already-alive session: no session.create at all', async () => {
+  it('StrictMode-shaped double call with already-live sessions: no session.create at all', async () => {
     const alive = summary({ id: 9, status: 'awaiting-input' });
     const { bridge, createCalls } = createFakeBridge([alive], summary({ id: 99 }));
 
-    const first = resolveBootSession(bridge, { cols: 80, rows: 24 });
-    const second = resolveBootSession(bridge, { cols: 80, rows: 24 });
+    const first = resolveBootWorkspace(bridge, { cols: 80, rows: 24 });
+    const second = resolveBootWorkspace(bridge, { cols: 80, rows: 24 });
     await Promise.all([first, second]);
 
     expect(createCalls).toHaveLength(0);
