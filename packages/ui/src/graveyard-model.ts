@@ -40,7 +40,7 @@
 //
 // 4. Picking the entry `Ctrl+Shift+T` restores — `mostRecentlyClosedSessionId`.
 
-import type { GraveyardEntry, SessionId } from '@termhub/shared';
+import type { GraveyardEntry, SessionId, SessionSummary } from '@termhub/shared';
 
 import { collectSessionIds, treeLeaves, type PaneNode } from './store/tree.js';
 import type { StoreState } from './store/workspace.js';
@@ -54,6 +54,13 @@ import type { StoreState } from './store/workspace.js';
 export interface SessionOrigin {
   workspaceId: string;
   workspaceName: string;
+  /**
+   * M4.8: the session's own `createdAt` (`state.sessions[id].createdAt`) at
+   * the moment it was recorded as placed — `sessionsToBury`'s own guard
+   * against burying the wrong session after a daemon-resync hydrate. See
+   * that function's doc comment.
+   */
+  createdAt: number;
 }
 
 /** Every currently-placed session id, mapped to the workspace it's placed in — one snapshot of "who lives where" right now. `Sidebar.tsx` keeps the *previous* call's result around (in a `useRef`) and diffs it against a fresh one on every store change via `sessionsJustUnplaced`. */
@@ -61,7 +68,11 @@ export function collectSessionLocations(state: StoreState): Map<SessionId, Sessi
   const locations = new Map<SessionId, SessionOrigin>();
   for (const workspace of state.workspaces) {
     for (const sessionId of collectSessionIds(workspace.root)) {
-      locations.set(sessionId, { workspaceId: workspace.id, workspaceName: workspace.name });
+      locations.set(sessionId, {
+        workspaceId: workspace.id,
+        workspaceName: workspace.name,
+        createdAt: state.sessions[sessionId]?.createdAt ?? 0,
+      });
     }
   }
   return locations;
@@ -100,6 +111,52 @@ export function sessionsJustUnplaced(
     }
   }
   return result;
+}
+
+/**
+ * M4.8, section 3 of this task's prompt: filters `sessionsJustUnplaced`'s
+ * raw candidates down to the sessions that are *actually* closed, not just
+ * ones a daemon-resync's `hydrate` happened to remove from every tree at
+ * once.
+ *
+ * The armadilha this closes: `packages/app/src/renderer/src/daemon-resync.ts`
+ * reconciles the store after a reconnect by replacing the whole layout (and
+ * `state.sessions`) via one `hydrate` call, the same mechanism boot itself
+ * uses. When the daemon restarted, every dead leaf leaves its workspace's
+ * tree in that single change — `sessionsJustUnplaced` reports every one of
+ * them as "just unplaced", indistinguishable from a real close. But the
+ * daemon renumbers sessions from 1 on every start, so one of those stale ids
+ * can now name an unrelated, brand-new session — including the very session
+ * the resync itself just created and placed. Sending `session.close` for
+ * that id would bury it by mistake, on the *new* connection, for no reason
+ * the user ever asked for.
+ *
+ * The fix: a candidate is only "really closed" — worth burying — when
+ * `sessions` (the *current* `state.sessions`, from the very same store
+ * snapshot the diff was computed against) still has an entry for its id
+ * **with the same `createdAt`** `SessionOrigin` recorded when it was placed.
+ *
+ * - A normal close (`closePaneInWorkspace`/`closeWorkspace`) never touches
+ *   `state.sessions` — the session's own metadata survives, unchanged, until
+ *   `Sidebar.tsx`'s own `removeSession` call runs *after* this filter, so the
+ *   id+createdAt still matches and the session is buried, exactly as before
+ *   this task.
+ * - A daemon-resync hydrate replaces `state.sessions` with only the sessions
+ *   the *new* connection actually reported (`session.list`, plus at most one
+ *   freshly created session) — a stale id is either entirely absent from
+ *   that new map, or, if reused, present with a *different* `createdAt`.
+ *   Either way this filters it out, so no `session.close` is ever sent for
+ *   it — not for an unrelated new session, and not for the one the resync
+ *   itself just created.
+ */
+export function sessionsToBury(
+  candidates: readonly JustUnplacedSession[],
+  sessions: Readonly<Record<SessionId, SessionSummary>>,
+): JustUnplacedSession[] {
+  return candidates.filter(({ sessionId, origin }) => {
+    const current = sessions[sessionId];
+    return current !== undefined && current.createdAt === origin.createdAt;
+  });
 }
 
 /** `GraveyardEntry[]`, newest-closed-first — `termhub-prototipo.html`'s own `closed.unshift(...)` ordering (the fake mock always prepends), reproduced here as an explicit sort since a real `graveyard.list` response carries no ordering guarantee of its own. */

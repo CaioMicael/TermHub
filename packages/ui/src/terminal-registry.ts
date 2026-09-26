@@ -113,6 +113,20 @@ export interface TerminalRegistry {
   place(sessionId: SessionId, slot: HTMLElement): void;
   /** Parks the host element only if it is still inside `slot`. Never disposes. */
   unplace(sessionId: SessionId, slot: HTMLElement): void;
+  /**
+   * M4.8, section 3.4 step 4: calls `reattach()` on every host currently
+   * held by this registry — the renderer's own daemon-resync
+   * (`packages/app/src/renderer/src/daemon-resync.ts`) calls this once the
+   * store has already been reconciled against the reconnected daemon
+   * (`hydrate`), so a surviving host (same session, same connection, just a
+   * fresh attach) gets its xterm reset and re-synced from the daemon's new
+   * snapshot. Safe to call on a freshly-created host too (one the same
+   * reconciliation just placed) — `TerminalHost.reattach`'s own ownership
+   * contract (`terminal-session.ts`'s `forgetSessionOwnership`) makes a
+   * redundant reattach on a brand-new host harmless, so this never needs to
+   * distinguish "survived" from "just created".
+   */
+  reattachAll(): void;
   /** Disposes every host and unsubscribes from the store. */
   dispose(): void;
 }
@@ -306,6 +320,11 @@ export function createTerminalRegistry(options: CreateTerminalRegistryOptions): 
       // pane) — recompute eagerly rather than waiting for the next store
       // tick, which may not come at all if nothing else changed.
       reconcileWebgl();
+    },
+    reattachAll() {
+      for (const [, record] of hosts) {
+        record.host.reattach();
+      }
     },
     unplace(sessionId, slot) {
       const record = hosts.get(sessionId);

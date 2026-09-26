@@ -1,6 +1,7 @@
 import type { SessionId, WorkspacesFile } from '@termhub/shared';
 
 import type { DaemonConnection } from './daemon-client.js';
+import type { DaemonSupervisor, DaemonSupervisorState } from './daemon-supervisor.js';
 import { DaemonRelay, toBridgeError } from './daemon-relay.js';
 import type { DaemonRelayOptions } from './daemon-relay.js';
 import type {
@@ -14,7 +15,7 @@ import type {
   RelayInboundMessage,
   RelayOutboundMessage,
 } from './ipc-contract.js';
-import type { SessionAttachments } from './session-attachments.js';
+import { SessionAttachments } from './session-attachments.js';
 
 /**
  * M4.3: the main process's read/write access to the persisted layout
@@ -94,11 +95,52 @@ export interface LayoutAccess {
 // detach` fail closed with the same `'bridge_not_connected'`-shaped error
 // every other method gets without a usable connection.
 
+/**
+ * docs/specs/m4.8-daemon-resilience.md section 3.2: what a `BridgeGateway`
+ * needs to follow the daemon-supervisor across however many connections it
+ * makes over the app's lifetime — a drop, then a reconnect (same daemon or a
+ * fresh one), any number of times. Deliberately **not** the raw
+ * `DaemonSupervisor` (`daemon-supervisor.ts`) itself: that module knows
+ * nothing about `SessionAttachments`, which is a *shared*, one-per-connection
+ * (never one-per-window) object every window's gateway must observe the
+ * *same* instance of (section 3.1's own "continua valendo que ele é
+ * compartilhado entre as janelas") — `main/index.ts` is the one place that
+ * builds a fresh `SessionAttachments` per new epoch and bundles it with the
+ * supervisor's own state into the single stream every gateway subscribes to
+ * here.
+ *
+ * Optional on `BridgeGatewayOptions` on purpose: every test/caller that only
+ * ever exercises a single, unchanging connection (everything before this
+ * task) passes nothing here and this gateway behaves exactly as it always
+ * has — `connectionPromise` alone still drives the *first* connection,
+ * unchanged. `onChange` only ever fires for whatever happens *after* that
+ * first connection settles (a drop, then any later reconnect) — never a
+ * replay of it, so a gateway never processes the same transition twice from
+ * two different sources.
+ */
+export interface DaemonReconnectState {
+  supervisorState: DaemonSupervisorState;
+  /** The `SessionAttachments` for `supervisorState`'s own connection, when it is `'connected'` — `undefined` otherwise. */
+  sessionAttachments: SessionAttachments | undefined;
+}
+export interface DaemonReconnectSource {
+  onChange(listener: (next: DaemonReconnectState) => void): () => void;
+}
+
 export interface BridgeGatewayOptions {
   /** Delivers one outbound message to this gateway's window. Always the same mechanism regardless of `message.kind` (see `ipc-contract.ts`'s header comment). */
   sendToRenderer: (message: RelayOutboundMessage) => void;
   /** Settles once (`connectToDaemon()`'s own contract) with the outcome this gateway should reflect as connection state. */
   connectionPromise: Promise<DaemonConnection>;
+  /**
+   * M4.8: everything that happens to the daemon connection *after*
+   * `connectionPromise` settles — a drop, then a reconnect (with a new
+   * generation/`SessionAttachments`), any number of times. Omitted entirely
+   * by every pre-M4.8 test/caller, which keeps reflecting whatever
+   * `connectionPromise` first resolved to, forever — the exact M2.2/M2.6
+   * behavior this task must not change for callers that never opt in.
+   */
+  reconnect?: DaemonReconnectSource;
   /**
    * The app-wide `session.attach`/`session.detach` book (docs/specs/
    * m2.6-boot-reattach.md section 3.2), one per daemon connection, shared
@@ -173,7 +215,10 @@ export class BridgeGateway {
   private reason: string | undefined;
   private relay: DaemonRelay | undefined;
   private closeSubscription: { dispose: () => void } | undefined;
+  private reconnectUnsubscribe: (() => void) | undefined;
   private disposed = false;
+  /** M4.8: the current connection's generation number, present whenever `state === 'connected'` — `undefined` otherwise. Carried on every `BridgeStateMessage` (`ipc-contract.ts`'s doc comment on `epoch`). */
+  private epoch: number | undefined;
 
   private sessionAttachments: SessionAttachments | undefined;
   private layoutAccess: LayoutAccess | undefined;
@@ -251,6 +296,13 @@ export class BridgeGateway {
         // unexpected failure.
         console.error('[TermHub] layout access promise rejected unexpectedly', err);
       });
+
+    // M4.8: everything *after* `connectionPromise` settles — a drop, then
+    // any later reconnect. `options.reconnect` is `undefined` for every
+    // pre-M4.8 caller/test, so this is a pure no-op for them.
+    this.reconnectUnsubscribe = options.reconnect?.onChange((next) => {
+      this.applyReconnectState(next);
+    });
   }
 
   /** Current connection state, for a renderer that asks after this gateway already settled (this class has no async "get state" of its own — `main/index.ts` only ever needs this for tests/diagnostics; the renderer learns state via `BridgeStateMessage`). */
@@ -429,6 +481,8 @@ export class BridgeGateway {
     this.relay = undefined;
     this.closeSubscription?.dispose();
     this.closeSubscription = undefined;
+    this.reconnectUnsubscribe?.();
+    this.reconnectUnsubscribe = undefined;
   }
 
   /**
@@ -684,38 +738,56 @@ export class BridgeGateway {
     this.onConnectionSettled(result);
   }
 
+  /**
+   * Builds the `DaemonRelay` for a newly `'connected'` `TransportClient` —
+   * shared by the very first connection (`onConnectionSettled`) and every
+   * later reconnect (`applyReconnectState`, M4.8), so the `admitData`/
+   * coalescing wiring is defined in exactly one place.
+   */
+  private buildRelay(client: DaemonRelayOptions['client']): DaemonRelay {
+    return new DaemonRelay({
+      client,
+      sendToRenderer: (message) => {
+        this.sendFiltered(message);
+      },
+      // Routing rule 4 at admission (docs/specs/m2.6-boot-reattach.md
+      // section 3.2), not only at flush time — see `DaemonRelayOptions.
+      // admitData`'s doc comment for why the flush-time check in
+      // `sendFiltered` alone cannot prevent stale, pre-detach live output
+      // from mixing into the same coalesced buffer as a following fresh
+      // attach's snapshot. Reads `this.sessionAttachments`/
+      // `this.currentInstanceId` fresh on every call, since both can
+      // change over this relay's lifetime (a reload, a new connection).
+      admitData: (sessionId) => {
+        const book = this.sessionAttachments;
+        if (book === undefined) {
+          return true; // no book configured: preserve the M2.2 broadcast-everything behavior
+        }
+        const holder = this.currentInstanceId;
+        return holder !== undefined && book.accepts(holder, sessionId);
+      },
+      ...(this.options.coalesceWindowMs !== undefined
+        ? { coalesceWindowMs: this.options.coalesceWindowMs }
+        : {}),
+      ...(this.options.coalesceByteLimitBytes !== undefined
+        ? { coalesceByteLimitBytes: this.options.coalesceByteLimitBytes }
+        : {}),
+    });
+  }
+
   private onConnectionSettled(result: DaemonConnection): void {
     this.reason = outcomeReason(result);
     if (result.outcome === 'connected') {
       this.state = 'connected';
-      this.relay = new DaemonRelay({
-        client: result.client,
-        sendToRenderer: (message) => {
-          this.sendFiltered(message);
-        },
-        // Routing rule 4 at admission (docs/specs/m2.6-boot-reattach.md
-        // section 3.2), not only at flush time — see `DaemonRelayOptions.
-        // admitData`'s doc comment for why the flush-time check in
-        // `sendFiltered` alone cannot prevent stale, pre-detach live output
-        // from mixing into the same coalesced buffer as a following fresh
-        // attach's snapshot. Reads `this.sessionAttachments`/
-        // `this.currentInstanceId` fresh on every call, since both can
-        // change over this relay's lifetime (a reload, a new connection).
-        admitData: (sessionId) => {
-          const book = this.sessionAttachments;
-          if (book === undefined) {
-            return true; // no book configured: preserve the M2.2 broadcast-everything behavior
-          }
-          const holder = this.currentInstanceId;
-          return holder !== undefined && book.accepts(holder, sessionId);
-        },
-        ...(this.options.coalesceWindowMs !== undefined
-          ? { coalesceWindowMs: this.options.coalesceWindowMs }
-          : {}),
-        ...(this.options.coalesceByteLimitBytes !== undefined
-          ? { coalesceByteLimitBytes: this.options.coalesceByteLimitBytes }
-          : {}),
-      });
+      // M4.8: the first connection is generation 1 whenever nothing has
+      // told this gateway otherwise yet (`options.reconnect` not provided,
+      // or its own first notification hasn't arrived — see this method's
+      // and `applyReconnectState`'s doc comments on why both paths can
+      // observe the same first connection without double-building
+      // anything: `applyReconnectState` always tears down whatever relay
+      // is already here before building its own).
+      this.epoch ??= 1;
+      this.relay = this.buildRelay(result.client);
       this.closeSubscription = result.client.onClose(() => {
         this.onClientClosed();
       });
@@ -725,15 +797,100 @@ export class BridgeGateway {
     this.sendState();
   }
 
+  /**
+   * Clears `this.relay` immediately (so a *new* request arriving right
+   * after a drop correctly gets `bridge_not_connected`, never routed to a
+   * relay that's about to go away), but defers the relay's own `dispose()`
+   * call to a fresh macrotask (`setTimeout(…, 0)`), instead of calling it
+   * synchronously here.
+   *
+   * This is the fix for docs/specs/m4.8-daemon-resilience.md section 3.2's
+   * "requisição em voo... recebe erro": `TransportClient` rejects every
+   * in-flight request's promise *synchronously*, inside its own `'close'`
+   * handling, *before* it notifies this gateway's `onClose` listener
+   * (`transport-client.ts`'s `onSocketClose`) — but a promise rejection's
+   * `.catch()` reaction only actually *runs* as a later microtask, and
+   * `DaemonRelay.handleRequest`'s own `catch` checks `this.disposed` before
+   * sending the error response. Disposing the relay synchronously, right
+   * here, would mark it disposed *before* that microtask ever gets to run —
+   * silently swallowing the very error response this section exists to
+   * guarantee. Deferring only the `dispose()` call itself (never anything
+   * this gateway's own state/`sendState()` need to reflect right away) gives
+   * every already-queued microtask, including that `catch`, a chance to run
+   * first — `daemon-relay.ts` itself is out of this task's file scope
+   * (section 6), so the fix has to live on this side of that boundary.
+   */
+  private discardRelay(): void {
+    const oldRelay = this.relay;
+    this.relay = undefined;
+    if (oldRelay !== undefined) {
+      setTimeout(() => {
+        oldRelay.dispose();
+      }, 0);
+    }
+  }
+
   private onClientClosed(): void {
     if (this.disposed) {
       return;
     }
-    this.relay?.dispose();
-    this.relay = undefined;
+    this.discardRelay();
     this.closeSubscription = undefined;
     this.state = 'disconnected';
     this.reason = undefined;
+    this.epoch = undefined;
+    this.sendState();
+  }
+
+  /**
+   * M4.8, section 3.2: reacts to a connection change reported by the
+   * daemon-supervisor (`options.reconnect`) — a drop, or a reconnect (same
+   * daemon or a fresh one). Always tears down whatever relay/subscription
+   * this gateway currently has first, so this is safe to call even for the
+   * very connection `onConnectionSettled` already built a relay for (the
+   * first one) — nothing is left dangling either way, and only ever exactly
+   * one relay is live per outcome.
+   *
+   * Deliberately does **not** subscribe to `state.supervisorState`'s own
+   * `client.onClose` the way `onConnectionSettled` does: the supervisor
+   * already watches that itself to drive its own state machine, and
+   * re-emits every transition through this same `onChange` stream — a
+   * second, independent subscription here would just double-report the same
+   * drop.
+   */
+  private applyReconnectState(next: DaemonReconnectState): void {
+    if (this.disposed) {
+      return;
+    }
+    this.closeSubscription?.dispose();
+    this.closeSubscription = undefined;
+    this.discardRelay();
+    this.sessionAttachments = next.sessionAttachments;
+
+    const state = next.supervisorState;
+    switch (state.state) {
+      case 'connected':
+        this.epoch = state.epoch;
+        this.state = 'connected';
+        this.reason = undefined;
+        this.relay = this.buildRelay(state.client);
+        break;
+      case 'blocked':
+        this.epoch = undefined;
+        this.state = 'blocked';
+        this.reason = state.reason;
+        break;
+      case 'failed':
+        this.epoch = undefined;
+        this.state = 'failed';
+        this.reason = state.lastError.message;
+        break;
+      case 'disconnected':
+        this.epoch = undefined;
+        this.state = 'disconnected';
+        this.reason = undefined;
+        break;
+    }
     this.sendState();
   }
 
@@ -742,6 +899,7 @@ export class BridgeGateway {
       kind: 'state',
       state: this.state,
       ...(this.reason !== undefined ? { reason: this.reason } : {}),
+      ...(this.epoch !== undefined ? { epoch: this.epoch } : {}),
     });
   }
 
@@ -837,4 +995,48 @@ export function wireWebContentsLifecycle(
   webContents.on('render-process-gone', () => {
     gateway.releaseCurrentInstance();
   });
+}
+
+/**
+ * Wraps a `DaemonSupervisor` (`daemon-supervisor.ts`) into the
+ * `DaemonReconnectSource` every window's `BridgeGateway` shares —
+ * docs/specs/m4.8-daemon-resilience.md section 3.1: "o supervisor (ou quem o
+ * usa) cria um novo [SessionAttachments] a cada geração". Building it here,
+ * next to `DaemonReconnectSource`'s own definition, keeps it independently
+ * unit-testable (`bridge-gateway.test.ts`) without constructing a real
+ * `BridgeGateway` at all; `main/index.ts` calls this exactly once per app
+ * start and hands the single result to every window's gateway, so every
+ * window observes the very same `SessionAttachments` instance for a given
+ * generation — never one per window (section 3.1's own "compartilhado entre
+ * as janelas").
+ *
+ * A `SessionAttachments` is built lazily, the first time a given epoch is
+ * observed, and cached — never rebuilt for the same epoch, and the cache is
+ * dropped as soon as the connection stops being `'connected'` (a drop, or a
+ * permanently `'blocked'`/`'failed'` outcome), so the *next* `'connected'`
+ * epoch always gets a fresh one built from that epoch's own `client`.
+ */
+export function createDaemonReconnectSource(
+  supervisor: Pick<DaemonSupervisor, 'onChange'>,
+): DaemonReconnectSource {
+  let cached: { epoch: number; book: SessionAttachments } | undefined;
+
+  function sessionAttachmentsFor(state: DaemonSupervisorState): SessionAttachments | undefined {
+    if (state.state !== 'connected') {
+      cached = undefined;
+      return undefined;
+    }
+    if (cached === undefined || cached.epoch !== state.epoch) {
+      cached = { epoch: state.epoch, book: new SessionAttachments(state.client) };
+    }
+    return cached.book;
+  }
+
+  return {
+    onChange(listener) {
+      return supervisor.onChange((state) => {
+        listener({ supervisorState: state, sessionAttachments: sessionAttachmentsFor(state) });
+      });
+    },
+  };
 }

@@ -134,8 +134,13 @@ export const DEFAULT_CWD = 'C:\\';
  * list (`pickDefaultShellProfile` returning `undefined`), or any other
  * failure all collapse to that same fallback, so this never throws and
  * never blocks the boot on the daemon's shell-detection succeeding.
+ *
+ * Exported for `daemon-resync.ts` (M4.8): the fresh session a daemon-restart
+ * resync creates (rule 6, section 3.4) goes through this exact same policy
+ * instead of a shell hardcoded independently — see that module's own doc
+ * comment.
  */
-async function resolveDefaultShellParams(
+export async function resolveDefaultShellParams(
   bridge: SessionBootBridge,
 ): Promise<{ shell: string; args?: string[] }> {
   try {

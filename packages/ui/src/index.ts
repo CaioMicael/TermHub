@@ -7,6 +7,9 @@ export type { ActivityBarProps, SidebarView } from './ActivityBar.js';
 export { Sidebar } from './Sidebar.js';
 export type { SidebarProps } from './Sidebar.js';
 
+export { ConnectionBanner } from './ConnectionBanner.js';
+export type { ConnectionBannerKind, ConnectionBannerProps } from './ConnectionBanner.js';
+
 export {
   activeFocusedTarget,
   buildSidebarGroups,
@@ -66,6 +69,7 @@ export {
   attachTerminalSession,
   encodeTerminalBinaryInput,
   encodeTerminalTextInput,
+  forgetSessionOwnership,
 } from './terminal-session.js';
 export type {
   AttachedTerminalSession,
@@ -208,6 +212,7 @@ export {
   resolveRestoreWorkspaceId,
   resolveSplitTarget,
   sessionsJustUnplaced,
+  sessionsToBury,
   sortGraveyardEntries,
 } from './graveyard-model.js';
 export type { GraveyardRow, JustUnplacedSession, SessionOrigin } from './graveyard-model.js';

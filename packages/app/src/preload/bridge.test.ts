@@ -233,6 +233,20 @@ describe('createBridge', () => {
     expect(bridge.getConnectionState()).toEqual({ state: 'disconnected' });
   });
 
+  it('M4.8: getConnectionState() surfaces the epoch on a "connected" state message, and omits it otherwise', () => {
+    const { deliver, ipc } = createFakeIpc();
+    const bridge = createBridge(ipc);
+
+    deliver({ kind: 'state', state: 'connected', epoch: 1 });
+    expect(bridge.getConnectionState()).toEqual({ state: 'connected', epoch: 1 });
+
+    deliver({ kind: 'state', state: 'disconnected' });
+    expect(bridge.getConnectionState()).toEqual({ state: 'disconnected' });
+
+    deliver({ kind: 'state', state: 'connected', epoch: 2 });
+    expect(bridge.getConnectionState()).toEqual({ state: 'connected', epoch: 2 });
+  });
+
   // -------------------------------------------------------------------------
   // M2.5: clipboard/context-menu — same request/response correlation
   // machinery as `request()` (`sendAwaitable` in bridge.ts), over the same

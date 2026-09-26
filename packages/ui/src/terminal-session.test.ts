@@ -4,6 +4,7 @@ import {
   attachTerminalSession,
   encodeTerminalBinaryInput,
   encodeTerminalTextInput,
+  forgetSessionOwnership,
   type TerminalBridge,
 } from './terminal-session.js';
 
@@ -239,6 +240,76 @@ describe('attachTerminalSession', () => {
 
       expect(written1).toEqual([]);
       expect(written2).toEqual([chunk]);
+    });
+  });
+
+  describe('forgetSessionOwnership (M4.8, docs/specs/m4.8-daemon-resilience.md required test 2)', () => {
+    it('⚑ without forgetting, a plain release() + acquire() (the "obvious" reattach) sends no session.attach at all — the defect this task exists to close', async () => {
+      const fake = createDaemonLikeFakeBridge();
+
+      const session1 = attachTerminalSession(fake.bridge, 1, { write: () => {} });
+      await vi.runAllTimersAsync();
+      await session1.ready;
+      expect(fake.requests.map((r) => r.method)).toEqual(['session.attach']);
+
+      // The connection dropped and reconnected underneath this same
+      // `bridge` object (window.termhub never changes across a reconnect —
+      // only what it's connected to does). The "obvious" way to reattach:
+      // release the old hold, then acquire a new one.
+      session1.detach();
+      const session2 = attachTerminalSession(fake.bridge, 1, { write: () => {} });
+      await vi.runAllTimersAsync();
+      await session2.ready;
+
+      // Exactly the trap docs/specs/m4.8-daemon-resilience.md section 2.3
+      // names: the deferred detach from `session1.detach()` gets cancelled
+      // by `session2`'s acquire (StrictMode's own absorption mechanism,
+      // `terminal-session.ts`'s header comment), and `session2` just reuses
+      // the *already-settled* attach promise from before the drop — no
+      // second `session.attach` is ever sent, on this connection or any
+      // other.
+      expect(fake.requests.map((r) => r.method)).toEqual(['session.attach']);
+    });
+
+    it('after forgetSessionOwnership(bridge), an acquire() sends a fresh session.attach — the fix', async () => {
+      const fake = createDaemonLikeFakeBridge();
+
+      const session1 = attachTerminalSession(fake.bridge, 1, { write: () => {} });
+      await vi.runAllTimersAsync();
+      await session1.ready;
+      expect(fake.requests.map((r) => r.method)).toEqual(['session.attach']);
+
+      session1.detach();
+      forgetSessionOwnership(fake.bridge);
+      const session2 = attachTerminalSession(fake.bridge, 1, { write: () => {} });
+      await vi.runAllTimersAsync();
+      await session2.ready;
+
+      // A genuine, fresh session.attach — not the reused promise from
+      // before. Note the deferred session.detach from `session1.detach()`
+      // was cancelled *before it could fire* (forgotten, not sent) — this
+      // module never talks to the old connection about a session id it no
+      // longer has any bookkeeping for.
+      expect(fake.requests.map((r) => r.method)).toEqual(['session.attach', 'session.attach']);
+    });
+
+    it('cancels a pending deferred session.detach without ever sending it', async () => {
+      const fake = createDaemonLikeFakeBridge();
+
+      const session = attachTerminalSession(fake.bridge, 1, { write: () => {} });
+      await vi.runAllTimersAsync();
+      await session.ready;
+
+      session.detach(); // schedules a deferred session.detach, not yet fired
+      forgetSessionOwnership(fake.bridge);
+      await vi.runAllTimersAsync();
+
+      expect(fake.requests.map((r) => r.method)).toEqual(['session.attach']);
+    });
+
+    it('is a safe no-op for a bridge nothing has ever attached through', () => {
+      const fake = createDaemonLikeFakeBridge();
+      expect(() => forgetSessionOwnership(fake.bridge)).not.toThrow();
     });
   });
 });

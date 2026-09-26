@@ -8,6 +8,7 @@ import {
   mostRecentlyClosedSessionId,
   resolveRestoreWorkspaceId,
   sessionsJustUnplaced,
+  sessionsToBury,
   type GraveyardRow,
   type SessionOrigin,
 } from './graveyard-model.js';
@@ -260,12 +261,21 @@ export function Sidebar({ view, bridge }: SidebarProps) {
     const reconcileBurials = () => {
       const state = useTermhubStore.getState();
       const nextLocations = collectSessionLocations(state);
-      const justUnplaced = sessionsJustUnplaced(placedLocations, nextLocations);
+      const candidates = sessionsJustUnplaced(placedLocations, nextLocations);
       // Updated *before* the side effects below run, so the `removeSession`
       // calls' own store notification (this same `subscribe` callback,
       // re-entered synchronously) sees no further diff and returns early —
       // otherwise this would recurse forever.
       placedLocations = nextLocations;
+      if (candidates.length === 0) {
+        return;
+      }
+      // M4.8: a daemon-resync's own `hydrate` can also make sessions "just
+      // unplaced" in bulk — never a real close. `sessionsToBury` (`
+      // graveyard-model.ts`'s own doc comment) is what tells the two apart,
+      // by id+createdAt against this same `state.sessions` — never send
+      // `session.close` for a candidate it filters out.
+      const justUnplaced = sessionsToBury(candidates, state.sessions);
       if (justUnplaced.length === 0) {
         return;
       }

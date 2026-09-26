@@ -1,16 +1,20 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   ActivityBar,
+  ConnectionBanner,
   createTerminalRegistry,
   measureFitSize,
   Sidebar,
   SplitTree,
   TabBar,
   useTermhubStore,
+  type ConnectionBannerKind,
   type SidebarView,
+  type StoreState,
   type TerminalRegistry,
 } from '@termhub/ui';
 
+import { runDaemonResync } from './daemon-resync.js';
 import { resolveBootWorkspace, startLayoutPersistence } from './session-boot.js';
 
 // M3.1's casca: a tab strip (one workspace = one tab, docs/plan.md section
@@ -42,6 +46,24 @@ import { resolveBootWorkspace, startLayoutPersistence } from './session-boot.js'
 // component is the one that creates and disposes it.
 
 type BootState = { phase: 'measuring' } | { phase: 'ready' } | { phase: 'error'; message: string };
+
+/**
+ * M4.8: adapts `useTermhubStore` (a Zustand hook, not a plain `{getState,
+ * hydrate}` object) to the store surface `daemon-resync.ts`'s
+ * `runDaemonResync` needs — `hydrate` is one of the store's own *actions*
+ * (`useTermhubStore.getState().hydrate(...)`), never a method on the hook
+ * itself. Module-level, not per-render: `useTermhubStore` is already a
+ * process-wide singleton (`store/store.ts`), so this adapter needs no
+ * lifecycle of its own.
+ */
+const daemonResyncStore = {
+  getState: () => useTermhubStore.getState(),
+  hydrate: (next: StoreState) => {
+    useTermhubStore.getState().hydrate(next);
+  },
+};
+
+type BannerState = { kind: ConnectionBannerKind; reason?: string } | undefined;
 
 const shellStyle = {
   width: '100vw',
@@ -143,6 +165,85 @@ export function App() {
 
   useEffect(() => window.termhub.onConnectionStateChange(setConnection), []);
 
+  // M4.8: the faixa (banner) above the tab bar, and the resync it triggers.
+  // `lastSeenEpochRef` is the generation this window last resynced against
+  // — captured once boot's own connection settles, so a reload/reconnect
+  // that never actually changes the daemon connection (this page's very
+  // first `'connected'`) never itself counts as "the daemon changed
+  // underneath us".
+  const [banner, setBanner] = useState<BannerState>(undefined);
+  const lastSeenEpochRef = useRef<number | undefined>(undefined);
+
+  useEffect(() => {
+    if (bootState.phase === 'ready' && lastSeenEpochRef.current === undefined) {
+      lastSeenEpochRef.current = connection.epoch;
+    }
+    // Deliberately keyed only on `bootState.phase`: this captures the
+    // baseline exactly once, the instant boot finishes — reading
+    // `connection.epoch` from the closure at that point, not on every
+    // change to it (the resync effect below is what reacts to later
+    // changes).
+  }, [bootState.phase]);
+
+  // Section 3.3: once boot has finished, 'disconnected'/'blocked' never
+  // unmounts the UI again — they only ever set the banner. 'connected' is
+  // handled by the resync effect below, which clears the banner only once
+  // resync itself has actually finished reconciling the grid.
+  useEffect(() => {
+    if (bootState.phase !== 'ready') {
+      return;
+    }
+    if (connection.state === 'disconnected') {
+      setBanner({ kind: 'reconnecting' });
+    } else if (connection.state === 'blocked') {
+      setBanner({
+        kind: 'blocked',
+        ...(connection.reason !== undefined ? { reason: connection.reason } : {}),
+      });
+    }
+  }, [bootState.phase, connection.state, connection.reason]);
+
+  // Section 3.4: resync whenever the connection comes back 'connected' with
+  // a generation different from the last one this window resynced against.
+  useEffect(() => {
+    if (bootState.phase !== 'ready') {
+      return;
+    }
+    if (connection.state !== 'connected' || connection.epoch === undefined) {
+      return;
+    }
+    if (lastSeenEpochRef.current === connection.epoch) {
+      return;
+    }
+    lastSeenEpochRef.current = connection.epoch;
+    let cancelled = false;
+    runDaemonResync(window.termhub, daemonResyncStore, registry)
+      .then((result) => {
+        if (cancelled) {
+          return undefined;
+        }
+        if (result.daemonRestarted) {
+          // Section 3.4's last paragraph: shown for a few seconds, then
+          // cleared — never a permanent state.
+          setBanner({ kind: 'restarted' });
+          setTimeout(() => {
+            if (!cancelled) {
+              setBanner(undefined);
+            }
+          }, 5000);
+        } else {
+          setBanner(undefined);
+        }
+        return undefined;
+      })
+      .catch((err: unknown) => {
+        console.error('[TermHub] daemon resync failed', err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [bootState.phase, connection.state, connection.epoch, registry]);
+
   useEffect(() => {
     if (connection.state !== 'connected') {
       return;
@@ -209,15 +310,21 @@ export function App() {
     return startLayoutPersistence(useTermhubStore, window.termhub);
   }, [bootState.phase]);
 
-  if (connection.state !== 'connected') {
-    return (
-      <div style={shellStyle}>
-        <ConnectionStatus state={connection} />
-      </div>
-    );
-  }
-
+  // docs/specs/m4.8-daemon-resilience.md section 3.3: "Antes de o boot
+  // terminar, o comportamento de hoje não muda" — this full-screen status
+  // (and the measuring/error screen right below it) only ever apply while
+  // boot hasn't succeeded yet. Once `bootState.phase === 'ready'`, this
+  // component never returns to either of these again for the rest of the
+  // page's life, no matter what `connection.state` does later — see the
+  // banner below instead.
   if (bootState.phase !== 'ready') {
+    if (connection.state !== 'connected') {
+      return (
+        <div style={shellStyle}>
+          <ConnectionStatus state={connection} />
+        </div>
+      );
+    }
     return (
       <div style={shellStyle}>
         <div ref={probeRef} style={{ width: '100%', height: '100%' }}>
@@ -232,6 +339,12 @@ export function App() {
 
   return (
     <div style={shellStyle}>
+      {banner !== undefined && (
+        <ConnectionBanner
+          kind={banner.kind}
+          {...(banner.reason !== undefined ? { reason: banner.reason } : {})}
+        />
+      )}
       <div style={shellBodyStyle}>
         <ActivityBar view={sidebarView} onSelectView={setSidebarView} />
         <Sidebar view={sidebarView} bridge={window.termhub} />

@@ -50,6 +50,8 @@ export interface MinimalIpcRenderer {
 export interface BridgeConnectionStateSnapshot {
   state: BridgeConnectionState;
   reason?: string;
+  /** M4.8: the daemon-supervisor's generation number for this connection — present whenever `state` is `'connected'` (`ipc-contract.ts`'s `BridgeStateMessage.epoch` doc comment). The renderer's own resync logic (`daemon-resync.ts`) keys off this changing to tell "still the same connection" from "reconnected". */
+  epoch?: number;
 }
 
 /** The bridge surface `createBridge` returns — everything `window.termhub` exposes *except* `versions`, which `preload/index.ts` adds separately (it comes from `process.versions`, not from any IPC round-trip). */
@@ -174,10 +176,11 @@ export function createBridge(
         }
         return;
       case 'state':
-        currentState =
-          message.reason !== undefined
-            ? { state: message.state, reason: message.reason }
-            : { state: message.state };
+        currentState = {
+          state: message.state,
+          ...(message.reason !== undefined ? { reason: message.reason } : {}),
+          ...(message.epoch !== undefined ? { epoch: message.epoch } : {}),
+        };
         for (const listener of stateListeners) {
           listener(currentState);
         }

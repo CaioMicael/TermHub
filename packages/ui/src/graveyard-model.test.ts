@@ -10,6 +10,7 @@ import {
   resolveRestoreWorkspaceId,
   resolveSplitTarget,
   sessionsJustUnplaced,
+  sessionsToBury,
   sortGraveyardEntries,
   type SessionOrigin,
 } from './graveyard-model.js';
@@ -139,9 +140,21 @@ describe('collectSessionLocations', () => {
     });
     const s = state({ workspaces: [workspace(), two] });
     const locations = collectSessionLocations(s);
-    expect(locations.get(1)).toEqual({ workspaceId: 'ws1', workspaceName: 'termhub' });
-    expect(locations.get(10)).toEqual({ workspaceId: 'ws2', workspaceName: 'api-gateway' });
-    expect(locations.get(11)).toEqual({ workspaceId: 'ws2', workspaceName: 'api-gateway' });
+    expect(locations.get(1)).toEqual({
+      workspaceId: 'ws1',
+      workspaceName: 'termhub',
+      createdAt: 0,
+    });
+    expect(locations.get(10)).toEqual({
+      workspaceId: 'ws2',
+      workspaceName: 'api-gateway',
+      createdAt: 0,
+    });
+    expect(locations.get(11)).toEqual({
+      workspaceId: 'ws2',
+      workspaceName: 'api-gateway',
+      createdAt: 0,
+    });
   });
 
   it('reports nothing for a workspace with no panes (root: null)', () => {
@@ -153,21 +166,21 @@ describe('collectSessionLocations', () => {
 describe('sessionsJustUnplaced', () => {
   it('reports a session present before and absent after, with its prior origin', () => {
     const prev = new Map<number, SessionOrigin>([
-      [1, { workspaceId: 'ws1', workspaceName: 'termhub' }],
-      [2, { workspaceId: 'ws1', workspaceName: 'termhub' }],
+      [1, { workspaceId: 'ws1', workspaceName: 'termhub', createdAt: 0 }],
+      [2, { workspaceId: 'ws1', workspaceName: 'termhub', createdAt: 0 }],
     ]);
     const next = new Map<number, SessionOrigin>([
-      [2, { workspaceId: 'ws1', workspaceName: 'termhub' }],
+      [2, { workspaceId: 'ws1', workspaceName: 'termhub', createdAt: 0 }],
     ]);
     expect(sessionsJustUnplaced(prev, next)).toEqual([
-      { sessionId: 1, origin: { workspaceId: 'ws1', workspaceName: 'termhub' } },
+      { sessionId: 1, origin: { workspaceId: 'ws1', workspaceName: 'termhub', createdAt: 0 } },
     ]);
   });
 
   it('reports every session of a whole tab closing at once', () => {
     const prev = new Map<number, SessionOrigin>([
-      [10, { workspaceId: 'ws2', workspaceName: 'api-gateway' }],
-      [11, { workspaceId: 'ws2', workspaceName: 'api-gateway' }],
+      [10, { workspaceId: 'ws2', workspaceName: 'api-gateway', createdAt: 0 }],
+      [11, { workspaceId: 'ws2', workspaceName: 'api-gateway', createdAt: 0 }],
     ]);
     const next = new Map<number, SessionOrigin>();
     const result = sessionsJustUnplaced(prev, next)
@@ -178,13 +191,76 @@ describe('sessionsJustUnplaced', () => {
 
   it('reports nothing when nothing left (a split, or a move within the same workspace)', () => {
     const prev = new Map<number, SessionOrigin>([
-      [1, { workspaceId: 'ws1', workspaceName: 'termhub' }],
+      [1, { workspaceId: 'ws1', workspaceName: 'termhub', createdAt: 0 }],
     ]);
     const next = new Map<number, SessionOrigin>([
-      [1, { workspaceId: 'ws1', workspaceName: 'termhub' }],
-      [2, { workspaceId: 'ws1', workspaceName: 'termhub' }],
+      [1, { workspaceId: 'ws1', workspaceName: 'termhub', createdAt: 0 }],
+      [2, { workspaceId: 'ws1', workspaceName: 'termhub', createdAt: 0 }],
     ]);
     expect(sessionsJustUnplaced(prev, next)).toEqual([]);
+  });
+});
+
+describe("sessionsToBury (M4.8, docs/specs/m4.8-daemon-resilience.md, this task's own section 3 armadilha)", () => {
+  it('keeps a candidate whose id+createdAt still matches state.sessions — the normal-close case', () => {
+    const candidates = [
+      { sessionId: 1, origin: { workspaceId: 'ws1', workspaceName: 'termhub', createdAt: 500 } },
+    ];
+    // A normal close never touches `state.sessions` before this filter runs
+    // (`Sidebar.tsx`'s own `removeSession` call comes *after* it) — the
+    // metadata is still there, unchanged.
+    const sessions = { 1: session({ id: 1, createdAt: 500 }) };
+    expect(sessionsToBury(candidates, sessions)).toEqual(candidates);
+  });
+
+  it('⚑ without this filter, every stale id from a daemon-resync hydrate would be sent to session.close — including one reused by the very session the resync just created', () => {
+    // The scenario docs/specs/m4.8-daemon-resilience.md's own armadilha (and
+    // this task's prompt, section 3) describes: the daemon restarted, and
+    // renumbered sessions from 1. Two sessions used to be placed (ids 1 and
+    // 2, from the *old* connection); after the resync, only one live
+    // session exists — the one the resync itself just created — and it
+    // happens to reuse id 1.
+    const candidates = [
+      { sessionId: 1, origin: { workspaceId: 'ws1', workspaceName: 'termhub', createdAt: 1_000 } },
+      { sessionId: 2, origin: { workspaceId: 'ws1', workspaceName: 'termhub', createdAt: 1_000 } },
+    ];
+    // The defect this test demonstrates: a naive burial mechanism that
+    // skips this filter would take `sessionsJustUnplaced`'s raw candidates
+    // as-is and bury *both* ids — id 1 included, even though a live session
+    // now exists at that exact id.
+    expect(candidates.map((c) => c.sessionId)).toEqual([1, 2]);
+
+    // The new connection's own session.list only ever reported the one
+    // fresh session it created — with a brand-new createdAt, at the reused
+    // id 1. Id 2 is entirely absent: nothing reused it (yet).
+    const sessions = { 1: session({ id: 1, createdAt: 9_999 }) };
+
+    // With the filter: nothing is buried. Not id 2 (absent from the new
+    // connection's own session list — not this connection's to close), and
+    // — the specific danger named by name — not id 1 either, even though
+    // it's present, because it names a *different* session now (a
+    // mismatched createdAt), not the one that was actually unplaced.
+    expect(sessionsToBury(candidates, sessions)).toEqual([]);
+  });
+
+  it('drops a candidate entirely absent from state.sessions (the common case: a daemon restart with no id reuse at all)', () => {
+    const candidates = [
+      { sessionId: 3, origin: { workspaceId: 'ws1', workspaceName: 'termhub', createdAt: 1_000 } },
+    ];
+    expect(sessionsToBury(candidates, {})).toEqual([]);
+  });
+
+  it('a mix: real closes are buried, resync-stale ones are not, in the same call', () => {
+    const candidates = [
+      { sessionId: 1, origin: { workspaceId: 'ws1', workspaceName: 'termhub', createdAt: 500 } }, // real close
+      { sessionId: 2, origin: { workspaceId: 'ws1', workspaceName: 'termhub', createdAt: 1_000 } }, // resync-stale, reused id
+      { sessionId: 3, origin: { workspaceId: 'ws1', workspaceName: 'termhub', createdAt: 1_000 } }, // resync-stale, id gone
+    ];
+    const sessions = {
+      1: session({ id: 1, createdAt: 500 }),
+      2: session({ id: 2, createdAt: 9_999 }),
+    };
+    expect(sessionsToBury(candidates, sessions)).toEqual([candidates[0]]);
   });
 });
 
@@ -213,7 +289,7 @@ describe('buildGraveyardRows', () => {
   it('carries the workspace label when the origin is known, omits it otherwise', () => {
     const e = entry({ session: session({ id: 7 }) });
     const origins = new Map<number, SessionOrigin>([
-      [7, { workspaceId: 'ws1', workspaceName: 'termhub' }],
+      [7, { workspaceId: 'ws1', workspaceName: 'termhub', createdAt: 0 }],
     ]);
     const [withOrigin] = buildGraveyardRows([e], origins, 1_000_000);
     expect(withOrigin?.workspaceLabel).toBe('termhub');
@@ -227,7 +303,7 @@ describe('resolveRestoreWorkspaceId', () => {
     const s = state({
       workspaces: [workspace({ id: 'ws1' }), workspace({ id: 'ws2', name: 'other' })],
     });
-    const origin: SessionOrigin = { workspaceId: 'ws2', workspaceName: 'other' };
+    const origin: SessionOrigin = { workspaceId: 'ws2', workspaceName: 'other', createdAt: 0 };
     expect(resolveRestoreWorkspaceId(s, origin)).toBe('ws2');
   });
 
@@ -238,7 +314,7 @@ describe('resolveRestoreWorkspaceId', () => {
 
   it('falls back to the active workspace when the origin workspace no longer exists', () => {
     const s = state({ activeWorkspaceId: 'ws1' });
-    const origin: SessionOrigin = { workspaceId: 'gone', workspaceName: 'gone' };
+    const origin: SessionOrigin = { workspaceId: 'gone', workspaceName: 'gone', createdAt: 0 };
     expect(resolveRestoreWorkspaceId(s, origin)).toBe('ws1');
   });
 

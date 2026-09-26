@@ -246,11 +246,12 @@ export interface BridgeEventMessage {
 export type BridgeConnectionState =
   'connecting' | 'connected' | 'blocked' | 'failed' | 'disconnected';
 
-/** Main -> renderer: a connection-state transition. `reason` is a human-readable string (e.g. `daemon-client.ts`'s `'blocked'` reason, or a `'failed'` outcome's last error message) — never a structured code; nothing here has parsed it as one anywhere in this bridge. */
+/** Main -> renderer: a connection-state transition. `reason` is a human-readable string (e.g. `daemon-client.ts`'s `'blocked'` reason, or a `'failed'` outcome's last error message) — never a structured code; nothing here has parsed it as one anywhere in this bridge. `epoch` (docs/specs/m4.8-daemon-resilience.md section 3.2) is present whenever `state` is `'connected'`: the daemon-supervisor's generation number for *this* connection, so the renderer can tell "still the same connection" from "reconnected, possibly to a different daemon lifetime" without inspecting anything else. */
 export interface BridgeStateMessage {
   kind: 'state';
   state: BridgeConnectionState;
   reason?: string;
+  epoch?: number;
 }
 
 export type RelayOutboundMessage =

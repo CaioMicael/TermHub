@@ -250,6 +250,42 @@ function releaseSessionOwnership(bridge: TerminalBridge, sessionId: number): voi
 }
 
 /**
+ * M4.8, section 2.3/3.4 step 1: forgets *every* session's ownership on
+ * `bridge` — clears the whole ref-count map and cancels any pending
+ * deferred `session.detach` timers, **without sending anything to the
+ * daemon**.
+ *
+ * Ownership here is scoped to one daemon *connection*, keyed only by
+ * `bridge` (there is exactly one `window.termhub` for the renderer's whole
+ * life — a reconnect never replaces it, only the connection underneath it
+ * does). When that underlying connection changes — a drop and a reconnect,
+ * same daemon or a fresh one — the ref counts this module tracked for the
+ * *old* connection describe nothing the new one knows about. The "obvious"
+ * way to reattach, a plain `release()` followed by `acquire()`, walks
+ * straight into that: `release()` merely *schedules* a deferred
+ * `session.detach` (this file's header comment on why, for React.StrictMode)
+ * and the very next `acquire()` cancels it and reuses the *already-settled*
+ * `attachPromise` from before — never sending a new `session.attach` at all,
+ * on either the old or the new connection (docs/specs/
+ * m4.8-daemon-resilience.md section 2.3's own name for this trap). Calling
+ * this function first — before any host reattaches — throws that whole
+ * bookkeeping away, so the very next `acquireSessionOwnership` for a given
+ * session starts completely fresh and genuinely sends `session.attach`.
+ */
+export function forgetSessionOwnership(bridge: TerminalBridge): void {
+  const registry = sessionOwnershipByBridge.get(bridge);
+  if (registry === undefined) {
+    return;
+  }
+  for (const record of registry.values()) {
+    if (record.detachTimer !== undefined) {
+      clearTimeout(record.detachTimer);
+    }
+  }
+  registry.clear();
+}
+
+/**
  * Attaches `sink` to `sessionId` on `bridge`: installs the filtered data
  * listener *before* acquiring the attachment (the ordering contract
  * above), then writes every chunk for this session to `sink`, in the order
