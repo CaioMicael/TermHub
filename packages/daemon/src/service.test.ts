@@ -5,18 +5,21 @@ import { Terminal } from '@xterm/headless';
 import { PROTOCOL_ERROR_CODE, ProtocolError } from '@termhub/shared';
 import type {
   GraveyardListResult,
+  ProfilesListResult,
   SessionAttachResult,
   SessionCreateResult,
   SessionExitPayload,
   SessionId,
   SessionListResult,
   SessionRestoreResult,
+  ShellProfile,
 } from '@termhub/shared';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { TerminalBuffer } from './buffer.js';
 import { Graveyard, MAX_TTL_MS, MIN_TTL_MS } from './graveyard.js';
 import type { GraveyardClock } from './graveyard.js';
+import type { ProfileService } from './profiles.js';
 import { Registry } from './registry.js';
 import type { SessionFactory, SessionLike } from './registry.js';
 import {
@@ -166,9 +169,13 @@ interface Harness {
   service: SessionService;
 }
 
-/** Starts a server with the session service registered, a matching registry, and one connected+handshaked client. `graveyard` (M4.4) lets a test inject one built with a fake clock — see `graveyard.test.ts`'s own fake clock for the pattern — while keeping everything else in this harness on real timers. */
+/** Starts a server with the session service registered, a matching registry, and one connected+handshaked client. `graveyard` (M4.4) lets a test inject one built with a fake clock — see `graveyard.test.ts`'s own fake clock for the pattern — while keeping everything else in this harness on real timers. `profiles` (M4.6) similarly lets a test inject a fake `ProfileService` instead of `registerSessionService`'s default (real shell detection for whatever OS the test runs on). */
 async function startHarness(
-  options: { sessionFactory?: SessionFactory; graveyard?: Graveyard } = {},
+  options: {
+    sessionFactory?: SessionFactory;
+    graveyard?: Graveyard;
+    profiles?: ProfileService;
+  } = {},
 ): Promise<Harness> {
   const address = uniqueAddress();
   const token = `tok-${randomUUID()}`;
@@ -176,7 +183,7 @@ async function startHarness(
     options.sessionFactory !== undefined ? { sessionFactory: options.sessionFactory } : {},
   );
   const server = new TransportServer({ token, address });
-  const service = registerSessionService(server, registry, options.graveyard);
+  const service = registerSessionService(server, registry, options.graveyard, options.profiles);
   cleanup.push(() => server.close());
   await server.listen();
 
@@ -1529,4 +1536,78 @@ describe('graveyard: real PTY end to end (M4.4)', () => {
     await waitFor(() => !processExists(realPid), 15_000);
     expect(processExists(realPid)).toBe(false);
   }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// M4.6 (first half) — `profiles.list`
+// ---------------------------------------------------------------------------
+
+describe('profiles.list: RPC wiring (fake ProfileService)', () => {
+  it('returns whatever the injected ProfileService reports, and forwards `refresh` to it', async () => {
+    const fakeProfiles: ShellProfile[] = [
+      { id: 'posix:/bin/sh', name: 'sh', kind: 'posix', shell: '/bin/sh', args: [] },
+    ];
+    const list = vi.fn(() => Promise.resolve(fakeProfiles));
+    const { client } = await startHarness({ profiles: { list } });
+
+    const first = await client.request<ProfilesListResult>('profiles.list', {});
+    expect(first).toEqual({ profiles: fakeProfiles });
+    expect(list).toHaveBeenNthCalledWith(1, undefined);
+
+    await client.request<ProfilesListResult>('profiles.list', { refresh: true });
+    expect(list).toHaveBeenNthCalledWith(2, true);
+  });
+});
+
+describe('profiles.list: real detection end to end over the real pipe (M4.6)', () => {
+  it(
+    'every profile the daemon actually detects on THIS machine opens a real PTY that runs a command and echoes ' +
+      'it back — the same test on Windows CI proves whatever profiles that runner has (pwsh/powershell/cmd/Git ' +
+      'Bash/WSL), and on this Linux container proves at least /bin/sh',
+    async () => {
+      const { registry, client } = await startHarness(); // default: real ProfileService, real shell detection
+      realRegistries.push(registry);
+
+      const profilesResult = await client.request<ProfilesListResult>('profiles.list', {});
+      expect(profilesResult.profiles.length).toBeGreaterThan(0);
+      // docs/milestones.md's own M4.6 acceptance for this half: at minimum,
+      // /bin/sh shows up on this Linux container.
+      if (process.platform !== 'win32') {
+        expect(profilesResult.profiles.some((p) => p.id === 'posix:/bin/sh')).toBe(true);
+      }
+
+      for (const profile of profilesResult.profiles) {
+        const createResult = await client.request<SessionCreateResult>('session.create', {
+          shell: profile.shell,
+          args: profile.args,
+          cwd: process.cwd(),
+          cols: 80,
+          rows: 24,
+        });
+        const sessionId = createResult.session.id;
+
+        let output = '';
+        const onData = (sid: SessionId, data: Uint8Array): void => {
+          if (sid === sessionId) output += Buffer.from(data).toString('utf8');
+        };
+        client.onData(onData);
+        await client.request('session.attach', { sessionId });
+        await waitFor(() => output.length > 0, 20_000);
+
+        // `\r`, not `\n` — the Enter key a terminal sends. See
+        // service.test.ts's own M4.4 real-PTY suite (above) for why: it's
+        // the only line ending every one of these shells (ConPTY-hosted
+        // PowerShell/cmd included) agrees actually submits the line.
+        const marker = `TERMHUB-PROFILE-${profile.id}-OK`;
+        client.sendData(sessionId, Buffer.from(`echo ${marker}\r`, 'utf8'));
+        await waitFor(() => hasStandaloneLine(output, marker), 20_000);
+        expect(hasStandaloneLine(output, marker)).toBe(true);
+
+        await client.request('session.kill', { sessionId });
+      }
+    },
+    // Scales with however many profiles this machine actually has (Windows
+    // CI can have 4-5: pwsh, powershell, cmd, Git Bash, maybe a WSL distro).
+    120_000,
+  );
 });

@@ -277,6 +277,45 @@ export interface GraveyardListResult {
   entries: GraveyardEntry[];
 }
 
+// ---------------------------------------------------------------------------
+// RPC method: profiles.list (M4.6, first half — packages/daemon/src/
+// profiles.ts)
+//
+// One entry per shell the daemon found installed on this machine (PowerShell
+// 7, Windows PowerShell 5.1, cmd, Git Bash, one per WSL distro, or — off
+// Windows — $SHELL/bash/zsh/sh), for a future `+` button menu to list and
+// `session.create` to launch (that wiring, and making profiles user-
+// configurable, is this milestone's second half — see this task's final
+// report for the exact split).
+//
+// `profiles.list` is a daemon RPC like any other, so it is part of
+// `RequestParamsByMethod`/`RequestResultByMethod` below. Reaching it from the
+// renderer is a separate step: `REQUEST_METHODS` in the app's
+// `ipc-contract.ts` does not list it yet.
+// ---------------------------------------------------------------------------
+
+/** One shell the daemon can launch a session with, as detected by `packages/daemon/src/profiles.ts`. */
+export interface ShellProfile {
+  /** Stable across daemon runs: `'pwsh'`, `'powershell'`, `'cmd'`, `'git-bash'`, `'wsl:<distro>'`, `'posix:<path>'`. */
+  id: string;
+  /** Shown in the (future) profile menu, e.g. `"PowerShell 7"`, `"Ubuntu (WSL)"`. */
+  name: string;
+  kind: 'pwsh' | 'powershell' | 'cmd' | 'git-bash' | 'wsl' | 'posix';
+  /** What a `session.create` call for this profile should pass as `shell`. */
+  shell: string;
+  /** What a `session.create` call for this profile should pass as `args`. */
+  args: string[];
+}
+
+export interface ProfilesListParams {
+  /** Forces detection to run again instead of returning the daemon's cached result. Defaults to `false`. */
+  refresh?: boolean;
+}
+
+export interface ProfilesListResult {
+  profiles: ShellProfile[];
+}
+
 /** Every request method's params type, keyed by method name — the single source of truth `RequestMethod` and the discriminated envelopes below are derived from. */
 export interface RequestParamsByMethod {
   'session.create': SessionCreateParams;
@@ -288,6 +327,7 @@ export interface RequestParamsByMethod {
   'session.kill': SessionKillParams;
   'session.restore': SessionRestoreParams;
   'graveyard.list': GraveyardListParams;
+  'profiles.list': ProfilesListParams;
 }
 
 /** Every request method's success result type, keyed by method name. */
@@ -301,6 +341,7 @@ export interface RequestResultByMethod {
   'session.kill': SessionKillResult;
   'session.restore': SessionRestoreResult;
   'graveyard.list': GraveyardListResult;
+  'profiles.list': ProfilesListResult;
 }
 
 export type RequestMethod = keyof RequestParamsByMethod;

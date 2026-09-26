@@ -2,6 +2,8 @@ import { PROTOCOL_ERROR_CODE, ProtocolError } from '@termhub/shared';
 import type {
   GraveyardListParams,
   GraveyardListResult,
+  ProfilesListParams,
+  ProfilesListResult,
   SessionAttachParams,
   SessionAttachResult,
   SessionCloseParams,
@@ -25,6 +27,8 @@ import type {
 
 import { TerminalBuffer } from './buffer.js';
 import { Graveyard, resolveTtlMs } from './graveyard.js';
+import { createProfileService } from './profiles.js';
+import type { ProfileService } from './profiles.js';
 import type { Registry, SessionLike } from './registry.js';
 import type { Disposable } from './session.js';
 import type { TransportServer } from './transport.js';
@@ -185,22 +189,26 @@ export interface SessionService {
 /**
  * Registers `session.create` / `session.resize` / `session.close` /
  * `session.list` / `session.attach` / `session.detach` / `session.kill` /
- * `session.restore` / `graveyard.list` on `server`, delegating to `registry`
- * and (for the M4.4 methods) `graveyard`, and wires every session's
- * output/exit through its `SessionRuntime` to whichever clients are attached
- * to it. Call once per `TransportServer` instance (mirrors
- * `registerMethod`'s own "no duplicate registration" contract).
+ * `session.restore` / `graveyard.list` / `profiles.list` on `server`,
+ * delegating to `registry`, (for the M4.4 methods) `graveyard`, and (for
+ * `profiles.list`, M4.6) `profiles`, and wires every session's output/exit
+ * through its `SessionRuntime` to whichever clients are attached to it. Call
+ * once per `TransportServer` instance (mirrors `registerMethod`'s own "no
+ * duplicate registration" contract).
  *
- * `graveyard` defaults to a fresh `Graveyard()` (the real system clock) —
- * production callers (`daemon-runtime.ts`) never need to pass one. Tests
- * that need to control the graveyard's clock (or share a `Graveyard`
- * instance to assert on directly) construct their own and pass it in, the
- * same `SessionFactory`-style injection `Registry` already uses.
+ * `graveyard` defaults to a fresh `Graveyard()` (the real system clock) and
+ * `profiles` to a fresh `createProfileService()` (real shell detection for
+ * whatever OS the daemon is actually running on) — production callers
+ * (`daemon-runtime.ts`) never need to pass either. Tests that need to
+ * control the graveyard's clock, or inject a fake system for profile
+ * detection, construct their own and pass it in, the same
+ * `SessionFactory`-style injection `Registry` already uses.
  */
 export function registerSessionService(
   server: TransportServer,
   registry: Registry,
   graveyard: Graveyard = new Graveyard(),
+  profiles: ProfileService = createProfileService(),
 ): SessionService {
   // One entry per live-or-not-yet-closed session, created in session.create
   // and removed only once the session is truly dead (killed live, or its
@@ -347,6 +355,16 @@ export function registerSessionService(
   server.registerMethod<GraveyardListParams, GraveyardListResult>('graveyard.list', () => ({
     entries: graveyard.list(),
   }));
+
+  // M4.6 (first half): `params.refresh` (`undefined` treated as `false` by
+  // `ProfileService#list`, same default the wire type's own doc comment
+  // documents) forces a fresh detection instead of the cached one.
+  server.registerMethod<ProfilesListParams, ProfilesListResult>(
+    'profiles.list',
+    async (params) => ({
+      profiles: await profiles.list(params.refresh),
+    }),
+  );
 
   server.registerMethod<SessionListParams, SessionListResult>('session.list', () => ({
     // Never includes a buried session: registry.evict() (called from
