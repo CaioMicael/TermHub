@@ -166,13 +166,53 @@ export interface BridgeContextMenuMessage {
   hasSelection: boolean;
 }
 
+/**
+ * Renderer -> main (M4.3): reads the persisted layout (`workspaces.json`,
+ * via the main process's `StateFile<WorkspacesFile>` — docs/specs/
+ * m4.1-atomic-state.md). Answered with a `BridgeResponseMessage` whose
+ * `result` is a `WorkspacesFile`, the same request/response mechanism as
+ * `BridgeClipboardReadMessage` (routed through `requestOwners`/
+ * `sendFiltered` so a stale instance's late response is dropped the same
+ * way). Never touches the daemon — `BridgeGateway`'s own `options.layout`
+ * reads straight from the `StateFile` `main/index.ts` already opened at
+ * boot (M4.1), independent of `state`/`relay`.
+ */
+export interface BridgeLayoutLoadMessage {
+  kind: 'layoutLoad';
+  id: string;
+  instanceId?: string;
+}
+
+/**
+ * Renderer -> main (M4.3): persists `layout` to `workspaces.json`.
+ * Deliberately **no response** — see this task's final report for why this
+ * is *not* modeled on `BridgeClipboardWriteMessage` (which, despite this
+ * file's original header comment analogy, does answer with `result: {}`):
+ * `layoutSave` fires on every store change once the renderer starts saving
+ * (this task's prompt, section 2), and a caller that never reads the
+ * response has no use for one — same shape/reasoning as
+ * `BridgeSendDataMessage`, just for the layout instead of PTY input.
+ * `layout` is untrusted, renderer-supplied `unknown`: `BridgeGateway`
+ * forwards it to `StateFile.save`, which validates against
+ * `WorkspacesFileSchema` before ever writing anything — an invalid value is
+ * refused and logged, never persisted (docs/specs/m4.1-atomic-state.md
+ * section 3.6).
+ */
+export interface BridgeLayoutSaveMessage {
+  kind: 'layoutSave';
+  instanceId?: string;
+  layout: unknown;
+}
+
 export type RelayInboundMessage =
   | BridgeHelloMessage
   | BridgeRequestMessage
   | BridgeSendDataMessage
   | BridgeClipboardReadMessage
   | BridgeClipboardWriteMessage
-  | BridgeContextMenuMessage;
+  | BridgeContextMenuMessage
+  | BridgeLayoutLoadMessage
+  | BridgeLayoutSaveMessage;
 
 /** Main -> renderer: the reply to one `BridgeRequestMessage`. */
 export interface BridgeResponseMessage {

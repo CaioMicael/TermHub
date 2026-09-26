@@ -306,4 +306,66 @@ describe('createBridge', () => {
       message: 'no clipboard',
     });
   });
+
+  // -------------------------------------------------------------------------
+  // M4.3: loadLayout/saveLayout — loadLayout shares request()'s correlation
+  // machinery (same as clipboardRead above); saveLayout never gets a
+  // response at all (ipc-contract.ts's BridgeLayoutSaveMessage doc comment).
+  // -------------------------------------------------------------------------
+
+  it('loadLayout(): sends a layoutLoad message and resolves with the layout', async () => {
+    const { ipc, sent, deliver } = createFakeIpc();
+    const bridge = createBridge(ipc, 'inst-1');
+
+    const resultPromise = bridge.loadLayout();
+    const msg = sent.find((m) => m.kind === 'layoutLoad');
+    if (msg === undefined || msg.kind !== 'layoutLoad') {
+      throw new Error('expected a layoutLoad message');
+    }
+    expect(msg.instanceId).toBe('inst-1');
+
+    const layout = { version: 1 as const, workspaces: [] };
+    deliver({ kind: 'response', id: msg.id, outcome: { ok: true, result: layout } });
+    await expect(resultPromise).resolves.toEqual(layout);
+  });
+
+  it('loadLayout() rejects with the plain BridgeErrorPayload on failure, same as request()', async () => {
+    const { ipc, sent, deliver } = createFakeIpc();
+    const bridge = createBridge(ipc);
+
+    const resultPromise = bridge.loadLayout();
+    const msg = sent.find((m) => m.kind === 'layoutLoad');
+    if (msg === undefined || msg.kind !== 'layoutLoad') {
+      throw new Error('expected a layoutLoad message');
+    }
+    deliver({
+      kind: 'response',
+      id: msg.id,
+      outcome: {
+        ok: false,
+        error: { code: 'bridge_internal_error', message: 'layout storage is not available' },
+      },
+    });
+    await expect(resultPromise).rejects.toEqual({
+      code: 'bridge_internal_error',
+      message: 'layout storage is not available',
+    });
+  });
+
+  it('saveLayout(): sends a layoutSave message carrying the layout, and never waits for (or expects) a response', () => {
+    const { ipc, sent } = createFakeIpc();
+    const bridge = createBridge(ipc, 'inst-1');
+
+    const layout = { version: 1 as const, workspaces: [] };
+    bridge.saveLayout(layout);
+
+    const msg = sent.find((m) => m.kind === 'layoutSave');
+    if (msg === undefined || msg.kind !== 'layoutSave') {
+      throw new Error('expected a layoutSave message');
+    }
+    expect(msg.instanceId).toBe('inst-1');
+    expect(msg.layout).toEqual(layout);
+    // No `id` field at all — there is nothing for a response to correlate against.
+    expect('id' in msg).toBe(false);
+  });
 });

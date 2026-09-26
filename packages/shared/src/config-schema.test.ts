@@ -9,7 +9,11 @@ import {
   type WorkspacesFile,
 } from './config-schema.js';
 
-const leaf = (sessionId: number): PersistedPaneNode => ({ kind: 'leaf', sessionId });
+const leaf = (sessionId: number, sessionCreatedAt = 1_000): PersistedPaneNode => ({
+  kind: 'leaf',
+  sessionId,
+  sessionCreatedAt,
+});
 
 function validWorkspacesFile(): WorkspacesFile {
   return {
@@ -137,5 +141,18 @@ describe('WorkspacesFileSchema: whole-file validation', () => {
     expect(WorkspacesFileSchema.safeParse({ ...validWorkspacesFile(), version: 2 }).success).toBe(
       false,
     );
+  });
+
+  it('rejects a leaf missing sessionCreatedAt (M4.3: matching by id alone is not enough — the daemon renumbers sessions from 1 on every restart)', () => {
+    const file = validWorkspacesFile();
+    const bareLeaf: unknown = { kind: 'leaf', sessionId: 3 };
+    const [first] = file.workspaces;
+    if (first === undefined) {
+      throw new Error('fixture: missing first workspace');
+    }
+    expect(
+      WorkspacesFileSchema.safeParse({ ...file, workspaces: [{ ...first, root: bareLeaf }] })
+        .success,
+    ).toBe(false);
   });
 });

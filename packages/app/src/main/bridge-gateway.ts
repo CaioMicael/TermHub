@@ -1,4 +1,4 @@
-import type { SessionId } from '@termhub/shared';
+import type { SessionId, WorkspacesFile } from '@termhub/shared';
 
 import type { DaemonConnection } from './daemon-client.js';
 import { DaemonRelay, toBridgeError } from './daemon-relay.js';
@@ -8,11 +8,30 @@ import type {
   BridgeClipboardWriteMessage,
   BridgeConnectionState,
   BridgeContextMenuMessage,
+  BridgeLayoutLoadMessage,
+  BridgeLayoutSaveMessage,
   BridgeRequestMessage,
   RelayInboundMessage,
   RelayOutboundMessage,
 } from './ipc-contract.js';
 import type { SessionAttachments } from './session-attachments.js';
+
+/**
+ * M4.3: the main process's read/write access to the persisted layout
+ * (`workspaces.json`, docs/specs/m4.1-atomic-state.md's
+ * `StateFile<WorkspacesFile>`), as `BridgeGateway` needs it. `save`'s
+ * `value` is `unknown` on purpose — it is renderer-supplied, untrusted data
+ * (this task's prompt, section "Armadilhas": "os valores do renderer vão
+ * para o main por structured clone: só dados simples") — and the *real*
+ * validation is `StateFile.save`'s own `WorkspacesFileSchema.safeParse`,
+ * not anything in this bridge. `main/index.ts` builds the real instance
+ * from `openAppStateFiles()`'s `workspaces` `StateFile`; tests construct a
+ * plain fake with no `StateFile`/disk at all.
+ */
+export interface LayoutAccess {
+  load(): Promise<WorkspacesFile>;
+  save(value: unknown): boolean;
+}
 
 // Owns one window's worth of bridge state, from before `connectToDaemon()`
 // settles through to the `TransportClient` (if any) closing. Deliberately
@@ -90,6 +109,20 @@ export interface BridgeGatewayOptions {
    * entirely by tests that don't need attach/detach routing at all.
    */
   sessionAttachments?: Promise<SessionAttachments | undefined>;
+  /**
+   * M4.3: the app's persisted-layout access (`workspaces.json`), backing
+   * `layoutLoad`/`layoutSave` — one per app (not per window, same reasoning
+   * as `sessionAttachments`: every window's `BridgeGateway` shares the same
+   * `StateFile`, since there is exactly one `workspaces.json` writer per
+   * process — docs/specs/m4.1-atomic-state.md section 3.1). A `Promise`
+   * for the same reason `sessionAttachments` is one: `main/index.ts` builds
+   * it from `openAppStateFiles()`'s own promise, which the window must not
+   * wait on before showing up. `undefined` (every test that doesn't need
+   * it) answers both message kinds as "not available" — `layoutLoad` with
+   * `bridge_internal_error`, `layoutSave` dropped silently (there is no
+   * response channel for it to report a failure on).
+   */
+  layout?: Promise<LayoutAccess | undefined>;
   /** Forwarded to the `DaemonRelay` created on `'connected'`. */
   coalesceWindowMs?: DaemonRelayOptions['coalesceWindowMs'];
   coalesceByteLimitBytes?: DaemonRelayOptions['coalesceByteLimitBytes'];
@@ -143,6 +176,7 @@ export class BridgeGateway {
   private disposed = false;
 
   private sessionAttachments: SessionAttachments | undefined;
+  private layoutAccess: LayoutAccess | undefined;
   /** The `instanceId` of the most recent `hello` this gateway has processed — `undefined` until the first one arrives. */
   private currentInstanceId: string | undefined;
   /**
@@ -203,6 +237,20 @@ export class BridgeGateway {
         // genuinely unexpected failure.
         console.error('[TermHub] session attachments promise rejected unexpectedly', err);
       });
+
+    options.layout
+      ?.then((access) => {
+        if (!this.disposed) {
+          this.layoutAccess = access;
+        }
+      })
+      .catch((err: unknown) => {
+        // Same stance as the two promises above: `main/index.ts` derives
+        // this one from `openAppStateFiles()` with a `.then`/`.catch` that
+        // never itself throws, so this only guards against a genuinely
+        // unexpected failure.
+        console.error('[TermHub] layout access promise rejected unexpectedly', err);
+      });
   }
 
   /** Current connection state, for a renderer that asks after this gateway already settled (this class has no async "get state" of its own — `main/index.ts` only ever needs this for tests/diagnostics; the renderer learns state via `BridgeStateMessage`). */
@@ -262,6 +310,21 @@ export class BridgeGateway {
     }
     if (message.kind === 'contextMenu') {
       this.handleContextMenu(message);
+      return;
+    }
+
+    // M4.3: the persisted layout, backed by `options.layout` — never the
+    // daemon (docs/specs/m4.1-atomic-state.md's `StateFile`, not
+    // `DaemonRelay`). `layoutLoad` answers through the same
+    // `requestOwners`/`sendFiltered` machinery as any other request;
+    // `layoutSave` never answers at all (`ipc-contract.ts`'s
+    // `BridgeLayoutSaveMessage` doc comment).
+    if (message.kind === 'layoutLoad') {
+      this.handleLayoutLoad(message);
+      return;
+    }
+    if (message.kind === 'layoutSave') {
+      this.handleLayoutSave(message);
       return;
     }
 
@@ -486,6 +549,50 @@ export class BridgeGateway {
         });
       },
     );
+  }
+
+  /** M4.3: `layoutLoad` — reads the persisted layout via `options.layout`. */
+  private handleLayoutLoad(message: BridgeLayoutLoadMessage): void {
+    const internalId = this.mintInternalId(message.id, message.instanceId);
+    const layout = this.layoutAccess;
+    if (layout === undefined) {
+      this.sendFiltered(
+        this.bridgeInternalErrorResponse(
+          internalId,
+          'layout storage is not available in this environment',
+        ),
+      );
+      return;
+    }
+    void layout.load().then(
+      (value) => {
+        this.sendFiltered({
+          kind: 'response',
+          id: internalId,
+          outcome: { ok: true, result: value },
+        });
+      },
+      (err: unknown) => {
+        this.sendFiltered({
+          kind: 'response',
+          id: internalId,
+          outcome: { ok: false, error: toBridgeError(err) },
+        });
+      },
+    );
+  }
+
+  /**
+   * M4.3: `layoutSave` — persists `message.layout` via `options.layout`.
+   * No response, ever (`ipc-contract.ts`'s `BridgeLayoutSaveMessage` doc
+   * comment), so this never mints a `requestOwners` entry: there is no
+   * answer for a stale instance's late arrival to collide with. With no
+   * `layoutAccess` configured, the value is dropped silently — same stance
+   * `handleRendererMessage` already takes for `sendData` with no
+   * connection.
+   */
+  private handleLayoutSave(message: BridgeLayoutSaveMessage): void {
+    this.layoutAccess?.save(message.layout);
   }
 
   private handleHello(instanceId: string): void {

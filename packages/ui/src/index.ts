@@ -167,6 +167,17 @@ export {
 export { initialStoreState, useTermhubStore } from './store/store.js';
 export type { TermhubStore, TermhubStoreActions } from './store/store.js';
 
+// ─── M4.3: pure store <-> WorkspacesFile projection/reconciliation ────────
+
+export {
+  reconcileLayout,
+  toPersistedLayout,
+  RECOVERED_WORKSPACE_CWD_FALLBACK,
+  RECOVERED_WORKSPACE_ID,
+  RECOVERED_WORKSPACE_NAME,
+} from './layout-persistence.js';
+export type { ReconcileOutcome, ReconcileRestored } from './layout-persistence.js';
+
 export {
   closePaneAction,
   createWorkspaceWithNewSession,

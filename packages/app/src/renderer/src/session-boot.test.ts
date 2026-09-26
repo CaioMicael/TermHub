@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import type { SessionSummary } from '@termhub/shared';
-import { collectSessionIds, treeLeaves, type PaneNode } from '@termhub/ui';
+import type { SessionSummary, WorkspacesFile } from '@termhub/shared';
+import { collectSessionIds, treeLeaves, type PaneNode, type StoreState } from '@termhub/ui';
 
 import {
   DEFAULT_CWD,
@@ -8,11 +8,28 @@ import {
   DEFAULT_WORKSPACE_ID,
   resetSessionBootForTests,
   resolveBootWorkspace,
+  startLayoutPersistence,
+  type BootResult,
+  type LayoutPersistenceStore,
   type SessionBootBridge,
   type SessionBootMethod,
   type SessionBootRequestParams,
   type SessionBootRequestResult,
 } from './session-boot.js';
+
+/** Every test in this file is about the `'fresh-boot'` fallback (M3.1's original policy) — a fake bridge whose `loadLayout()` always resolves to the "no persisted layout at all" default is what makes `reconcileLayout` take that path. M4.3's own reconciliation rules are `layout-persistence.test.ts`'s job (pure, no bridge at all), and `bridge-gateway.test.ts`/`App.tsx`'s own doc comment cover the wiring around a *present* layout. */
+function noPersistedLayout(): WorkspacesFile {
+  return { version: 1, workspaces: [] };
+}
+
+/** Every test in this file resolves to exactly one workspace (the fresh-boot fallback's own policy) — this just spares each assertion an inline `noUncheckedIndexedAccess` check. */
+function onlyWorkspace(result: BootResult): BootResult['workspaces'][number] {
+  const [workspace] = result.workspaces;
+  if (workspace === undefined) {
+    throw new Error('fixture: expected exactly one workspace');
+  }
+  return workspace;
+}
 
 function summary(overrides: Partial<SessionSummary> = {}): SessionSummary {
   return {
@@ -52,7 +69,11 @@ function createFakeBridge(
     return Promise.resolve(result) as Promise<SessionBootRequestResult[M]>;
   }
 
-  return { bridge: { request }, listCalls, createCalls };
+  return {
+    bridge: { request, loadLayout: () => Promise.resolve(noPersistedLayout()) },
+    listCalls,
+    createCalls,
+  };
 }
 
 describe('resolveBootWorkspace', () => {
@@ -66,9 +87,9 @@ describe('resolveBootWorkspace', () => {
 
     const result = await resolveBootWorkspace(bridge, { cols: 120, rows: 40 });
 
-    expect(result.workspace.id).toBe(DEFAULT_WORKSPACE_ID);
-    expect(result.workspace.root).toEqual({ kind: 'leaf', sessionId: 6 });
-    expect(result.workspace.focusedSessionId).toBe(6);
+    expect(onlyWorkspace(result).id).toBe(DEFAULT_WORKSPACE_ID);
+    expect(onlyWorkspace(result).root).toEqual({ kind: 'leaf', sessionId: 6 });
+    expect(onlyWorkspace(result).focusedSessionId).toBe(6);
     expect(result.sessions).toEqual([created]);
     expect(createCalls).toEqual([{ shell: DEFAULT_SHELL, cwd: DEFAULT_CWD, cols: 120, rows: 40 }]);
   });
@@ -80,7 +101,7 @@ describe('resolveBootWorkspace', () => {
 
     const result = await resolveBootWorkspace(bridge, { cols: 80, rows: 24 });
 
-    expect(result.workspace.root).toEqual({ kind: 'leaf', sessionId: 6 });
+    expect(onlyWorkspace(result).root).toEqual({ kind: 'leaf', sessionId: 6 });
     expect(createCalls).toHaveLength(1);
     // The exited session's metadata is still handed back for the store.
     expect(result.sessions).toEqual([exited, created]);
@@ -96,14 +117,14 @@ describe('resolveBootWorkspace', () => {
     const result = await resolveBootWorkspace(bridge, { cols: 80, rows: 24 });
 
     expect(createCalls).toHaveLength(0);
-    expect(collectSessionIds(result.workspace.root).size).toBe(4);
+    expect(collectSessionIds(onlyWorkspace(result).root).size).toBe(4);
     expect(
-      treeLeaves(result.workspace.root)
+      treeLeaves(onlyWorkspace(result).root)
         .map((l) => l.sessionId)
         .sort(),
     ).toEqual([1, 2, 3, 4]);
     // 2x2: root is a split of two column splits, per treeFromSessions.
-    const root = result.workspace.root as Extract<PaneNode, { kind: 'split' }>;
+    const root = onlyWorkspace(result).root as Extract<PaneNode, { kind: 'split' }>;
     expect(root.a.kind).toBe('split');
     expect(root.b.kind).toBe('split');
   });
@@ -116,7 +137,7 @@ describe('resolveBootWorkspace', () => {
 
     const result = await resolveBootWorkspace(bridge, { cols: 80, rows: 24 });
 
-    expect(result.workspace.focusedSessionId).toBe(7);
+    expect(onlyWorkspace(result).focusedSessionId).toBe(7);
   });
 
   it('ignores exited sessions even when their createdAt is the highest, both for the tree and for focus', async () => {
@@ -126,8 +147,8 @@ describe('resolveBootWorkspace', () => {
 
     const result = await resolveBootWorkspace(bridge, { cols: 80, rows: 24 });
 
-    expect(result.workspace.root).toEqual({ kind: 'leaf', sessionId: 5 });
-    expect(result.workspace.focusedSessionId).toBe(5);
+    expect(onlyWorkspace(result).root).toEqual({ kind: 'leaf', sessionId: 5 });
+    expect(onlyWorkspace(result).focusedSessionId).toBe(5);
     expect(createCalls).toHaveLength(0);
   });
 
@@ -152,5 +173,126 @@ describe('resolveBootWorkspace', () => {
     await Promise.all([first, second]);
 
     expect(createCalls).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M4.3, this task's required proof 3: saving the layout must never start
+// before boot's own `hydrate()` — a plain fake store (no Zustand, no React)
+// stands in for `useTermhubStore` so this is exercised without any of
+// App.tsx's rendering.
+// ---------------------------------------------------------------------------
+
+interface FakeLayoutStore extends LayoutPersistenceStore {
+  setState(next: StoreState): void;
+}
+
+function makeFakeStore(initial: StoreState): FakeLayoutStore {
+  let state = initial;
+  const listeners = new Set<(state: StoreState, previousState: StoreState) => void>();
+  return {
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    setState(next) {
+      const previous = state;
+      state = next;
+      for (const listener of listeners) {
+        listener(state, previous);
+      }
+    },
+  };
+}
+
+const emptyState: StoreState = { workspaces: [], activeWorkspaceId: undefined, sessions: {} };
+
+function hydratedState(): StoreState {
+  return {
+    workspaces: [
+      {
+        id: 'ws-a',
+        name: 'a',
+        cwd: 'C:\\a',
+        root: { kind: 'leaf', sessionId: 1 },
+        focusedSessionId: 1,
+        maximizedSessionId: undefined,
+      },
+    ],
+    activeWorkspaceId: 'ws-a',
+    sessions: { 1: summary({ id: 1 }) },
+  };
+}
+
+describe('startLayoutPersistence', () => {
+  it('the bug this task avoids: subscribing before hydrate saves on the hydrate transition itself', () => {
+    const store = makeFakeStore(emptyState);
+    const saved: unknown[] = [];
+    const unsubscribe = startLayoutPersistence(store, {
+      saveLayout: (layout) => saved.push(layout),
+    });
+
+    expect(saved).toHaveLength(0); // nothing saved just from subscribing
+
+    // This is boot's own `hydrate()` — the very first real mutation.
+    store.setState(hydratedState());
+
+    // A subscription registered before hydrate observes hydrate's own
+    // transition and saves it — exactly the premature-save risk this
+    // task's prompt names ("um subscribe no topo do App.tsx faz
+    // exatamente isso"). This is why `App.tsx` never calls
+    // `startLayoutPersistence` this early.
+    expect(saved).toHaveLength(1);
+    unsubscribe();
+  });
+
+  it('subscribing only after hydrate: no save from the hydrate transition, and exactly one save for a later change', () => {
+    const store = makeFakeStore(emptyState);
+    // Boot's hydrate happens first, with nobody subscribed yet.
+    store.setState(hydratedState());
+
+    const saved: unknown[] = [];
+    const unsubscribe = startLayoutPersistence(store, {
+      saveLayout: (layout) => saved.push(layout),
+    });
+    expect(saved).toHaveLength(0); // hydrate already happened before subscribing
+
+    const changed: StoreState = { ...hydratedState(), activeWorkspaceId: 'ws-a' };
+    // A real change: a *different* workspaces array reference (as every
+    // reducer in store/workspace.ts produces on a real mutation).
+    store.setState({ ...changed, workspaces: [...changed.workspaces] });
+    expect(saved).toHaveLength(1);
+    unsubscribe();
+  });
+
+  it('a sessions-only change never saves', () => {
+    const initial = hydratedState();
+    const store = makeFakeStore(initial);
+    const saved: unknown[] = [];
+    const unsubscribe = startLayoutPersistence(store, {
+      saveLayout: (layout) => saved.push(layout),
+    });
+
+    // Same `workspaces` array reference and same `activeWorkspaceId` as
+    // `initial` — only `sessions` differs, as a real `upsertSession` call
+    // (`store/workspace.ts`) produces.
+    store.setState({ ...initial, sessions: { ...initial.sessions, 2: summary({ id: 2 }) } });
+
+    expect(saved).toHaveLength(0);
+    unsubscribe();
+  });
+
+  it('unsubscribing stops further saves', () => {
+    const store = makeFakeStore(hydratedState());
+    const saved: unknown[] = [];
+    const unsubscribe = startLayoutPersistence(store, {
+      saveLayout: (layout) => saved.push(layout),
+    });
+    unsubscribe();
+
+    store.setState({ ...hydratedState(), activeWorkspaceId: undefined });
+    expect(saved).toHaveLength(0);
   });
 });

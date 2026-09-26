@@ -5,6 +5,7 @@ import type {
   RequestParamsByMethod,
   RequestResultByMethod,
   SessionId,
+  WorkspacesFile,
 } from '@termhub/shared';
 
 import { IPC_CHANNEL } from '../main/ipc-contract.js';
@@ -15,6 +16,8 @@ import type {
   BridgeContextMenuMessage,
   BridgeErrorPayload,
   BridgeHelloMessage,
+  BridgeLayoutLoadMessage,
+  BridgeLayoutSaveMessage,
   BridgeRequestMessage,
   BridgeSendDataMessage,
   RelayInboundMessage,
@@ -81,6 +84,22 @@ export interface PreloadBridge {
   writeClipboardText(text: string): Promise<void>;
   /** M2.5, section 2.3: opens the native OS context menu ("Copiar"/"Colar") and resolves with the user's choice, or `undefined` if dismissed without one. */
   openContextMenu(hasSelection: boolean): Promise<'copy' | 'paste' | undefined>;
+  /**
+   * M4.3: reads the persisted layout (`workspaces.json`, via the main
+   * process's `StateFile`) — never the daemon. Rejects with a plain
+   * `BridgeErrorPayload` the same way `request()` does (e.g.
+   * `bridge_internal_error` if the main process has no `LayoutAccess`
+   * configured — see `bridge-gateway.ts`'s `handleLayoutLoad`).
+   */
+  loadLayout(): Promise<WorkspacesFile>;
+  /**
+   * M4.3: persists `layout`. Fire-and-forget — no response, ever
+   * (`ipc-contract.ts`'s `BridgeLayoutSaveMessage` doc comment) — so unlike
+   * every other method here, this one cannot report success or failure to
+   * its caller; `main`'s `StateFile.save` logs a refusal on an invalid
+   * value instead.
+   */
+  saveLayout(layout: unknown): void;
 }
 
 /**
@@ -288,6 +307,18 @@ export function createBridge(
         };
         return message;
       }).then((result) => result.choice);
+    },
+
+    loadLayout() {
+      return sendAwaitable<WorkspacesFile>((id) => {
+        const message: BridgeLayoutLoadMessage = { kind: 'layoutLoad', id, instanceId };
+        return message;
+      });
+    },
+
+    saveLayout(layout) {
+      const message: BridgeLayoutSaveMessage = { kind: 'layoutSave', instanceId, layout };
+      ipc.send(IPC_CHANNEL.FROM_RENDERER, message);
     },
   };
 }

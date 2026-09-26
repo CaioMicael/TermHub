@@ -1,8 +1,10 @@
 import { join } from 'node:path';
 import { app, BrowserWindow, clipboard, ipcMain, Menu } from 'electron';
 import type { IpcMainEvent } from 'electron';
+import type { WorkspacesFile } from '@termhub/shared';
 
 import { BridgeGateway, wireWebContentsLifecycle } from './bridge-gateway.js';
+import type { LayoutAccess } from './bridge-gateway.js';
 import { connectToDaemon } from './daemon-client.js';
 import type { DaemonConnection } from './daemon-client.js';
 import { IPC_CHANNEL } from './ipc-contract.js';
@@ -178,6 +180,7 @@ function attachDaemonBridge(
   window: BrowserWindow,
   connectionPromise: Promise<DaemonConnection>,
   sessionAttachments: Promise<SessionAttachments | undefined>,
+  layout: Promise<LayoutAccess | undefined>,
 ): { dispose: () => void } {
   const sendToRenderer = (message: RelayOutboundMessage): void => {
     if (window.isDestroyed()) {
@@ -190,6 +193,7 @@ function attachDaemonBridge(
     sendToRenderer,
     connectionPromise,
     sessionAttachments,
+    layout,
     // M2.5, section 2.4: clipboard access lives in the main process — never
     // `navigator.clipboard` in the sandboxed renderer (see
     // `@termhub/ui`'s `TerminalBridge.readClipboardText` doc comment).
@@ -287,9 +291,39 @@ async function main(): Promise<void> {
       result.outcome === 'connected' ? new SessionAttachments(result.client) : undefined,
   );
 
+  // M4.3: the app's persisted-layout access, shared by every window's
+  // `BridgeGateway` the same way `sessionAttachmentsPromise` is (there is
+  // exactly one `workspaces.json` `StateFile`/writer for the whole process
+  // — docs/specs/m4.1-atomic-state.md section 3.1). Both `load`/`save`
+  // below are already synchronous once `stateFilesPromise` itself resolves
+  // (`StateFile.get()`/`StateFile.save()` never do I/O synchronously — the
+  // write is queued/debounced internally); `.then`'s second callback (never
+  // `.catch`) means a rejected `stateFilesPromise` — logged separately,
+  // right after it is created, below — yields `undefined` here instead of
+  // an unhandled rejection.
+  const layoutAccessPromise: Promise<LayoutAccess | undefined> = stateFilesPromise.then(
+    (files) => ({
+      load: () => Promise.resolve(files.workspaces.get()),
+      save: (value: unknown) =>
+        // `unknown` here is exactly the renderer-supplied, untrusted value
+        // `StateFile.save`'s own `WorkspacesFileSchema.safeParse` validates
+        // before ever writing anything (docs/specs/m4.1-atomic-state.md
+        // section 3.6) — this assertion only satisfies
+        // `StateFile<WorkspacesFile>.save`'s parameter type, it is not the
+        // trust boundary itself.
+        files.workspaces.save(value as WorkspacesFile),
+    }),
+    () => undefined,
+  );
+
   const openWindow = (): BrowserWindow => {
     const window = createWindow();
-    const windowBridge = attachDaemonBridge(window, connectionPromise, sessionAttachmentsPromise);
+    const windowBridge = attachDaemonBridge(
+      window,
+      connectionPromise,
+      sessionAttachmentsPromise,
+      layoutAccessPromise,
+    );
     window.on('closed', () => {
       windowBridge.dispose();
     });

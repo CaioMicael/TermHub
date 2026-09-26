@@ -45,7 +45,14 @@ function layout(tag: string): WorkspacesFile {
   return {
     version: 1,
     activeWorkspaceId: 'ws',
-    workspaces: [{ id: 'ws', name: tag, cwd: 'C:\\w', root: { kind: 'leaf', sessionId: 1 } }],
+    workspaces: [
+      {
+        id: 'ws',
+        name: tag,
+        cwd: 'C:\\w',
+        root: { kind: 'leaf', sessionId: 1, sessionCreatedAt: 1_000 },
+      },
+    ],
   };
 }
 
@@ -415,8 +422,8 @@ describe('StateFile write queue', () => {
             id: 'n',
             dir: 'row',
             ratio: 0.95,
-            a: { kind: 'leaf', sessionId: 1 },
-            b: { kind: 'leaf', sessionId: 2 },
+            a: { kind: 'leaf', sessionId: 1, sessionCreatedAt: 1_000 },
+            b: { kind: 'leaf', sessionId: 2, sessionCreatedAt: 2_000 },
           },
         },
       ],
@@ -424,8 +431,8 @@ describe('StateFile write queue', () => {
     const duplicateSession: WorkspacesFile = {
       version: 1,
       workspaces: [
-        { id: 'a', name: 'a', cwd: '', root: { kind: 'leaf', sessionId: 7 } },
-        { id: 'b', name: 'b', cwd: '', root: { kind: 'leaf', sessionId: 7 } },
+        { id: 'a', name: 'a', cwd: '', root: { kind: 'leaf', sessionId: 7, sessionCreatedAt: 1 } },
+        { id: 'b', name: 'b', cwd: '', root: { kind: 'leaf', sessionId: 7, sessionCreatedAt: 2 } },
       ],
     };
     const missingActive: WorkspacesFile = { ...layout('x'), activeWorkspaceId: 'nope' };

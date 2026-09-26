@@ -1,15 +1,22 @@
-import type { SessionCreateParams, SessionSummary } from '@termhub/shared';
-import { treeFromSessions, type Workspace } from '@termhub/ui';
+import type { SessionCreateParams, SessionSummary, WorkspacesFile } from '@termhub/shared';
+import {
+  reconcileLayout,
+  toPersistedLayout,
+  treeFromSessions,
+  type StoreState,
+  type Workspace,
+} from '@termhub/ui';
 
-// M3.1's definitive boot policy, superseding M2.6's single-session one
-// (docs/specs/m2.6-boot-reattach.md section 3.4, which this module used to
-// implement verbatim — see this task's final report for the diff). Every
-// non-`exited` session the daemon already knows about is reattached into
-// one default workspace, laid out by `treeFromSessions` (`@termhub/ui`'s
-// store, M3.1's prompt section 3.4: "Com 4 sessões, sai 2×2"); focus goes to
-// the one with the highest `createdAt` — the session the user was most
-// recently working in, same reasoning M2.6 already had for a single
-// session. With no live session at all, one is created, as before.
+// M3.1's single-workspace boot policy, now the *fallback* path M4.3's
+// persisted-layout reconciliation falls back to (docs/milestones.md M4.3,
+// this task's prompt section 2, rule 5: "sem arquivo, ou com zero
+// workspaces: o boot é exatamente o de hoje"). Every non-`exited` session
+// the daemon already knows about is reattached into one default workspace,
+// laid out by `treeFromSessions` (`@termhub/ui`'s store, M3.1's prompt
+// section 3.4: "Com 4 sessões, sai 2×2"); focus goes to the one with the
+// highest `createdAt` — the session the user was most recently working in,
+// same reasoning M2.6 already had for a single session. With no live
+// session at all, one is created, as before.
 //
 // Exited sessions are left exactly where they are, untouched, for M4's
 // graveyard to pick up later — this module only ever reads their `status`.
@@ -17,12 +24,31 @@ import { treeFromSessions, type Workspace } from '@termhub/ui';
 // store's `sessions` map has them, for whenever M4's cemetery UI wants to
 // read it), but never in the workspace's tree.
 //
-// **Known, documented gap** (M3.1's prompt, section 3.4: "Persistir o
-// layout é da M4.3. Aqui o layout é reconstruído a cada boot"): there is no
-// saved layout yet. Every boot re-derives a fresh `treeFromSessions` grid
-// from whatever `session.list` returns, even if the user had arranged their
-// panes differently before closing the window. M4.3 is what makes this
-// stick.
+// ## M4.3: reconciling the persisted layout first
+//
+// `bootWorkspaceOnce` now asks `bridge.loadLayout()` for the persisted
+// `WorkspacesFile` (M4.1's `workspaces.json`, loaded in the main process at
+// boot) and hands it, together with `session.list`'s live sessions, to
+// `@termhub/ui`'s pure `reconcileLayout` (`packages/ui/src/
+// layout-persistence.ts` — see its own doc comment for the reconciliation
+// rules). Three outcomes:
+//
+// - `'fresh-boot'` (rule 5 above): falls through to the single-workspace
+//   policy this file has always implemented, unchanged.
+// - `'restored'` with no `needsFreshSessionInWorkspaceId`: the reconciled
+//   workspaces/activeWorkspaceId are returned as is — no daemon call at
+//   all beyond the `session.list` already made.
+// - `'restored'` with `needsFreshSessionInWorkspaceId` set (rule 6: the
+//   daemon restarted, so `liveSessions` was empty and every workspace's
+//   tree collapsed to `root: null`): exactly **one** `session.create` is
+//   made — the same call/params the fresh-boot path already uses — and its
+//   result becomes that one workspace's sole pane, so the screen isn't
+//   left empty.
+//
+// A `loadLayout()` rejection (e.g. the main process has no `LayoutAccess`
+// configured at all) is treated the same as "no file" rather than failing
+// the whole boot — losing the persisted layout must never be worse than
+// the M2.6 gate this file also has to keep passing.
 //
 // ## Why this still has to be idempotent against React.StrictMode
 //
@@ -51,6 +77,8 @@ export interface SessionBootBridge {
     method: M,
     params: SessionBootRequestParams[M],
   ): Promise<SessionBootRequestResult[M]>;
+  /** M4.3: the persisted layout — see this file's header comment. Structurally satisfied by `window.termhub` (`preload/bridge.ts`'s `PreloadBridge.loadLayout`); a test fake can reject to exercise the "no layout available" fallback. */
+  loadLayout(): Promise<WorkspacesFile>;
 }
 
 export interface SessionBootSize {
@@ -74,8 +102,10 @@ export const DEFAULT_WORKSPACE_ID = 'default';
 export const DEFAULT_WORKSPACE_NAME = 'default';
 
 export interface BootResult {
-  workspace: Workspace;
-  /** Every session `session.list` returned (live and exited alike) — not just the ones placed in `workspace.root`. The caller (`App.tsx`) is expected to `upsertSession` all of them into the store. */
+  /** M4.3: possibly more than one when a persisted layout was reconciled — the fresh-boot fallback still returns exactly one, as before. */
+  workspaces: Workspace[];
+  activeWorkspaceId: string;
+  /** Every session `session.list` returned (live and exited alike), plus one freshly created session when rule 6 applied — not just the ones placed in some workspace's tree. The caller (`App.tsx`) is expected to `upsertSession`-equivalent (via `hydrate`) all of them into the store. */
   sessions: SessionSummary[];
 }
 
@@ -106,11 +136,66 @@ async function bootWorkspaceOnce(
   size: SessionBootSize,
 ): Promise<BootResult> {
   const { sessions } = await bridge.request('session.list', {});
-  const live = sessions
-    .filter((session) => session.status !== 'exited')
-    .slice()
-    .sort((a, b) => a.createdAt - b.createdAt);
+  const live = sessions.filter((session) => session.status !== 'exited');
 
+  let layoutFile: WorkspacesFile | undefined;
+  try {
+    layoutFile = await bridge.loadLayout();
+  } catch (err) {
+    // M4.3's prompt: losing the persisted layout must never be worse than
+    // the M2.6 gate this file also has to keep passing — fall through to
+    // the fresh-boot policy below exactly as if there were no file at all.
+    console.warn(
+      '[TermHub] could not load the persisted layout; falling back to a fresh boot',
+      err,
+    );
+    layoutFile = undefined;
+  }
+
+  const outcome = reconcileLayout(layoutFile, live);
+
+  if (outcome.kind === 'fresh-boot') {
+    return freshBootWorkspace(bridge, size, sessions, live);
+  }
+
+  let workspaces = outcome.workspaces;
+  let allSessions = sessions;
+  if (outcome.needsFreshSessionInWorkspaceId !== undefined) {
+    // Rule 6: the daemon restarted (no live session survived anywhere), so
+    // every workspace's tree collapsed to `root: null` — create exactly one
+    // session, in the workspace that was active, the same call the
+    // fresh-boot path below uses.
+    const targetId = outcome.needsFreshSessionInWorkspaceId;
+    const target = workspaces.find((workspace) => workspace.id === targetId);
+    const params: SessionCreateParams = {
+      shell: DEFAULT_SHELL,
+      cwd: target?.cwd ?? DEFAULT_CWD,
+      cols: size.cols,
+      rows: size.rows,
+    };
+    const { session } = await bridge.request('session.create', params);
+    workspaces = workspaces.map((workspace) =>
+      workspace.id === targetId
+        ? {
+            ...workspace,
+            root: { kind: 'leaf', sessionId: session.id },
+            focusedSessionId: session.id,
+          }
+        : workspace,
+    );
+    allSessions = [...sessions, session];
+  }
+
+  return { workspaces, activeWorkspaceId: outcome.activeWorkspaceId, sessions: allSessions };
+}
+
+/** M3.1's original single-workspace boot policy (docs/specs/m2.6-boot-reattach.md section 3.4), used as `reconcileLayout`'s `'fresh-boot'` fallback (rule 5). `allSessions` is every session `session.list` returned (live and exited); `live` is the same list already filtered to non-`exited`, computed once by the caller. */
+async function freshBootWorkspace(
+  bridge: SessionBootBridge,
+  size: SessionBootSize,
+  allSessions: SessionSummary[],
+  live: SessionSummary[],
+): Promise<BootResult> {
   if (live.length === 0) {
     const params: SessionCreateParams = {
       shell: DEFAULT_SHELL,
@@ -127,16 +212,20 @@ async function bootWorkspaceOnce(
       focusedSessionId: session.id,
       maximizedSessionId: undefined,
     };
-    return { workspace, sessions: [...sessions, session] };
+    return {
+      workspaces: [workspace],
+      activeWorkspaceId: workspace.id,
+      sessions: [...allSessions, session],
+    };
   }
 
-  // `live` is sorted ascending by createdAt, so the last element is the
-  // newest — the one that gets focus (docs/specs/m2.6-boot-reattach.md
-  // section 3.4's rule, generalized from "the" session to "the newest of
-  // several").
-  const ids = live.map((session) => session.id);
+  // Sorted ascending by createdAt, so the last element is the newest — the
+  // one that gets focus (docs/specs/m2.6-boot-reattach.md section 3.4's
+  // rule, generalized from "the" session to "the newest of several").
+  const sortedLive = live.slice().sort((a, b) => a.createdAt - b.createdAt);
+  const ids = sortedLive.map((session) => session.id);
   const root = treeFromSessions(ids, DEFAULT_WORKSPACE_ID);
-  const newest = live[live.length - 1] as SessionSummary;
+  const newest = sortedLive[sortedLive.length - 1] as SessionSummary;
   const workspace: Workspace = {
     id: DEFAULT_WORKSPACE_ID,
     name: DEFAULT_WORKSPACE_NAME,
@@ -150,5 +239,52 @@ async function bootWorkspaceOnce(
     focusedSessionId: newest.id,
     maximizedSessionId: undefined,
   };
-  return { workspace, sessions };
+  return { workspaces: [workspace], activeWorkspaceId: workspace.id, sessions: allSessions };
+}
+
+// ---------------------------------------------------------------------------
+// M4.3: saving the layout, gated to start only after boot's own hydrate
+// ---------------------------------------------------------------------------
+
+/** The bridge surface `startLayoutPersistence` needs — `window.termhub` structurally satisfies it. */
+export interface LayoutPersistenceBridge {
+  saveLayout(layout: unknown): void;
+}
+
+/** The store surface `startLayoutPersistence` needs — `useTermhubStore` (a Zustand `UseBoundStore`) structurally satisfies it; a test can pass a plain fake instead. */
+export interface LayoutPersistenceStore {
+  subscribe(listener: (state: StoreState, previousState: StoreState) => void): () => void;
+}
+
+/**
+ * Starts saving the layout (`toPersistedLayout` -> `bridge.saveLayout`) on
+ * every `workspaces`/`activeWorkspaceId` change **from this call onward** —
+ * never retroactively, and never for whatever transition (if any) already
+ * happened before it was called. `App.tsx` calls this exactly once, and
+ * only after its own boot `hydrate()` has already run (`bootState` reaching
+ * `'ready'`): calling it any earlier would let the very first store
+ * mutation — boot's own `hydrate()`, which populates `workspaces` from
+ * nothing — itself trigger a save, which is the premature-save risk this
+ * task's prompt warns about by name ("um `subscribe` no topo do `App.tsx`
+ * faz exatamente isso"). Returns the unsubscribe function.
+ *
+ * A `sessions`-only change never saves: Zustand's plain (non-selector)
+ * `subscribe` fires on every `set()` regardless of which slice changed, so
+ * this compares `workspaces`/`activeWorkspaceId` by reference against the
+ * previous state itself, rather than depending on a subscription that only
+ * fires for a chosen slice.
+ */
+export function startLayoutPersistence(
+  store: LayoutPersistenceStore,
+  bridge: LayoutPersistenceBridge,
+): () => void {
+  return store.subscribe((state, previousState) => {
+    if (
+      state.workspaces === previousState.workspaces &&
+      state.activeWorkspaceId === previousState.activeWorkspaceId
+    ) {
+      return;
+    }
+    bridge.saveLayout(toPersistedLayout(state));
+  });
 }

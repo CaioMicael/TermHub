@@ -37,9 +37,18 @@ export function defaultConfig(): ConfigFile {
   return { version: CONFIG_VERSION, graveyardTtlMinutes: DEFAULT_GRAVEYARD_TTL_MINUTES };
 }
 
-/** Persisted form of `PaneNode` (packages/ui/src/store/tree.ts), same shape. */
+/**
+ * Persisted form of `PaneNode` (packages/ui/src/store/tree.ts). The leaf
+ * carries `sessionCreatedAt` on top of the live `PaneNode`'s `sessionId`
+ * (M4.3, docs/milestones.md): the daemon renumbers session ids from 1 on
+ * every restart, so a leaf that matched "session 3" before a restart could
+ * silently match an unrelated new "session 3" afterwards if only the id
+ * were compared. A persisted leaf only matches a live session when **both**
+ * `sessionId` and `sessionCreatedAt` agree (`packages/ui/src/
+ * layout-persistence.ts`'s `reconcileLayout`).
+ */
 export type PersistedPaneNode =
-  | { kind: 'leaf'; sessionId: number }
+  | { kind: 'leaf'; sessionId: number; sessionCreatedAt: number }
   | {
       kind: 'split';
       id: string;
@@ -51,7 +60,11 @@ export type PersistedPaneNode =
 
 const PaneNodeSchema: z.ZodType<PersistedPaneNode> = z.lazy(() =>
   z.union([
-    z.object({ kind: z.literal('leaf'), sessionId: z.number().int() }),
+    z.object({
+      kind: z.literal('leaf'),
+      sessionId: z.number().int(),
+      sessionCreatedAt: z.number().int(),
+    }),
     z.object({
       kind: z.literal('split'),
       id: z.string().min(1),

@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 
 import { PROTOCOL_ERROR_CODE, ProtocolError } from '@termhub/shared';
-import type { SessionAttachResult, SessionId } from '@termhub/shared';
+import type { SessionAttachResult, SessionId, WorkspacesFile } from '@termhub/shared';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { resolvePipeAddress } from '@termhub/daemon/src/transport-address.js';
@@ -715,6 +715,171 @@ describe('BridgeGateway — M2.5 clipboard/context menu', () => {
       'session.restore',
       'graveyard.list',
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M4.3: layoutLoad/layoutSave — never touches the daemon at all, backed by
+// `options.layout` (a `LayoutAccess` fake here, the real `StateFile<
+// WorkspacesFile>` in `main/index.ts`).
+// ---------------------------------------------------------------------------
+
+function sampleLayoutFile(): WorkspacesFile {
+  return {
+    version: 1,
+    activeWorkspaceId: 'ws',
+    workspaces: [
+      {
+        id: 'ws',
+        name: 'default',
+        cwd: 'C:\\w',
+        root: { kind: 'leaf', sessionId: 1, sessionCreatedAt: 100 },
+      },
+    ],
+  };
+}
+
+describe('BridgeGateway — M4.3 layout persistence', () => {
+  it('layoutLoad resolves with the current layout, and layoutSave forwards to LayoutAccess.save — neither ever touches the daemon connection (still "connecting")', async () => {
+    const { promise } = deferred<DaemonConnection>(); // never resolves
+    const { sink, messages } = collectOutbound();
+    const saved: unknown[] = [];
+    const gateway = new BridgeGateway({
+      sendToRenderer: sink,
+      connectionPromise: promise,
+      layout: Promise.resolve({
+        load: () => Promise.resolve(sampleLayoutFile()),
+        save: (value: unknown) => {
+          saved.push(value);
+          return true;
+        },
+      }),
+    });
+    cleanup.push(() => gateway.dispose());
+    await flushMicrotasks(); // let the `layout` promise resolve into `layoutAccess`
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'inst-1' });
+    messages.length = 0;
+
+    gateway.handleRendererMessage({ kind: 'layoutLoad', id: 'l1', instanceId: 'inst-1' });
+    await flushMicrotasks();
+    expect(messages).toEqual([
+      { kind: 'response', id: 'l1', outcome: { ok: true, result: sampleLayoutFile() } },
+    ]);
+    messages.length = 0;
+
+    const toSave: WorkspacesFile = { ...sampleLayoutFile(), activeWorkspaceId: undefined };
+    gateway.handleRendererMessage({ kind: 'layoutSave', instanceId: 'inst-1', layout: toSave });
+    await flushMicrotasks();
+    expect(saved).toEqual([toSave]);
+    // layoutSave never answers, whether it succeeds or not.
+    expect(messages).toEqual([]);
+  });
+
+  it('layoutLoad without a configured LayoutAccess fails closed with bridge_internal_error', async () => {
+    const { promise } = deferred<DaemonConnection>();
+    const { sink, messages } = collectOutbound();
+    const gateway = new BridgeGateway({ sendToRenderer: sink, connectionPromise: promise });
+    cleanup.push(() => gateway.dispose());
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'inst-1' });
+    messages.length = 0;
+
+    gateway.handleRendererMessage({ kind: 'layoutLoad', id: 'l1', instanceId: 'inst-1' });
+    await flushMicrotasks();
+    expect(messages).toEqual([
+      {
+        kind: 'response',
+        id: 'l1',
+        outcome: {
+          ok: false,
+          error: {
+            code: 'bridge_internal_error',
+            message: 'layout storage is not available in this environment',
+          },
+        },
+      },
+    ]);
+  });
+
+  it('layoutSave without a configured LayoutAccess is dropped silently — no crash, no response', () => {
+    const { promise } = deferred<DaemonConnection>();
+    const { sink, messages } = collectOutbound();
+    const gateway = new BridgeGateway({ sendToRenderer: sink, connectionPromise: promise });
+    cleanup.push(() => gateway.dispose());
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'inst-1' });
+    messages.length = 0;
+
+    gateway.handleRendererMessage({
+      kind: 'layoutSave',
+      instanceId: 'inst-1',
+      layout: sampleLayoutFile(),
+    });
+    expect(messages).toEqual([]);
+  });
+
+  it('rejects (refuses to save) an invalid layout without writing it — LayoutAccess.save itself is the trust boundary', async () => {
+    const { promise } = deferred<DaemonConnection>();
+    const { sink } = collectOutbound();
+    const saved: unknown[] = [];
+    const gateway = new BridgeGateway({
+      sendToRenderer: sink,
+      connectionPromise: promise,
+      layout: Promise.resolve({
+        load: () => Promise.resolve(sampleLayoutFile()),
+        // Mirrors the real `StateFile.save`'s contract: invalid input (e.g.
+        // a ratio of 5 — schema-invalid) is refused and never recorded.
+        save: (value: unknown) => {
+          const isValidRatio =
+            typeof value === 'object' &&
+            value !== null &&
+            'workspaces' in value &&
+            Array.isArray(value.workspaces);
+          if (!isValidRatio) {
+            return false;
+          }
+          saved.push(value);
+          return true;
+        },
+      }),
+    });
+    cleanup.push(() => gateway.dispose());
+    await flushMicrotasks();
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'inst-1' });
+
+    gateway.handleRendererMessage({
+      kind: 'layoutSave',
+      instanceId: 'inst-1',
+      layout: { ratio: 5 }, // structurally invalid — no `workspaces` array at all
+    });
+    await flushMicrotasks();
+    expect(saved).toEqual([]);
+  });
+
+  it('a layoutLoad from a superseded instance never delivers its response to the new one', async () => {
+    const { promise } = deferred<DaemonConnection>();
+    const { sink, messages } = collectOutbound();
+    let resolveLoad!: (file: WorkspacesFile) => void;
+    const gateway = new BridgeGateway({
+      sendToRenderer: sink,
+      connectionPromise: promise,
+      layout: Promise.resolve({
+        load: () =>
+          new Promise((resolve) => {
+            resolveLoad = resolve;
+          }),
+        save: () => true,
+      }),
+    });
+    cleanup.push(() => gateway.dispose());
+    await flushMicrotasks();
+
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'instance-1' });
+    gateway.handleRendererMessage({ kind: 'layoutLoad', id: 'l1', instanceId: 'instance-1' });
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'instance-2' }); // reload, mid-flight
+    messages.length = 0;
+
+    resolveLoad(sampleLayoutFile());
+    await flushMicrotasks();
+    expect(messages.filter((m) => m.kind === 'response')).toHaveLength(0);
   });
 });
 

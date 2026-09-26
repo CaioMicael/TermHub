@@ -11,7 +11,7 @@ import {
   type TerminalRegistry,
 } from '@termhub/ui';
 
-import { resolveBootWorkspace } from './session-boot.js';
+import { resolveBootWorkspace, startLayoutPersistence } from './session-boot.js';
 
 // M3.1's casca: a tab strip (one workspace = one tab, docs/plan.md section
 // 2) over a grid of panes for the active workspace, everything read from
@@ -175,8 +175,8 @@ export function App() {
         // intermediate render where the workspace's tree already
         // references a session that isn't in `sessions` yet.
         useTermhubStore.getState().hydrate({
-          workspaces: [...current.workspaces, result.workspace],
-          activeWorkspaceId: result.workspace.id,
+          workspaces: [...current.workspaces, ...result.workspaces],
+          activeWorkspaceId: result.activeWorkspaceId,
           sessions: nextSessions,
         });
         setBootState({ phase: 'ready' });
@@ -194,6 +194,20 @@ export function App() {
       cancelled = true;
     };
   }, [connection.state, bootState.phase]);
+
+  // M4.3: starts saving the layout on every `workspaces`/`activeWorkspaceId`
+  // change — but only once boot's own `hydrate()` above has already run.
+  // `bootState.phase` reaches `'ready'` synchronously right after that
+  // `hydrate()` call, so `startLayoutPersistence` is never called any
+  // earlier — see its own doc comment (`session-boot.ts`) for why
+  // subscribing any earlier is exactly the premature-save bug this task's
+  // prompt warns about by name.
+  useEffect(() => {
+    if (bootState.phase !== 'ready') {
+      return;
+    }
+    return startLayoutPersistence(useTermhubStore, window.termhub);
+  }, [bootState.phase]);
 
   if (connection.state !== 'connected') {
     return (
