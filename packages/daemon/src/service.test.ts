@@ -1448,7 +1448,10 @@ describe('graveyard: real PTY end to end (M4.4)', () => {
     await client.request('session.attach', { sessionId });
     await waitFor(() => output.length > 0, 15_000);
 
-    client.sendData(sessionId, Buffer.from('echo BEFORE-CLOSE-MARK\n', 'utf8'));
+    // `\r`, not `\n`: it is the Enter key a terminal sends. PowerShell under
+    // ConPTY only runs the line on `\r` (CI on Windows timed out waiting for
+    // the echo with `\n`), and a POSIX tty turns `\r` into `\n` for /bin/sh.
+    client.sendData(sessionId, Buffer.from('echo BEFORE-CLOSE-MARK\r', 'utf8'));
     await waitFor(() => hasStandaloneLine(output, 'BEFORE-CLOSE-MARK'), 15_000);
 
     await client.request('session.close', { sessionId });
@@ -1483,7 +1486,7 @@ describe('graveyard: real PTY end to end (M4.4)', () => {
     // buffer really did survive being buried.
     await waitFor(() => hasStandaloneLine(afterRestore, 'BEFORE-CLOSE-MARK'), 15_000);
 
-    client.sendData(sessionId, Buffer.from('echo AFTER-RESTORE-MARK\n', 'utf8'));
+    client.sendData(sessionId, Buffer.from('echo AFTER-RESTORE-MARK\r', 'utf8'));
     await waitFor(() => hasStandaloneLine(afterRestore, 'AFTER-RESTORE-MARK'), 15_000);
 
     await client.request('session.kill', { sessionId });
