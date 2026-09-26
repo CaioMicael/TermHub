@@ -7,7 +7,7 @@ Estado em 2026-09-26, escrito para quem assumir a coordenação em outra sessão
 | Branch | Conteúdo | Estado |
 |---|---|---|
 | `main` | M0, M1 e M2 mergeados | CI verde. Gate do M2 fechado pelo dono em 24/09 |
-| `m3-tabs-splits` | M3.1 a M3.6 e quatro correções, **tudo verificado** | PR #2 em draft. Falta só o gate manual do M3 |
+| `m3-tabs-splits` | M3.1 a M3.6 e quatro correções, **tudo verificado** | Gate do M3 aprovado pelo dono em 26/09. Mergeada na `main` pelo PR #2 |
 
 A branch `wip/m3.6-e-retry-rename` foi desmontada em dois commits verificados, um por tarefa: `cf706fb` (retry do rename) e `6ed3c0f` (M3.6). O que ficou provado e o que não ficou está na mensagem de cada um.
 
@@ -15,11 +15,11 @@ A branch `wip/m3.6-e-retry-rename` foi desmontada em dois commits verificados, u
 
 O código do M3 está completo. A M3.6 foi exercitada num Chromium real, com os componentes montados numa ponte falsa, e os gestos nativos de drag funcionaram: divisória, painel solto na borda de outro, reordenação de abas e troca de aba. No fim, cada painel tinha o próprio conteúdo, e cada sessão teve um `session.attach` só. **Não** foi provada em Electron real com daemon: a sessão de retomada rodou num container Linux, sem o binário do Electron, e toda sessão nova nasce em `powershell.exe` fixo (M4.6).
 
-O protótipo da UI não estava disponível nessa sessão. O realce da zona de soltura e o indicador de inserção da aba não foram conferidos contra ele.
+O protótipo chegou depois dos commits da M3.6. Ele não desenha drag, então o realce da zona de soltura e o indicador de inserção da aba não conflitam com ele: os dois usam o `--accent-hi`.
 
-### Fechar o M3
+### Gate e divergência adiada
 
-O gate é teste manual do dono, no Windows: 4 agentes (`claude` de verdade) em grade 2×2, divisórias arrastáveis, troca de aba sem perder scrollback. Com o ok dele: tirar o PR #2 do draft, merge `--no-ff` na `main`, confirmar o CI na `main`.
+O dono rodou o gate no Windows e aprovou em 26/09. Uma divergência com o protótipo ficou adiada por decisão dele: os três botões do `.tabbar-right` (dividir na vertical, dividir na horizontal, grade 2×2) não existem. O aceite da M3.3 pedia visual idêntico ao protótipo, então isso é dívida do M3, e ainda não tem tarefa dona.
 
 ## Depois: M4
 
@@ -45,4 +45,4 @@ A M4.1 é ⬥ e precisa de techspec antes de disparar.
 
 - **Causa raiz do daemon zumbi.** O processo agora sai de qualquer jeito (`3f2dfb3`), mas não se sabe qual handle do `node-pty`/ConPTY segura o event loop depois que uma sessão sai sozinha. Pode reaparecer como vazamento num daemon de vida longa.
 - **Painel estreito.** Com menos de ~150px de largura, os botões do cabeçalho ficam cortados.
-- **Botões da barra de abas.** Os ícones do `.tabbar-right` do protótipo (dividir e grade) não foram feitos.
+- **Botões da barra de abas.** Os ícones do `.tabbar-right` do protótipo (dividir e grade) não foram feitos. Adiados pelo dono no fechamento do M3, sem tarefa dona ainda.
