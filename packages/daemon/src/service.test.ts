@@ -1559,6 +1559,9 @@ describe('profiles.list: RPC wiring (fake ProfileService)', () => {
   });
 });
 
+/** CSI escape sequences (colors, cursor moves), stripped from a failure's output tail so it reads as text. Built from a string so the ESC byte is not a literal control character in a regex. */
+const CSI_SEQUENCE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;?]*[A-Za-z]`, 'g');
+
 describe('profiles.list: real detection end to end over the real pipe (M4.6)', () => {
   it(
     'every profile the daemon actually detects on THIS machine opens a real PTY that runs a command and echoes ' +
@@ -1576,6 +1579,11 @@ describe('profiles.list: real detection end to end over the real pipe (M4.6)', (
         expect(profilesResult.profiles.some((p) => p.id === 'posix:/bin/sh')).toBe(true);
       }
 
+      // Every profile is tried before failing, and a failure names the
+      // profile and shows the end of its output: CI on Windows runs this
+      // with whatever shells its runner has, and a bare timeout there does
+      // not say which one broke or why.
+      const failures: Array<{ id: string; stage: string; tail: string }> = [];
       for (const profile of profilesResult.profiles) {
         const createResult = await client.request<SessionCreateResult>('session.create', {
           shell: profile.shell,
@@ -1592,19 +1600,30 @@ describe('profiles.list: real detection end to end over the real pipe (M4.6)', (
         };
         client.onData(onData);
         await client.request('session.attach', { sessionId });
-        await waitFor(() => output.length > 0, 20_000);
 
         // `\r`, not `\n` — the Enter key a terminal sends. See
         // service.test.ts's own M4.4 real-PTY suite (above) for why: it's
         // the only line ending every one of these shells (ConPTY-hosted
         // PowerShell/cmd included) agrees actually submits the line.
         const marker = `TERMHUB-PROFILE-${profile.id}-OK`;
+        const tail = (): string => JSON.stringify(output.replace(CSI_SEQUENCE, '').slice(-600));
+        try {
+          await waitFor(() => output.length > 0, 20_000);
+        } catch {
+          failures.push({ id: profile.id, stage: 'no output at all', tail: tail() });
+          await client.request('session.kill', { sessionId });
+          continue;
+        }
         client.sendData(sessionId, Buffer.from(`echo ${marker}\r`, 'utf8'));
-        await waitFor(() => hasStandaloneLine(output, marker), 20_000);
-        expect(hasStandaloneLine(output, marker)).toBe(true);
+        try {
+          await waitFor(() => hasStandaloneLine(output, marker), 20_000);
+        } catch {
+          failures.push({ id: profile.id, stage: 'marker never echoed', tail: tail() });
+        }
 
         await client.request('session.kill', { sessionId });
       }
+      expect(failures).toEqual([]);
     },
     // Scales with however many profiles this machine actually has (Windows
     // CI can have 4-5: pwsh, powershell, cmd, Git Bash, maybe a WSL distro).
