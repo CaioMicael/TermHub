@@ -7,7 +7,9 @@ import { connectToDaemon } from './daemon-client.js';
 import type { DaemonConnection } from './daemon-client.js';
 import { IPC_CHANNEL } from './ipc-contract.js';
 import type { RelayInboundMessage, RelayOutboundMessage } from './ipc-contract.js';
+import { installQuitFlush } from './quit-flush.js';
 import { SessionAttachments } from './session-attachments.js';
+import { openAppStateFiles } from './store-files.js';
 
 // packages/app has its own package.json without "type": "module" (unlike
 // the repo root), so main and preload build as CommonJS and __dirname is
@@ -239,7 +241,29 @@ function attachDaemonBridge(
 }
 
 async function main(): Promise<void> {
+  // docs/specs/m4.1-atomic-state.md section 3.1: one main process per user.
+  // A second one would be a second writer of workspaces.json, each
+  // overwriting the other's layout. Taken before anything else, so a
+  // process that loses never connects to the daemon or reads state files.
+  if (!app.requestSingleInstanceLock()) {
+    app.quit();
+    return;
+  }
+
   await app.whenReady();
+
+  // Loaded once, at boot, from the daemon's state directory (section 3.2).
+  // M4.3 threads this into the renderer's layout; until then the load
+  // still runs for real, so a bad file is backed up by the real app.
+  const stateFilesPromise = openAppStateFiles();
+  stateFilesPromise.catch((error: unknown) => {
+    console.error('[TermHub] unexpected error while loading state files', error);
+  });
+  // Section 3.7: before-quit waits for every state file's write queue.
+  installQuitFlush(app, [
+    () => stateFilesPromise.then((files) => files.config.flush()),
+    () => stateFilesPromise.then((files) => files.workspaces.flush()),
+  ]);
 
   // One `connectToDaemon()` call for the whole app start, shared by the
   // logger above and every window's bridge — never one call per window.
@@ -263,26 +287,41 @@ async function main(): Promise<void> {
       result.outcome === 'connected' ? new SessionAttachments(result.client) : undefined,
   );
 
-  const mainWindow = createWindow();
-  const bridge = attachDaemonBridge(mainWindow, connectionPromise, sessionAttachmentsPromise);
-  mainWindow.on('closed', () => {
-    bridge.dispose();
-  });
+  const openWindow = (): BrowserWindow => {
+    const window = createWindow();
+    const windowBridge = attachDaemonBridge(window, connectionPromise, sessionAttachmentsPromise);
+    window.on('closed', () => {
+      windowBridge.dispose();
+    });
+    return window;
+  };
+
+  const mainWindow = openWindow();
   await loadRenderer(mainWindow);
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length > 0) {
       return;
     }
-
-    const nextWindow = createWindow();
-    const nextBridge = attachDaemonBridge(nextWindow, connectionPromise, sessionAttachmentsPromise);
-    nextWindow.on('closed', () => {
-      nextBridge.dispose();
-    });
-    loadRenderer(nextWindow).catch((error: unknown) => {
+    loadRenderer(openWindow()).catch((error: unknown) => {
       console.error('[TermHub] failed to load renderer after activate', error);
     });
+  });
+
+  // Someone launched TermHub again: that process quit on the lock above,
+  // and this one surfaces its existing window instead (section 3.1).
+  app.on('second-instance', () => {
+    const [existing] = BrowserWindow.getAllWindows();
+    if (existing === undefined) {
+      loadRenderer(openWindow()).catch((error: unknown) => {
+        console.error('[TermHub] failed to load renderer for a second launch', error);
+      });
+      return;
+    }
+    if (existing.isMinimized()) {
+      existing.restore();
+    }
+    existing.focus();
   });
 }
 
