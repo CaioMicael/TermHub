@@ -182,8 +182,10 @@ describe('loadStateFile on a real disk: a bad file never crashes and is never de
     });
     const readErrors: string[] = [];
     let stop = false;
+    let reads = 0;
     const reader = async (): Promise<void> => {
       while (!stop) {
+        reads += 1;
         try {
           const raw = await readFile(path, 'utf8');
           WorkspacesFileSchema.parse(JSON.parse(raw));
@@ -193,8 +195,12 @@ describe('loadStateFile on a real disk: a bad file never crashes and is never de
             readErrors.push(String(err));
           }
         }
-        // Randomized pause, for the reason daemon.test.ts's test 5 gives.
-        await new Promise((resolve) => setTimeout(resolve, 1 + Math.random() * 5));
+        // Same randomized 20-60 ms pause as daemon.test.ts's test 5, and for
+        // its reason. A reader that barely pauses keeps the file open almost
+        // all the time, and on NTFS that starves the rename outright: with
+        // 1-6 ms here, CI on Windows failed with EPERM after the full retry
+        // budget. That tests the reader, not atomicity.
+        await new Promise((resolve) => setTimeout(resolve, 20 + Math.random() * 40));
       }
     };
     const readers = [reader(), reader(), reader()];
@@ -203,11 +209,17 @@ describe('loadStateFile on a real disk: a bad file never crashes and is never de
       const next = layout(`v${i}-${'x'.repeat(2048)}`);
       expect(file.save(next)).toBe(true);
       await file.flush();
+      // Spreads the run out so the readers sample across all of it, without
+      // shortening their own pause (see above).
+      await new Promise((resolve) => setTimeout(resolve, 10));
     }
     stop = true;
     await Promise.all(readers);
 
     expect(readErrors).toEqual([]);
+    // Enough samples to mean something: a run too short to read the file
+    // proves nothing about truncation.
+    expect(reads).toBeGreaterThan(50);
     expect(JSON.parse(await readFile(path, 'utf8'))).toEqual(layout(`v99-${'x'.repeat(2048)}`));
   }, 30_000);
 });
