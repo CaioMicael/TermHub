@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
-import type { SessionStatus } from '@termhub/shared';
+import type { ShellProfile, SessionStatus } from '@termhub/shared';
 
+import { ProfileMenu } from './ProfileMenu.js';
 import { selectAggregatedWorkspaceStatus, selectSessionCount } from './store/selectors.js';
 import type { SessionActionsBridge, SessionActionsStoreApi } from './store/session-actions.js';
 import { useTermhubStore } from './store/store.js';
@@ -104,6 +105,10 @@ interface TabDragState {
 export function TabBar({ workspaces, activeWorkspaceId, onSelect, bridge }: TabBarProps) {
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | undefined>(undefined);
+  // M4.6's second half: the `+` button no longer creates a workspace
+  // directly — it opens `ProfileMenu` (below), and the workspace is only
+  // created once a profile is actually picked from it (`handleSelectProfile`).
+  const [menuOpen, setMenuOpen] = useState(false);
   const [dragState, setDragState] = useState<TabDragState | null>(null);
   // One `<div>` ref per tab, keyed by workspace id — `onDragOver`/`onDrop`
   // (on the strip itself, not per tab: reordering needs every tab's
@@ -112,11 +117,12 @@ export function TabBar({ workspaces, activeWorkspaceId, onSelect, bridge }: TabB
   // `tabInsertionIndex` (`tab-drag.ts`) takes.
   const tabRefs = useRef(new Map<string, HTMLDivElement>());
 
-  const handleCreate = () => {
+  const handleSelectProfile = (profile: ShellProfile) => {
+    setMenuOpen(false);
     const active = workspaces.find((w) => w.id === activeWorkspaceId);
     setCreating(true);
     setCreateError(undefined);
-    createWorkspaceTab(sessionActionsStore, bridge, active)
+    createWorkspaceTab(sessionActionsStore, bridge, active, profile)
       .catch((err: unknown) => {
         setCreateError(err instanceof Error ? err.message : String(err));
       })
@@ -205,24 +211,39 @@ export function TabBar({ workspaces, activeWorkspaceId, onSelect, bridge }: TabB
           onDragEnd={clearDrag}
         />
       ))}
-      <button
-        type="button"
-        className="th-tab-add"
-        title="Novo workspace"
-        disabled={creating}
-        onClick={handleCreate}
-      >
-        <svg
-          width="16"
-          height="16"
-          viewBox="0 0 16 16"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.3"
+      {/* The menu is positioned against this wrapper, so it opens right under
+          the + button instead of at the far edge of the tab bar. */}
+      <div style={{ position: 'relative', display: 'flex' }}>
+        <button
+          type="button"
+          className="th-tab-add"
+          title="Novo workspace"
+          disabled={creating}
+          onClick={() => {
+            setMenuOpen((open) => !open);
+          }}
         >
-          <path d="M8 3v10M3 8h10" strokeLinecap="round" />
-        </svg>
-      </button>
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 16 16"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.3"
+          >
+            <path d="M8 3v10M3 8h10" strokeLinecap="round" />
+          </svg>
+        </button>
+        {menuOpen && (
+          <ProfileMenu
+            bridge={bridge}
+            onSelect={handleSelectProfile}
+            onClose={() => {
+              setMenuOpen(false);
+            }}
+          />
+        )}
+      </div>
       {dragState !== null && (
         <div className="th-tab-drop-indicator" style={{ left: dragState.indicatorLeft }} />
       )}

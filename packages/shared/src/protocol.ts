@@ -123,6 +123,16 @@ export interface SessionSummary {
   tag?: string;
   cwd: string;
   shell: string;
+  /**
+   * Extra arguments `session.create` passed to `shell` when this session was
+   * spawned (mirrors `SessionCreateParams.args`), present whenever the
+   * creator supplied any. M4.6's second half needs this on the summary so a
+   * pane split can relaunch the *same* shell profile the split pane is
+   * running — without it, splitting a WSL pane would spawn `wsl.exe` with no
+   * `-d <distro>` and land in the default distro instead of the one actually
+   * open.
+   */
+  args?: string[];
   /** Command run inside the shell instead of an interactive prompt (e.g. `claude`), if any. */
   command?: string;
   /** Epoch milliseconds. */

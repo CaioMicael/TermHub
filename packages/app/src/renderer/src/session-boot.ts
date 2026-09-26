@@ -1,4 +1,10 @@
-import type { SessionCreateParams, SessionSummary, WorkspacesFile } from '@termhub/shared';
+import type {
+  ProfilesListParams,
+  ProfilesListResult,
+  SessionCreateParams,
+  SessionSummary,
+  WorkspacesFile,
+} from '@termhub/shared';
 import {
   reconcileLayout,
   toPersistedLayout,
@@ -6,6 +12,8 @@ import {
   type StoreState,
   type Workspace,
 } from '@termhub/ui';
+
+import { pickDefaultShellProfile } from './default-shell-profile.js';
 
 // M3.1's single-workspace boot policy, now the *fallback* path M4.3's
 // persisted-layout reconciliation falls back to (docs/milestones.md M4.3,
@@ -60,15 +68,30 @@ import {
 // awaits the same in-flight-or-settled promise. See `session-boot.test.ts`
 // for the StrictMode-shaped test proving exactly one `session.create` (or
 // zero, when a live session already exists) happens.
+//
+// ## M4.6 (second half): the fresh-session shell is no longer hardcoded
+//
+// Both places this module creates a fresh session (this file's
+// `freshBootWorkspace` and the `needsFreshSessionInWorkspaceId` branch just
+// below) now ask `resolveDefaultShellParams` for the machine's own default
+// shell instead of always passing `DEFAULT_SHELL` ("powershell.exe"). That
+// helper's own doc comment covers the fallback chain; the short version is:
+// a `profiles.list` failure, or a profile list with nothing
+// `pickDefaultShellProfile` (`./default-shell-profile.js`) recognizes as a
+// default, still falls back to exactly today's `DEFAULT_SHELL`/no-args
+// behavior — this task's own "armadilhas" section is explicit that the boot
+// must never get worse than it already was.
 
 /** Every RPC method this module's boot policy calls, keyed to its real wire params/result shape (`@termhub/shared`'s `protocol.ts`) — a minimal, locally-typed slice of `window.termhub`, mirroring the same "small interface, structurally compatible" approach `@termhub/ui`'s `TerminalBridge`/`SessionActionsBridge` use. */
 export interface SessionBootRequestParams {
   'session.list': Record<string, never>;
   'session.create': SessionCreateParams;
+  'profiles.list': ProfilesListParams;
 }
 export interface SessionBootRequestResult {
   'session.list': { sessions: SessionSummary[] };
   'session.create': { session: SessionSummary };
+  'profiles.list': ProfilesListResult;
 }
 export type SessionBootMethod = keyof SessionBootRequestParams;
 
@@ -87,15 +110,45 @@ export interface SessionBootSize {
 }
 
 /**
- * The shell/cwd this policy asks the daemon to spawn when it has to create a
- * session, and the workspace's own `cwd` field when there is nothing better
- * to seed it with (the fresh-session path below). See the original M2.6
- * version of this file for the full "why hardcoded" rationale (renderer
- * sandboxing, no PATH/home access) — unchanged by this task, still M4.6's
- * (`profiles.ts`) to fix.
+ * The cwd this policy asks the daemon to spawn a fresh session into when
+ * there is nothing better to seed it with (the fresh-session path below);
+ * unchanged by this task.
+ *
+ * `DEFAULT_SHELL` is now only the *last-resort* fallback, not the shell a
+ * fresh boot actually uses (M4.6's second half) — see
+ * `resolveDefaultShellParams` below for the real policy: the machine's own
+ * default `ShellProfile` (`default-shell-profile.ts`'s
+ * `pickDefaultShellProfile`), read from `profiles.list`. This constant is
+ * what boot falls back to when that RPC fails or returns nothing usable, so
+ * the boot never gets *worse* than it was before this task (this task's
+ * prompt, section 2 and its own "armadilhas" section).
  */
 export const DEFAULT_SHELL = 'powershell.exe';
 export const DEFAULT_CWD = 'C:\\';
+
+/**
+ * Resolves the `shell`/`args` a fresh boot session should launch with:
+ * the machine's default `ShellProfile` (`pickDefaultShellProfile`) when
+ * `profiles.list` succeeds and offers one, `DEFAULT_SHELL` with no `args`
+ * otherwise — a rejected `profiles.list` call, an empty/all-exotic profile
+ * list (`pickDefaultShellProfile` returning `undefined`), or any other
+ * failure all collapse to that same fallback, so this never throws and
+ * never blocks the boot on the daemon's shell-detection succeeding.
+ */
+async function resolveDefaultShellParams(
+  bridge: SessionBootBridge,
+): Promise<{ shell: string; args?: string[] }> {
+  try {
+    const { profiles } = await bridge.request('profiles.list', {});
+    const profile = pickDefaultShellProfile(profiles);
+    if (profile !== undefined) {
+      return { shell: profile.shell, args: profile.args };
+    }
+  } catch (err) {
+    console.warn('[TermHub] could not load shell profiles; falling back to the default shell', err);
+  }
+  return { shell: DEFAULT_SHELL };
+}
 
 /** The single workspace boot ever reconciles into today. M3.1's prompt only asks for *one* workspace holding every live session — a session picker across several *workspaces* would need per-session project/cwd grouping this module has no way to infer yet (that's product-level, not this task's). */
 export const DEFAULT_WORKSPACE_ID = 'default';
@@ -167,11 +220,13 @@ async function bootWorkspaceOnce(
     // fresh-boot path below uses.
     const targetId = outcome.needsFreshSessionInWorkspaceId;
     const target = workspaces.find((workspace) => workspace.id === targetId);
+    const defaults = await resolveDefaultShellParams(bridge);
     const params: SessionCreateParams = {
-      shell: DEFAULT_SHELL,
+      shell: defaults.shell,
       cwd: target?.cwd ?? DEFAULT_CWD,
       cols: size.cols,
       rows: size.rows,
+      ...(defaults.args !== undefined ? { args: defaults.args } : {}),
     };
     const { session } = await bridge.request('session.create', params);
     workspaces = workspaces.map((workspace) =>
@@ -197,11 +252,13 @@ async function freshBootWorkspace(
   live: SessionSummary[],
 ): Promise<BootResult> {
   if (live.length === 0) {
+    const defaults = await resolveDefaultShellParams(bridge);
     const params: SessionCreateParams = {
-      shell: DEFAULT_SHELL,
+      shell: defaults.shell,
       cwd: DEFAULT_CWD,
       cols: size.cols,
       rows: size.rows,
+      ...(defaults.args !== undefined ? { args: defaults.args } : {}),
     };
     const { session } = await bridge.request('session.create', params);
     const workspace: Workspace = {

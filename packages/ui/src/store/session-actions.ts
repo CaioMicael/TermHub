@@ -14,6 +14,8 @@
 import type {
   GraveyardListParams,
   GraveyardListResult,
+  ProfilesListParams,
+  ProfilesListResult,
   SessionCloseParams,
   SessionCloseResult,
   SessionCreateParams,
@@ -27,37 +29,46 @@ import type { SplitDirection } from './tree.js';
 import type { StoreState, Workspace } from './workspace.js';
 
 /**
- * The shell every session this module creates is spawned with. Mirrors
- * `packages/app/src/renderer/src/session-boot.ts`'s `DEFAULT_SHELL` — same
- * value, same reasoning (M3.1's prompt, section 3.3: "a sessão nova nasce com
- * shell ... iguais aos do session-boot.ts atual (powershell.exe fixo)").
- * Duplicated rather than imported because `@termhub/ui` must not depend on
- * `@termhub/app` (the dependency direction is the other way). Real shell
- * detection is M4.6's `profiles.ts` — same deferred gap `session-boot.ts`
- * already documents, not reinvented here.
+ * Fallback shell for `splitPaneWithNewSession` when the pane being split
+ * has no `SessionSummary` in the store yet (the target session's metadata
+ * hasn't arrived — an edge case, not the normal path). Every other caller of
+ * `session.create` in this module now takes its shell/args explicitly (a
+ * `ShellProfile` for a brand-new workspace via `tab-bar-actions.ts`'s
+ * profile menu, or the split target's own `shell`/`args` for a split) —
+ * M4.6's second half replaced the single hardcoded shell this constant used
+ * to be for every session this module created. Same value
+ * `packages/app/src/renderer/src/session-boot.ts`'s `DEFAULT_SHELL` falls
+ * back to, for the same reason: something has to be spawnable even with no
+ * better information at all.
  */
 export const NEW_SESSION_SHELL = 'powershell.exe';
 
 /**
  * Every RPC method this module (and, by extension, everything that shares
- * its `SessionActionsBridge` type — `Sidebar.tsx`'s graveyard section
- * included) calls, keyed to its real params/result shape
- * (`@termhub/shared`'s `protocol.ts`). `session.close`/`session.restore`/
- * `graveyard.list` are M4.5's addition on top of M3's `session.create` —
- * see `buryClosedSession` below for why `session.close` is called from
- * here rather than from `pane-header-actions.ts`/`tab-bar-actions.ts`.
+ * its `SessionActionsBridge` type — `Sidebar.tsx`'s graveyard section and
+ * `ProfileMenu.tsx`'s profile fetch included) calls, keyed to its real
+ * params/result shape (`@termhub/shared`'s `protocol.ts`). `session.close`/
+ * `session.restore`/`graveyard.list` are M4.5's addition on top of M3's
+ * `session.create` — see `buryClosedSession` below for why `session.close`
+ * is called from here rather than from `pane-header-actions.ts`/
+ * `tab-bar-actions.ts`. `profiles.list` is M4.6's second half: the `+`
+ * button's profile menu (`ProfileMenu.tsx`/`profile-menu-actions.ts`) needs
+ * it on the same bridge object `TabBar.tsx` already threads through as a
+ * prop, rather than a second bridge type.
  */
 export interface SessionActionsRequestParams {
   'session.create': SessionCreateParams;
   'session.close': SessionCloseParams;
   'session.restore': SessionRestoreParams;
   'graveyard.list': GraveyardListParams;
+  'profiles.list': ProfilesListParams;
 }
 export interface SessionActionsRequestResult {
   'session.create': { session: SessionSummary };
   'session.close': SessionCloseResult;
   'session.restore': SessionRestoreResult;
   'graveyard.list': GraveyardListResult;
+  'profiles.list': ProfilesListResult;
 }
 export type SessionActionsMethod = keyof SessionActionsRequestParams;
 
@@ -114,13 +125,20 @@ export function estimateSplitSize(existing: Size, dir: SplitDirection): Size {
 
 /**
  * Creates a new session and splits `targetSessionId`'s pane in
- * `workspaceId` to show it, in direction `dir`. The new session's shell is
- * `NEW_SESSION_SHELL`; its cwd is the *workspace's* `cwd` (M3.1's prompt,
- * section 3.3 — not the target pane's own cwd, which this store doesn't
- * track per-session beyond what `SessionSummary.cwd` already reports, and
- * which M4.6 may revisit). Its `cols`/`rows` come from `estimateSplitSize`
- * against the target session's current `SessionSummary`, or a plain 80x24
- * guess if that session's metadata isn't in the store yet.
+ * `workspaceId` to show it, in direction `dir`. The new session's shell and
+ * args are the *target pane's own* — `targetSession.shell`/`targetSession.args`
+ * (M4.6's second half: a split reopens the same shell profile the split
+ * pane is running, `NEW_SESSION_SHELL` only if that target session's
+ * metadata isn't in the store yet, an edge case that should never happen in
+ * practice). This is why `SessionSummary` grew an `args` field
+ * (`packages/shared/src/protocol.ts`) alongside the `shell` it already had:
+ * without `args`, splitting a WSL pane would spawn `wsl.exe` with no
+ * `-d <distro>` and land in the default distro, not the one actually open.
+ * Its cwd is the *workspace's* `cwd` (M3.1's prompt, section 3.3 — not the
+ * target pane's own cwd, which this store doesn't track per-session beyond
+ * what `SessionSummary.cwd` already reports). Its `cols`/`rows` come from
+ * `estimateSplitSize` against the target session's current `SessionSummary`,
+ * or a plain 80x24 guess if that session's metadata isn't in the store yet.
  *
  * On the daemon accepting the session, this: (1) `upsertSession`s the new
  * session's metadata, then (2) `split`s the tree — in that order, so by the
@@ -159,12 +177,15 @@ export async function splitPaneWithNewSession(
       : { cols: 80, rows: 24 },
     params.dir,
   );
+  const shell = targetSession?.shell ?? NEW_SESSION_SHELL;
+  const args = targetSession?.args;
 
   const { session } = await bridge.request('session.create', {
-    shell: NEW_SESSION_SHELL,
+    shell,
     cwd: workspace.cwd,
     cols: sizeHint.cols,
     rows: sizeHint.rows,
+    ...(args !== undefined ? { args } : {}),
   });
 
   store.upsertSession(session);
@@ -179,17 +200,30 @@ export async function splitPaneWithNewSession(
  * by the underlying `addWorkspace` reducer — a collision leaves the session
  * created in the daemon but not placed in any workspace, same "no retry, no
  * cleanup" posture as `splitPaneWithNewSession`).
+ *
+ * `params.shell`/`params.args` are M4.6's second half: the caller (
+ * `tab-bar-actions.ts`'s `createWorkspaceTab`) supplies the `ShellProfile`
+ * the user picked from the `+` button's menu — this function no longer
+ * hardcodes `NEW_SESSION_SHELL` itself, unlike before this task.
  */
 export async function createWorkspaceWithNewSession(
   store: SessionActionsStoreApi,
   bridge: SessionActionsBridge,
-  params: { workspaceId: string; name: string; cwd: string; size: Size },
+  params: {
+    workspaceId: string;
+    name: string;
+    cwd: string;
+    size: Size;
+    shell: string;
+    args?: string[];
+  },
 ): Promise<SessionSummary> {
   const { session } = await bridge.request('session.create', {
-    shell: NEW_SESSION_SHELL,
+    shell: params.shell,
     cwd: params.cwd,
     cols: params.size.cols,
     rows: params.size.rows,
+    ...(params.args !== undefined ? { args: params.args } : {}),
   });
 
   store.upsertSession(session);

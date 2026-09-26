@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import type { SessionSummary, WorkspacesFile } from '@termhub/shared';
+import type { ShellProfile, SessionSummary, WorkspacesFile } from '@termhub/shared';
 import { collectSessionIds, treeLeaves, type PaneNode, type StoreState } from '@termhub/ui';
 
 import {
@@ -45,12 +45,28 @@ function summary(overrides: Partial<SessionSummary> = {}): SessionSummary {
   };
 }
 
+/**
+ * `profiles.list`'s fake response for `createFakeBridge` — defaults to an
+ * empty profile list, which makes `pickDefaultShellProfile` return
+ * `undefined` and every test below fall back to exactly `DEFAULT_SHELL`
+ * with no `args`, i.e. today's pre-M4.6 behavior. Tests that care about the
+ * profile-driven path override this; tests that don't (every test that
+ * predates this task) get the old behavior unchanged, with no edits to
+ * their own assertions needed.
+ */
 function createFakeBridge(
   initialSessions: SessionSummary[],
   createdSession: SessionSummary,
-): { bridge: SessionBootBridge; listCalls: number[]; createCalls: unknown[] } {
+  options: { profiles?: ShellProfile[]; profilesError?: Error } = {},
+): {
+  bridge: SessionBootBridge;
+  listCalls: number[];
+  createCalls: unknown[];
+  profilesListCalls: number[];
+} {
   const listCalls: number[] = [];
   const createCalls: unknown[] = [];
+  const profilesListCalls: number[] = [];
 
   function request<M extends SessionBootMethod>(
     method: M,
@@ -64,6 +80,19 @@ function createFakeBridge(
       // identical pattern in `packages/app/src/preload/bridge.ts`.
       return Promise.resolve(result) as Promise<SessionBootRequestResult[M]>;
     }
+    if (method === 'profiles.list') {
+      profilesListCalls.push(1);
+      if (options.profilesError !== undefined) {
+        // No `as` needed here (unlike the branches below): `Promise.reject`
+        // returns `Promise<never>`, already assignable to any
+        // `Promise<SessionBootRequestResult[M]>`.
+        return Promise.reject(options.profilesError);
+      }
+      const result: SessionBootRequestResult['profiles.list'] = {
+        profiles: options.profiles ?? [],
+      };
+      return Promise.resolve(result) as Promise<SessionBootRequestResult[M]>;
+    }
     createCalls.push(params);
     const result: SessionBootRequestResult['session.create'] = { session: createdSession };
     return Promise.resolve(result) as Promise<SessionBootRequestResult[M]>;
@@ -73,6 +102,7 @@ function createFakeBridge(
     bridge: { request, loadLayout: () => Promise.resolve(noPersistedLayout()) },
     listCalls,
     createCalls,
+    profilesListCalls,
   };
 }
 
@@ -173,6 +203,127 @@ describe('resolveBootWorkspace', () => {
     await Promise.all([first, second]);
 
     expect(createCalls).toHaveLength(0);
+  });
+
+  // ---------------------------------------------------------------------
+  // M4.6 (second half): the fresh-session shell comes from `profiles.list` +
+  // `pickDefaultShellProfile`, not a hardcoded `DEFAULT_SHELL` — with a
+  // fallback to that same old value whenever profile detection can't help.
+  // ---------------------------------------------------------------------
+
+  it('launches the fresh boot session with the machine default shell profile, args included', async () => {
+    const pwsh: ShellProfile = {
+      id: 'pwsh',
+      name: 'PowerShell 7',
+      kind: 'pwsh',
+      shell: 'pwsh.exe',
+      args: [],
+    };
+    const created = summary({ id: 6, shell: 'pwsh.exe' });
+    const { bridge, createCalls, profilesListCalls } = createFakeBridge([], created, {
+      profiles: [pwsh],
+    });
+
+    await resolveBootWorkspace(bridge, { cols: 120, rows: 40 });
+
+    expect(profilesListCalls).toHaveLength(1);
+    expect(createCalls).toEqual([
+      { shell: 'pwsh.exe', args: [], cwd: DEFAULT_CWD, cols: 120, rows: 40 },
+    ]);
+  });
+
+  it('picks the WSL default over powershell when no pwsh/powershell/cmd is present — armadilha check: falls through to DEFAULT_SHELL correctly instead', async () => {
+    // A machine that only detected a WSL distro and Git Bash (no pwsh/
+    // powershell/cmd at all — an unlikely but possible broken install)
+    // has no Windows default per `pickDefaultShellProfile`, so this must
+    // still fall back to `DEFAULT_SHELL`, not silently default into WSL.
+    const wsl: ShellProfile = {
+      id: 'wsl:Ubuntu',
+      name: 'Ubuntu (WSL)',
+      kind: 'wsl',
+      shell: 'wsl.exe',
+      args: ['-d', 'Ubuntu'],
+    };
+    const created = summary({ id: 6 });
+    const { bridge, createCalls } = createFakeBridge([], created, { profiles: [wsl] });
+
+    await resolveBootWorkspace(bridge, { cols: 80, rows: 24 });
+
+    expect(createCalls).toEqual([{ shell: DEFAULT_SHELL, cwd: DEFAULT_CWD, cols: 80, rows: 24 }]);
+  });
+
+  it('falls back to DEFAULT_SHELL when profiles.list rejects — the boot must never be worse than before this task', async () => {
+    const created = summary({ id: 6 });
+    const { bridge, createCalls } = createFakeBridge([], created, {
+      profilesError: new Error('daemon unreachable'),
+    });
+
+    await resolveBootWorkspace(bridge, { cols: 80, rows: 24 });
+
+    expect(createCalls).toEqual([{ shell: DEFAULT_SHELL, cwd: DEFAULT_CWD, cols: 80, rows: 24 }]);
+  });
+
+  it('applies the same default-shell resolution to the rule-6 (daemon restarted, persisted layout present) fresh session', async () => {
+    const pwsh: ShellProfile = {
+      id: 'pwsh',
+      name: 'PowerShell 7',
+      kind: 'pwsh',
+      shell: 'pwsh.exe',
+      args: [],
+    };
+    const created = summary({ id: 6, shell: 'pwsh.exe', cwd: 'C:\\dev\\restored' });
+    const listCalls: number[] = [];
+    const createCalls: unknown[] = [];
+    const profilesListCalls: number[] = [];
+    // A persisted layout with one workspace and no surviving leaf (the
+    // persisted session id has no match in `session.list`'s — empty —
+    // result) is exactly rule 6's trigger condition
+    // (`@termhub/ui`'s `layout-persistence.ts`: `liveSessions.length === 0`
+    // with at least one persisted workspace) — `needsFreshSessionInWorkspaceId`
+    // is what makes `bootWorkspaceOnce` take this second `session.create`
+    // call site, not `freshBootWorkspace`'s.
+    const persistedLayout: WorkspacesFile = {
+      version: 1,
+      workspaces: [
+        {
+          id: 'ws-restored',
+          name: 'restored',
+          cwd: 'C:\\dev\\restored',
+          root: { kind: 'leaf', sessionId: 42, sessionCreatedAt: 1_000 },
+        },
+      ],
+      activeWorkspaceId: 'ws-restored',
+    };
+    function request<M extends SessionBootMethod>(
+      method: M,
+      params: SessionBootRequestParams[M],
+    ): Promise<SessionBootRequestResult[M]> {
+      if (method === 'session.list') {
+        listCalls.push(1);
+        const result: SessionBootRequestResult['session.list'] = { sessions: [] };
+        return Promise.resolve(result) as Promise<SessionBootRequestResult[M]>;
+      }
+      if (method === 'profiles.list') {
+        profilesListCalls.push(1);
+        const result: SessionBootRequestResult['profiles.list'] = { profiles: [pwsh] };
+        return Promise.resolve(result) as Promise<SessionBootRequestResult[M]>;
+      }
+      createCalls.push(params);
+      const result: SessionBootRequestResult['session.create'] = { session: created };
+      return Promise.resolve(result) as Promise<SessionBootRequestResult[M]>;
+    }
+    const bridge: SessionBootBridge = {
+      request,
+      loadLayout: () => Promise.resolve(persistedLayout),
+    };
+
+    const result = await resolveBootWorkspace(bridge, { cols: 80, rows: 24 });
+
+    expect(profilesListCalls).toHaveLength(1);
+    expect(createCalls).toEqual([
+      { shell: 'pwsh.exe', args: [], cwd: 'C:\\dev\\restored', cols: 80, rows: 24 },
+    ]);
+    expect(onlyWorkspace(result).root).toEqual({ kind: 'leaf', sessionId: 6 });
   });
 });
 

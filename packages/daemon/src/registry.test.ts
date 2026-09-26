@@ -140,6 +140,29 @@ describe('Registry', () => {
     expect(summary.command).toBeUndefined();
   });
 
+  // M4.6 (second half): a pane split relaunches the split pane's own shell
+  // profile by reading `args` off its `SessionSummary` — this is that wire
+  // straight through `create()`. Without it a WSL pane's split would spawn
+  // `wsl.exe` with no `-d <distro>` and land in the wrong distro (this
+  // task's own prompt names this pitfall).
+  it('propagates args into the summary, for a future split to reuse (M4.6)', () => {
+    const { factory } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    const summary = registry.create(baseParams({ shell: 'wsl.exe', args: ['-d', 'Ubuntu'] }));
+
+    expect(summary.args).toEqual(['-d', 'Ubuntu']);
+  });
+
+  it('omits args from the summary when session.create was not given any', () => {
+    const { factory } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    const summary = registry.create(baseParams({ shell: 'pwsh.exe' }));
+
+    expect(summary.args).toBeUndefined();
+  });
+
   it('get() returns undefined for an id that was never created', () => {
     const { factory } = makeFactory();
     const registry = new Registry({ sessionFactory: factory });

@@ -160,6 +160,10 @@ export class Registry {
       status: 'running',
       ...(params.tag !== undefined ? { tag: params.tag } : {}),
       ...(params.command !== undefined ? { command: params.command } : {}),
+      // M4.6 (second half): carried onto the summary so a pane split can
+      // relaunch the same shell profile — see SessionSummary.args's own doc
+      // comment (packages/shared/src/protocol.ts) for why this matters.
+      ...(params.args !== undefined ? { args: params.args } : {}),
     };
 
     const record: InternalRecord = { session, summary };

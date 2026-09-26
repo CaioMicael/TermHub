@@ -1,0 +1,65 @@
+/*
+ * `ProfileMenu.tsx` visuals — M4.6's second half. The prototype
+ * (`termhub-prototipo.html`) never draws a `+`-button menu itself; this
+ * follows the visual language of its `.palette`/`.pitem` rule block (a
+ * floating dark list, one row per item, name + dim meta text, a hover
+ * highlight) instead of inventing a new one, same "hex value + comment
+ * naming the prototype var" convention `tab-bar.css`/`pane-header.css`
+ * already use. `th-` prefix, same reasoning `pane-header.css`'s own header
+ * comment gives.
+ */
+
+.th-profile-menu {
+  position: absolute;
+  top: 100%; /* right under the + button (TabBar.tsx wraps both in a relative box) */
+  left: 0;
+  min-width: 220px;
+  max-width: 320px;
+  background: #252526; /* prototype .palette background */
+  border: 1px solid #454545; /* prototype .palette border */
+  border-radius: 6px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.6); /* prototype .palette box-shadow */
+  padding: 4px 0;
+  z-index: 20;
+}
+
+.th-profile-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px; /* prototype .pitem padding */
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.th-profile-item:hover {
+  background: #2a2d2e; /* prototype --hover */
+}
+
+.th-profile-item-name {
+  color: #e4e4e4; /* prototype .pi-name */
+}
+
+.th-profile-item-shell {
+  margin-left: auto;
+  color: #858585; /* prototype --fg-dim */
+  font-size: 11.5px; /* prototype .pi-meta */
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.th-profile-item-empty {
+  color: #858585; /* prototype --fg-dim */
+  cursor: default;
+}
+
+.th-profile-item-empty:hover {
+  background: none;
+}
+
+.th-profile-menu-error {
+  padding: 6px 12px;
+  color: #f14c4c; /* prototype --st-err */
+  font-size: 11.5px;
+  white-space: normal;
+}

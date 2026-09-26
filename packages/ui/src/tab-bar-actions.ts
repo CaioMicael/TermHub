@@ -6,7 +6,7 @@
 // — the same reasoning `session-actions.ts`'s own header comment gives for
 // living outside `store.ts`.
 
-import type { SessionSummary } from '@termhub/shared';
+import type { SessionSummary, ShellProfile } from '@termhub/shared';
 
 import {
   createWorkspaceWithNewSession,
@@ -66,7 +66,7 @@ export function closeWorkspaceTab(
   store.closeWorkspace(workspaceId);
 }
 
-/** Fallback shell/cwd/size for a workspace born from the tab bar's `+` with no better guess available — mirrors `packages/app/src/renderer/src/session-boot.ts`'s `DEFAULT_CWD` and its own fresh-session size guess. Duplicated rather than imported for the same reason `session-actions.ts`'s `NEW_SESSION_SHELL` already duplicates `DEFAULT_SHELL`: `@termhub/ui` must not depend on `@termhub/app` (session-actions.ts's header comment). Real shell/cwd detection is M4.6/M4.7's job. */
+/** Fallback cwd/size for a workspace born from the tab bar's `+` with no better guess available — mirrors `packages/app/src/renderer/src/session-boot.ts`'s `DEFAULT_CWD` and its own fresh-session size guess. Duplicated rather than imported because `@termhub/ui` must not depend on `@termhub/app` (session-actions.ts's header comment). Real cwd detection is M4.7's job (per-workspace launch config); the shell itself is no longer guessed here at all — M4.6's second half made it the profile the user picks from `ProfileMenu.tsx`, see `createWorkspaceTab` below. */
 export const NEW_WORKSPACE_CWD_FALLBACK = 'C:\\';
 export const NEW_WORKSPACE_SIZE: Size = { cols: 80, rows: 24 };
 export const NEW_WORKSPACE_NAME_BASE = 'Novo workspace';
@@ -114,19 +114,21 @@ export function nextWorkspaceName(existingNames: readonly string[]): string {
 }
 
 /**
- * What the tab bar's `+` button triggers (M3.3's prompt, section 2): builds
- * a fresh, non-colliding `workspaceId`/`name`, picks a `cwd` (the currently
- * active workspace's own `cwd`, when there is one — a new tab next to an
- * existing project most often belongs in the same place; falls back to
+ * What the tab bar's `+` button triggers once the user has picked a shell
+ * profile from `ProfileMenu.tsx` (M4.6's second half — the `+` click itself
+ * only opens that menu now; this is its `onSelect`). Builds a fresh,
+ * non-colliding `workspaceId`/`name`, picks a `cwd` (the currently active
+ * workspace's own `cwd`, when there is one — a new tab next to an existing
+ * project most often belongs in the same place; falls back to
  * `NEW_WORKSPACE_CWD_FALLBACK` otherwise) and a fixed size guess
  * (`NEW_WORKSPACE_SIZE` — corrected for real once the pane mounts and
  * `fit()` runs, same posture as `session-actions.ts`'s `estimateSplitSize`
  * doc comment), then delegates to `createWorkspaceWithNewSession` for the
  * actual `session.create` round trip plus the `upsertSession`/`addWorkspace`
- * store writes.
+ * store writes — launched with `profile`'s own `shell`/`args`, verbatim.
  *
  * `session-actions.ts`'s `createWorkspaceWithNewSession` does **not**
- * decide the name/cwd/size itself — it takes them as params. This
+ * decide the name/cwd/size/shell itself — it takes them as params. This
  * function is the piece of policy that this task's own prompt assumed
  * lived inside that action (see this task's final report for the
  * discrepancy) but actually has to live on the caller's side.
@@ -135,6 +137,7 @@ export async function createWorkspaceTab(
   store: SessionActionsStoreApi,
   bridge: SessionActionsBridge,
   activeWorkspace: Pick<Workspace, 'cwd'> | undefined,
+  profile: Pick<ShellProfile, 'shell' | 'args'>,
 ): Promise<SessionSummary> {
   const state = store.getState();
   const workspaceId = generateWorkspaceId(state.workspaces.map((w) => w.id));
@@ -145,5 +148,7 @@ export async function createWorkspaceTab(
     name,
     cwd,
     size: NEW_WORKSPACE_SIZE,
+    shell: profile.shell,
+    args: profile.args,
   });
 }
