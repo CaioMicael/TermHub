@@ -10,6 +10,21 @@ Estado em 2026-09-26, escrito para quem assumir a coordenação em outra sessão
 | `m3-tabs-splits` | M3.1 a M3.5 e três correções, **tudo verificado** | CI verde. PR #2 em draft |
 | `wip/m3.6-e-retry-rename` | Trabalho **não verificado**, interrompido no meio (abaixo) | Não mergear sem verificar |
 
+## Como retomar o trabalho da branch `wip/`
+
+**Não trabalhe na `wip/`, e não a mergeie como está.** O commit dela junta duas tarefas (M3.6 e a correção do retry) com uma mensagem que só diz "não verificado", e o processo do projeto é um commit por tarefa, com mensagem explicando o porquê. A `wip/` é um depósito para o código não se perder, não uma branch de trabalho.
+
+O fluxo:
+
+1. Continue na `m3-tabs-splits`: `git checkout m3-tabs-splits && git pull`.
+2. Traga os arquivos de **uma** tarefa da `wip/` para a árvore, sem commitar:
+   - M3.6: `git restore --source=origin/wip/m3.6-e-retry-rename -- packages/ui/src/TabBar.tsx packages/ui/src/PaneHeader.tsx packages/ui/src/SplitTree.tsx packages/ui/src/index.ts packages/ui/src/tab-bar.css packages/ui/src/pane-header.css packages/ui/src/split-tree.css packages/ui/src/pane-drag.ts packages/ui/src/pane-drag.test.ts packages/ui/src/tab-drag.ts packages/ui/src/tab-drag.test.ts`
+   - Retry do rename: `git restore --source=origin/wip/m3.6-e-retry-rename -- packages/daemon/src/daemon.ts packages/daemon/src/daemon.test.ts`
+3. Complete e verifique a tarefa (o que falta está abaixo). Ou dispare um subagente com o escopo dela, dizendo que o código de partida já está na árvore.
+4. Commite **essa tarefa só**, com a mensagem de sempre, em português e explicando o porquê. Faça push e confira o CI.
+5. Repita para a outra tarefa. As duas mexem em arquivos disjuntos e podem ser verificadas em paralelo.
+6. Com as duas na `m3-tabs-splits`, apague a `wip/`: `git push origin --delete wip/m3.6-e-retry-rename`.
+
 ## O que falta no M3
 
 ### M3.6: arrastar abas e painéis (na branch `wip/`)
