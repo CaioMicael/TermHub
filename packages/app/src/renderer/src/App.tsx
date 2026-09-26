@@ -1,5 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
-import { measureFitSize, SplitTree, TabBar, useTermhubStore } from '@termhub/ui';
+import {
+  createTerminalRegistry,
+  measureFitSize,
+  SplitTree,
+  TabBar,
+  useTermhubStore,
+  type TerminalRegistry,
+} from '@termhub/ui';
 
 import { resolveBootWorkspace } from './session-boot.js';
 
@@ -21,13 +28,15 @@ import { resolveBootWorkspace } from './session-boot.js';
 //
 // Every workspace's `SplitTree` stays mounted, all the time, switched only
 // via `display: none` (M3.1's prompt, section 3.5) — so switching tabs
-// never re-attaches a session or drops xterm's scrollback. `Terminal.tsx`'s
-// own `ResizeObserver`-driven resize guard (M2.5) already no-ops for a
-// zero-size (hidden) container, so a hidden pane never sends a spurious
-// `session.resize`. Freeing/reattaching each hidden pane's WebGL context
-// (the ~16-context Chromium budget, docs/plan.md section 5) is M3.5's job,
-// not this component's — every mounted `Terminal` here keeps whatever
-// renderer it attached with.
+// never re-attaches a session or drops xterm's scrollback. As of M3.5, the
+// terminal instances themselves aren't even in this tree any more: `App`
+// creates one `TerminalRegistry` (`@termhub/ui`'s `terminal-registry.ts`)
+// for the page's whole lifetime, and every `SplitTree` below only renders
+// `TerminalSlot`s that ask the registry to place/park its already-alive
+// host — see docs/specs/m3.5-terminal-lifecycle.md section 4.1 for why
+// birth/death now tracks the store (`split`/`closePane`/`closeWorkspace`/
+// `removeSession`), not React mounts, and section 4.5 for why this
+// component is the one that creates and disposes it.
 
 type BootState = { phase: 'measuring' } | { phase: 'ready' } | { phase: 'error'; message: string };
 
@@ -94,6 +103,18 @@ export function App() {
   const setActiveWorkspace = useTermhubStore((s) => s.setActiveWorkspace);
   const focusPaneAction = useTermhubStore((s) => s.focusPane);
   const setRatioAction = useTermhubStore((s) => s.setRatio);
+
+  // Created once, for the whole life of this page — never recreated on a
+  // re-render (docs/specs/m3.5-terminal-lifecycle.md section 4.5). `useState`'s
+  // lazy initializer runs exactly once, on the very first render; the
+  // registry itself subscribes to `useTermhubStore` immediately (it doesn't
+  // need to wait for boot to hydrate the store — an empty store simply has
+  // nothing placed yet). Disposed on this component's own unmount, i.e. the
+  // end of the page's life, not on every render.
+  const [registry] = useState<TerminalRegistry>(() =>
+    createTerminalRegistry({ bridge: window.termhub, store: useTermhubStore }),
+  );
+  useEffect(() => () => registry.dispose(), [registry]);
 
   useEffect(() => window.termhub.onConnectionStateChange(setConnection), []);
 
@@ -196,6 +217,7 @@ export function App() {
               sessions={sessions}
               focusedSessionId={workspace.focusedSessionId}
               maximizedSessionId={workspace.maximizedSessionId}
+              registry={registry}
               bridge={window.termhub}
               onFocusPane={(sessionId) => {
                 focusPaneAction(workspace.id, sessionId);

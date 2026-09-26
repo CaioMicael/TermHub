@@ -1,6 +1,3 @@
-export { Terminal } from './Terminal.js';
-export type { TerminalProps } from './Terminal.js';
-
 export { TabBar } from './TabBar.js';
 export type { TabBarProps } from './TabBar.js';
 
@@ -48,6 +45,30 @@ export type {
   WebglFallbackReason,
   WebglRendererHandle,
 } from './terminal-webgl.js';
+
+export { selectWebglSessions } from './terminal-webgl-policy.js';
+export type { SelectWebglSessionsParams } from './terminal-webgl-policy.js';
+
+// ─── M3.5: the imperative terminal registry/host, and their React "slot" ──
+
+export { createTerminalHost } from './terminal-host.js';
+export type {
+  ElementObserverHandle,
+  HostDisposable,
+  TerminalHost,
+  TerminalHostOptions,
+  XTermLike,
+} from './terminal-host.js';
+
+export { createTerminalRegistry } from './terminal-registry.js';
+export type {
+  CreateTerminalRegistryOptions,
+  TerminalDom,
+  TerminalRegistry,
+} from './terminal-registry.js';
+
+export { TerminalSlot } from './TerminalSlot.js';
+export type { TerminalSlotProps } from './TerminalSlot.js';
 
 // ─── Store (M3.1): workspace/pane-tree model, reducers, selectors ─────────
 

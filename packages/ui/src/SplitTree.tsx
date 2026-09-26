@@ -11,8 +11,9 @@ import type { SessionSummary } from '@termhub/shared';
 import { PaneHeader } from './PaneHeader.js';
 import { buildPaneLayout, sizesToRatio, type PaneLayout } from './split-layout.js';
 import './split-tree.css';
-import { Terminal } from './Terminal.js';
-import type { TerminalBridge } from './terminal-session.js';
+import { TerminalSlot } from './TerminalSlot.js';
+import type { TerminalRegistry } from './terminal-registry.js';
+import type { SessionActionsBridge } from './store/session-actions.js';
 import { TERMINAL_SOLO_PADDING } from './terminal-theme.js';
 
 export interface SplitTreeProps {
@@ -22,7 +23,28 @@ export interface SplitTreeProps {
   focusedSessionId: number | undefined;
   /** When set, only this pane renders, full-size — "tela cheia" (docs/plan.md section 2, the prototype's `.pane.solo`). Also covers the "one pane total" case: a single-leaf `root` renders the exact same way whether or not it happens to equal `maximizedSessionId`. */
   maximizedSessionId: number | undefined;
-  bridge: TerminalBridge;
+  /**
+   * M3.5's terminal registry (`terminal-registry.ts`), created once in
+   * `App.tsx` with the real bridge and store (docs/specs/m3.5-terminal-
+   * lifecycle.md section 4.5) — `SplitTree` never constructs one itself,
+   * only threads it down to each leaf's `TerminalSlot`, which calls
+   * `place`/`unplace` on it.
+   */
+  registry: TerminalRegistry;
+  /**
+   * Only `PaneHeader`'s "dividir" button needs this (`splitPaneWithNewSession`'s
+   * `session.create` round trip) — since the registry above now owns the
+   * *terminal's* bridge entirely (constructed once in `App.tsx`, never
+   * forwarded through this component), `SplitTree` itself no longer needs
+   * `TerminalBridge`'s `sendData`/`onData`/clipboard methods at all. Typed
+   * as exactly what `PaneHeader` requires, `SessionActionsBridge`, with no
+   * cast: M3.4's `as unknown as SessionActionsBridge` line (`af23679`'s
+   * final report) existed only because this prop used to be `TerminalBridge`
+   * (a shape `PaneHeader` never needed) forwarded straight through — this
+   * task's report explains why that requirement went away instead of
+   * needing an intersection type.
+   */
+  bridge: SessionActionsBridge;
   onFocusPane: (sessionId: number) => void;
   /** Wired straight to the store's `setRatio(workspaceId, nodeId, ratio)` (M3.1). Committed once per completed drag — `react-resizable-panels`' `onLayoutChanged` only fires after pointer release (`meta.isUserInteraction`), not per pointer-move — never on every intermediate layout during the drag itself (this task's prompt, section 2: "não a cada pixel"). */
   onSetRatio: (nodeId: string, ratio: number) => void;
@@ -66,6 +88,7 @@ export function SplitTree({
   sessions,
   focusedSessionId,
   maximizedSessionId,
+  registry,
   bridge,
   onFocusPane,
   onSetRatio,
@@ -83,6 +106,7 @@ export function SplitTree({
         focused
         solo
         maximized
+        registry={registry}
         bridge={bridge}
         onFocusPane={onFocusPane}
       />
@@ -95,6 +119,7 @@ export function SplitTree({
       layout={layout}
       sessions={sessions}
       focusedSessionId={focusedSessionId}
+      registry={registry}
       bridge={bridge}
       onFocusPane={onFocusPane}
       onSetRatio={onSetRatio}
@@ -108,6 +133,7 @@ function PaneLayoutView({
   layout,
   sessions,
   focusedSessionId,
+  registry,
   bridge,
   onFocusPane,
   onSetRatio,
@@ -117,7 +143,8 @@ function PaneLayoutView({
   layout: PaneLayout;
   sessions: Record<number, SessionSummary>;
   focusedSessionId: number | undefined;
-  bridge: TerminalBridge;
+  registry: TerminalRegistry;
+  bridge: SessionActionsBridge;
   onFocusPane: (sessionId: number) => void;
   onSetRatio: (nodeId: string, ratio: number) => void;
   solo: boolean;
@@ -132,6 +159,7 @@ function PaneLayoutView({
         focused={layout.sessionId === focusedSessionId}
         solo={solo}
         maximized={false}
+        registry={registry}
         bridge={bridge}
         onFocusPane={onFocusPane}
       />
@@ -144,6 +172,7 @@ function PaneLayoutView({
       layout={layout}
       sessions={sessions}
       focusedSessionId={focusedSessionId}
+      registry={registry}
       bridge={bridge}
       onFocusPane={onFocusPane}
       onSetRatio={onSetRatio}
@@ -156,6 +185,7 @@ function SplitGroupView({
   layout,
   sessions,
   focusedSessionId,
+  registry,
   bridge,
   onFocusPane,
   onSetRatio,
@@ -164,7 +194,8 @@ function SplitGroupView({
   layout: Extract<PaneLayout, { kind: 'split' }>;
   sessions: Record<number, SessionSummary>;
   focusedSessionId: number | undefined;
-  bridge: TerminalBridge;
+  registry: TerminalRegistry;
+  bridge: SessionActionsBridge;
   onFocusPane: (sessionId: number) => void;
   onSetRatio: (nodeId: string, ratio: number) => void;
 }) {
@@ -216,6 +247,7 @@ function SplitGroupView({
           layout={layout.a}
           sessions={sessions}
           focusedSessionId={focusedSessionId}
+          registry={registry}
           bridge={bridge}
           onFocusPane={onFocusPane}
           onSetRatio={onSetRatio}
@@ -231,6 +263,7 @@ function SplitGroupView({
           layout={layout.b}
           sessions={sessions}
           focusedSessionId={focusedSessionId}
+          registry={registry}
           bridge={bridge}
           onFocusPane={onFocusPane}
           onSetRatio={onSetRatio}
@@ -248,6 +281,7 @@ function PaneLeafView({
   focused,
   solo,
   maximized,
+  registry,
   bridge,
   onFocusPane,
 }: {
@@ -257,7 +291,8 @@ function PaneLeafView({
   focused: boolean;
   solo: boolean;
   maximized: boolean;
-  bridge: TerminalBridge;
+  registry: TerminalRegistry;
+  bridge: SessionActionsBridge;
   onFocusPane: (sessionId: number) => void;
 }) {
   const session = sessions[sessionId];
@@ -286,19 +321,7 @@ function PaneLeafView({
         focused={focused}
         maximized={maximized}
         solo={solo}
-        // `as unknown as`: this component's own `bridge` prop is typed
-        // `TerminalBridge` (generic `request` over just 3 RPC methods,
-        // `terminal-session.ts`), while `PaneHeader`'s new `bridge` prop
-        // (M3.4's authorized contract extension) is typed
-        // `SessionActionsBridge` (generic `request` over `session.create`
-        // among others, `store/session-actions.ts`). TypeScript won't
-        // structurally unify two differently-constrained generic method
-        // signatures even though the real runtime value (`window.termhub`,
-        // `PreloadBridge`) satisfies both — its own `request` is generic
-        // over the full `RequestMethod` union, a superset of each. See
-        // M3.4's final report for why this line, not a `SplitTreeProps`
-        // change, was the fix.
-        bridge={bridge as unknown as import('./store/session-actions.js').SessionActionsBridge}
+        bridge={bridge}
       />
       <div
         style={{
@@ -311,9 +334,7 @@ function PaneLeafView({
             : 0,
         }}
       >
-        {session !== undefined && (
-          <Terminal sessionId={sessionId} cols={session.cols} rows={session.rows} bridge={bridge} />
-        )}
+        <TerminalSlot sessionId={sessionId} registry={registry} />
       </div>
     </div>
   );
