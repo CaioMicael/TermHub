@@ -1,6 +1,19 @@
 export { TabBar } from './TabBar.js';
 export type { TabBarProps } from './TabBar.js';
 
+export { ActivityBar } from './ActivityBar.js';
+export type { ActivityBarProps, SidebarView } from './ActivityBar.js';
+
+export { Sidebar } from './Sidebar.js';
+export type { SidebarProps } from './Sidebar.js';
+
+export {
+  activeFocusedTarget,
+  buildSidebarGroups,
+  totalPlacedSessionCount,
+} from './sidebar-model.js';
+export type { SidebarGroup, SidebarRow } from './sidebar-model.js';
+
 export {
   canCloseWorkspace,
   closeWorkspaceTab,

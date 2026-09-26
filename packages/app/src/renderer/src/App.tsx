@@ -1,10 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  ActivityBar,
   createTerminalRegistry,
   measureFitSize,
+  Sidebar,
   SplitTree,
   TabBar,
   useTermhubStore,
+  type SidebarView,
   type TerminalRegistry,
 } from '@termhub/ui';
 
@@ -66,6 +69,27 @@ const gridAreaStyle = {
   position: 'relative',
 } as const;
 
+// M4.2: activity bar (48px) + sidebar (270px) sit left of the existing
+// tab-bar-over-grid column (docs/plan.md section 2's shell layout — the
+// title bar itself is out of this task's scope). `shellBodyStyle` is the
+// row the three live in; `mainColumnStyle` is what used to be `shellStyle`'s
+// own direct children (`TabBar` + the grid area), now nested one level
+// deeper so it can sit next to the sidebar instead of filling the whole
+// window.
+const shellBodyStyle = {
+  flex: 1,
+  minHeight: 0,
+  display: 'flex',
+} as const;
+
+const mainColumnStyle = {
+  flex: 1,
+  minWidth: 0,
+  minHeight: 0,
+  display: 'flex',
+  flexDirection: 'column',
+} as const;
+
 /** Renders whatever `window.termhub`'s current connection state warrants when it isn't `'connected'`, or `null` once it is (the caller then proceeds to session boot). */
 function ConnectionStatus({
   state,
@@ -95,6 +119,7 @@ function ConnectionStatus({
 export function App() {
   const [connection, setConnection] = useState(() => window.termhub.getConnectionState());
   const [bootState, setBootState] = useState<BootState>({ phase: 'measuring' });
+  const [sidebarView, setSidebarView] = useState<SidebarView>('terminals');
   const probeRef = useRef<HTMLDivElement | null>(null);
 
   const workspaces = useTermhubStore((s) => s.workspaces);
@@ -193,41 +218,47 @@ export function App() {
 
   return (
     <div style={shellStyle}>
-      <TabBar
-        workspaces={workspaces}
-        activeWorkspaceId={activeWorkspaceId}
-        onSelect={(workspaceId) => {
-          setActiveWorkspace(workspaceId);
-        }}
-        bridge={window.termhub}
-      />
-      <div style={gridAreaStyle}>
-        {workspaces.map((workspace) => (
-          <div
-            key={workspace.id}
-            style={{
-              position: 'absolute',
-              inset: 0,
-              display: workspace.id === activeWorkspaceId ? 'block' : 'none',
+      <div style={shellBodyStyle}>
+        <ActivityBar view={sidebarView} onSelectView={setSidebarView} />
+        <Sidebar view={sidebarView} bridge={window.termhub} />
+        <div style={mainColumnStyle}>
+          <TabBar
+            workspaces={workspaces}
+            activeWorkspaceId={activeWorkspaceId}
+            onSelect={(workspaceId) => {
+              setActiveWorkspace(workspaceId);
             }}
-          >
-            <SplitTree
-              workspaceId={workspace.id}
-              root={workspace.root}
-              sessions={sessions}
-              focusedSessionId={workspace.focusedSessionId}
-              maximizedSessionId={workspace.maximizedSessionId}
-              registry={registry}
-              bridge={window.termhub}
-              onFocusPane={(sessionId) => {
-                focusPaneAction(workspace.id, sessionId);
-              }}
-              onSetRatio={(nodeId, ratio) => {
-                setRatioAction(workspace.id, nodeId, ratio);
-              }}
-            />
+            bridge={window.termhub}
+          />
+          <div style={gridAreaStyle}>
+            {workspaces.map((workspace) => (
+              <div
+                key={workspace.id}
+                style={{
+                  position: 'absolute',
+                  inset: 0,
+                  display: workspace.id === activeWorkspaceId ? 'block' : 'none',
+                }}
+              >
+                <SplitTree
+                  workspaceId={workspace.id}
+                  root={workspace.root}
+                  sessions={sessions}
+                  focusedSessionId={workspace.focusedSessionId}
+                  maximizedSessionId={workspace.maximizedSessionId}
+                  registry={registry}
+                  bridge={window.termhub}
+                  onFocusPane={(sessionId) => {
+                    focusPaneAction(workspace.id, sessionId);
+                  }}
+                  onSetRatio={(nodeId, ratio) => {
+                    setRatioAction(workspace.id, nodeId, ratio);
+                  }}
+                />
+              </div>
+            ))}
           </div>
-        ))}
+        </div>
       </div>
     </div>
   );
