@@ -1559,6 +1559,28 @@ describe('profiles.list: RPC wiring (fake ProfileService)', () => {
   });
 });
 
+/**
+ * Whether `marker` shows up as the *output* of `echo <marker>`, not only as
+ * the typed command. A line-based check is not enough under ConPTY: it
+ * repaints the screen with cursor moves, so cmd's next prompt can land
+ * right after the echoed text with no line break in between (CI on Windows:
+ * `echo M\r\nMD:\a\...>`). Any occurrence not right after `echo ` counts,
+ * which also ignores a repaint of the command line itself.
+ */
+function hasEchoOutput(output: string, marker: string): boolean {
+  let from = 0;
+  for (;;) {
+    const at = output.indexOf(marker, from);
+    if (at === -1) {
+      return false;
+    }
+    if (!output.slice(Math.max(0, at - 5), at).endsWith('echo ')) {
+      return true;
+    }
+    from = at + marker.length;
+  }
+}
+
 /** CSI escape sequences (colors, cursor moves), stripped from a failure's output tail so it reads as text. Built from a string so the ESC byte is not a literal control character in a regex. */
 const CSI_SEQUENCE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;?]*[A-Za-z]`, 'g');
 
@@ -1616,7 +1638,7 @@ describe('profiles.list: real detection end to end over the real pipe (M4.6)', (
         }
         client.sendData(sessionId, Buffer.from(`echo ${marker}\r`, 'utf8'));
         try {
-          await waitFor(() => hasStandaloneLine(output, marker), 20_000);
+          await waitFor(() => hasEchoOutput(output, marker), 20_000);
         } catch {
           failures.push({ id: profile.id, stage: 'marker never echoed', tail: tail() });
         }
