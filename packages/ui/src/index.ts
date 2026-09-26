@@ -147,6 +147,7 @@ export {
   closeWorkspace,
   focusPane,
   movePaneInWorkspace,
+  placeSessionInWorkspace,
   removeSession,
   renameWorkspace,
   reorderWorkspaces,
@@ -179,6 +180,7 @@ export {
 export type { ReconcileOutcome, ReconcileRestored } from './layout-persistence.js';
 
 export {
+  buryClosedSession,
   closePaneAction,
   createWorkspaceWithNewSession,
   estimateSplitSize,
@@ -193,3 +195,19 @@ export type {
   SessionActionsStoreApi,
   Size,
 } from './store/session-actions.js';
+
+// ─── M4.5: the graveyard ("Fechados recentemente") pure model, and the
+// terminal-clipboard shortcut it shares with `Ctrl+Shift+T` ──────────────
+
+export {
+  buildGraveyardRows,
+  collectSessionLocations,
+  formatAliveRemaining,
+  formatClosedAgo,
+  mostRecentlyClosedSessionId,
+  resolveRestoreWorkspaceId,
+  resolveSplitTarget,
+  sessionsJustUnplaced,
+  sortGraveyardEntries,
+} from './graveyard-model.js';
+export type { GraveyardRow, JustUnplacedSession, SessionOrigin } from './graveyard-model.js';

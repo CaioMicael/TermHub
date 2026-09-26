@@ -3,6 +3,7 @@ import type { SessionSummary } from '@termhub/shared';
 
 import { makeLeaf } from './tree.js';
 import {
+  buryClosedSession,
   closePaneAction,
   createWorkspaceWithNewSession,
   estimateSplitSize,
@@ -210,5 +211,24 @@ describe('closePaneAction', () => {
     });
     closePaneAction(store, 'ws1', 1);
     expect(store.calls.closePane).toEqual([['ws1', 1]]);
+  });
+});
+
+describe('buryClosedSession', () => {
+  it('calls session.close with no ttlMs (the daemon default)', () => {
+    const request = vi.fn().mockResolvedValue({});
+    buryClosedSession({ request }, 7);
+    expect(request).toHaveBeenCalledWith('session.close', { sessionId: 7 });
+  });
+
+  it('never throws or leaves a rejection unhandled when the daemon call fails', async () => {
+    const request = vi.fn().mockRejectedValue(new Error('daemon unreachable'));
+    const errors: unknown[] = [];
+    expect(() => {
+      buryClosedSession({ request }, 7, (err) => errors.push(err));
+    }).not.toThrow();
+    await vi.waitFor(() => {
+      expect(errors).toHaveLength(1);
+    });
   });
 });

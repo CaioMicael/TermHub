@@ -11,7 +11,17 @@
 // src/session-boot.ts`'s `SessionBootBridge` already use, so `@termhub/ui`
 // never has to import anything from `@termhub/app`.
 
-import type { SessionCreateParams, SessionId, SessionSummary } from '@termhub/shared';
+import type {
+  GraveyardListParams,
+  GraveyardListResult,
+  SessionCloseParams,
+  SessionCloseResult,
+  SessionCreateParams,
+  SessionId,
+  SessionRestoreParams,
+  SessionRestoreResult,
+  SessionSummary,
+} from '@termhub/shared';
 
 import type { SplitDirection } from './tree.js';
 import type { StoreState, Workspace } from './workspace.js';
@@ -28,12 +38,26 @@ import type { StoreState, Workspace } from './workspace.js';
  */
 export const NEW_SESSION_SHELL = 'powershell.exe';
 
-/** Every RPC method this module calls, keyed to its real params/result shape (`@termhub/shared`'s `protocol.ts`). */
+/**
+ * Every RPC method this module (and, by extension, everything that shares
+ * its `SessionActionsBridge` type — `Sidebar.tsx`'s graveyard section
+ * included) calls, keyed to its real params/result shape
+ * (`@termhub/shared`'s `protocol.ts`). `session.close`/`session.restore`/
+ * `graveyard.list` are M4.5's addition on top of M3's `session.create` —
+ * see `buryClosedSession` below for why `session.close` is called from
+ * here rather than from `pane-header-actions.ts`/`tab-bar-actions.ts`.
+ */
 export interface SessionActionsRequestParams {
   'session.create': SessionCreateParams;
+  'session.close': SessionCloseParams;
+  'session.restore': SessionRestoreParams;
+  'graveyard.list': GraveyardListParams;
 }
 export interface SessionActionsRequestResult {
   'session.create': { session: SessionSummary };
+  'session.close': SessionCloseResult;
+  'session.restore': SessionRestoreResult;
+  'graveyard.list': GraveyardListResult;
 }
 export type SessionActionsMethod = keyof SessionActionsRequestParams;
 
@@ -197,4 +221,41 @@ export function closePaneAction(
   sessionId: SessionId,
 ): void {
   store.closePane(workspaceId, sessionId);
+}
+
+/**
+ * M4.5's "fechar enterra": tells the daemon to bury `sessionId` in its
+ * graveyard (the default TTL — this never passes `ttlMs`, since the value
+ * lives in the main process's `config.json` and plumbing it to the renderer
+ * is out of this task's scope, per its own report). Fire-and-forget by
+ * design (`no-floating-promises`-safe: the `.catch` below is what handles
+ * it, not an ignored return value) — nothing here blocks the UI on the
+ * daemon's reply, and `session.close` is idempotent (`protocol.ts`'s own
+ * doc comment: "Repetir o close não muda o expiresAt"), so calling it twice
+ * for the same session (e.g. this module's own caller retrying) is
+ * harmless.
+ *
+ * **Not** called from `closePaneAction`/`handleCloseClick` above — armadilha
+ * 5's own test (`session-actions.test.ts`) locks `closePaneAction` to
+ * *never* touch the bridge, and `PaneHeader.tsx`'s close button
+ * (`pane-header-actions.ts`'s one caller) is a forbidden file whose call
+ * site passes no bridge at all. `Sidebar.tsx` is this function's real
+ * caller instead: it diffs the store's own tree shape on every change
+ * (`graveyard-model.ts`'s `sessionsJustUnplaced`) and calls this for every
+ * session that diff finds, regardless of *which* close button removed its
+ * pane — see this task's final report for the full reasoning.
+ */
+export function buryClosedSession(
+  bridge: Pick<SessionActionsBridge, 'request'>,
+  sessionId: SessionId,
+  onError?: (err: unknown) => void,
+): void {
+  bridge.request('session.close', { sessionId }).catch((err: unknown) => {
+    (
+      onError ??
+      ((error: unknown) => {
+        console.error('buryClosedSession: falha ao enterrar sessão no daemon', sessionId, error);
+      })
+    )(err);
+  });
 }

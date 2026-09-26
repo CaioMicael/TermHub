@@ -50,6 +50,8 @@ export interface TermhubStoreActions {
   focusPane: (workspaceId: string, sessionId: SessionId) => void;
   toggleMaximize: (workspaceId: string, sessionId: SessionId) => void;
   addWorkspace: (workspace: Workspace, opts?: { activate?: boolean }) => void;
+  /** M4.5: restores a graveyard session back into `workspaceId`'s tree — see `workspace.ts`'s `placeSessionInWorkspace` for the actual placement rule. */
+  placeSession: (workspaceId: string, session: SessionSummary, newNodeId: string) => void;
   closeWorkspace: (workspaceId: string) => void;
   setActiveWorkspace: (workspaceId: string) => void;
   reorderWorkspaces: (workspaceIds: readonly string[]) => void;
@@ -111,6 +113,9 @@ export const useTermhubStore: UseBoundStore<StoreApi<TermhubStore>> = create<Ter
     },
     addWorkspace: (workspace, opts) => {
       set((state) => reducers.addWorkspace(state, workspace, opts));
+    },
+    placeSession: (workspaceId, session, newNodeId) => {
+      set((state) => reducers.placeSessionInWorkspace(state, workspaceId, session, newNodeId));
     },
     closeWorkspace: (workspaceId) => {
       set((state) => reducers.closeWorkspace(state, workspaceId));

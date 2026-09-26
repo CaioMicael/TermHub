@@ -212,3 +212,57 @@
 .th-row-dot--err {
   background: #f14c4c; /* prototype --st-err */
 }
+
+/*
+ * M4.5's "Fechados recentemente" section — `termhub-prototipo.html`'s
+ * `.dot.wait` override (`background:#6a9955;animation:none`, a *different*
+ * green from `.dot.run`'s `--st-run`) and `.dot.dead`
+ * (`background:transparent;border:1px solid var(--st-idle)`).
+ */
+.th-row-dot--graveyard-alive {
+  background: #6a9955;
+}
+
+.th-row-dot--graveyard-dead {
+  background: transparent;
+  border: 1px solid #6e7681; /* prototype --st-idle */
+}
+
+.th-row-name--dim {
+  color: #8d8d8d; /* prototype's exited-entry name color */
+}
+
+.th-row-ttl {
+  margin-left: auto;
+  color: #858585; /* prototype --fg-dim */
+  font-size: 10px;
+  flex: 0 0 auto;
+}
+
+/* Same swap the prototype's `.row:hover .ttl{display:none}` makes — the
+   restore button (`.th-row-acts`, already `display:none` until hover) takes
+   the time text's place once the row is hovered. */
+.th-row:hover .th-row-ttl {
+  display: none;
+}
+
+.th-graveyard-footer {
+  padding: 10px 12px 0 22px;
+  color: #858585; /* prototype --fg-dim */
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.th-graveyard-footer b {
+  color: #c4c4c4;
+  font-weight: 700;
+}
+
+.th-graveyard-footer kbd {
+  font-family: inherit;
+  font-size: 10px;
+  background: #3c3c3c;
+  border: 1px solid #4a4a4a;
+  border-radius: 3px;
+  padding: 0 4px;
+}
