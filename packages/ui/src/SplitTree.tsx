@@ -1,4 +1,4 @@
-import { useCallback, useRef } from 'react';
+import { useCallback, useContext, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   Group,
   Panel,
@@ -6,14 +6,27 @@ import {
   type Layout,
   type LayoutChangedMeta,
 } from 'react-resizable-panels';
-import type { SessionSummary } from '@termhub/shared';
+import type { SessionId, SessionSummary } from '@termhub/shared';
 
 import { PaneHeader } from './PaneHeader.js';
+import {
+  computePaneDrop,
+  decodePaneDragPayload,
+  edgeForPoint,
+  isPaneDragDisabled,
+  PANE_DRAG_MIME,
+  PaneDragContext,
+  type PaneDragApi,
+  type PaneDragState,
+  type PaneDropTarget,
+} from './pane-drag.js';
 import { buildPaneLayout, sizesToRatio, type PaneLayout } from './split-layout.js';
 import './split-tree.css';
 import { TerminalSlot } from './TerminalSlot.js';
 import type { TerminalRegistry } from './terminal-registry.js';
 import type { SessionActionsBridge } from './store/session-actions.js';
+import type { MoveEdge } from './store/tree.js';
+import { useTermhubStore } from './store/store.js';
 import { TERMINAL_SOLO_PADDING } from './terminal-theme.js';
 
 export interface SplitTreeProps {
@@ -99,33 +112,91 @@ export function SplitTree({
   }
   if (maximizedSessionId !== undefined) {
     return (
-      <PaneLeafView
-        workspaceId={workspaceId}
-        sessionId={maximizedSessionId}
-        sessions={sessions}
-        focused
-        solo
-        maximized
-        registry={registry}
-        bridge={bridge}
-        onFocusPane={onFocusPane}
-      />
+      <PaneDragProvider workspaceId={workspaceId}>
+        <PaneLeafView
+          workspaceId={workspaceId}
+          sessionId={maximizedSessionId}
+          sessions={sessions}
+          focused
+          solo
+          maximized
+          registry={registry}
+          bridge={bridge}
+          onFocusPane={onFocusPane}
+        />
+      </PaneDragProvider>
     );
   }
   const solo = layout.kind === 'leaf';
   return (
-    <PaneLayoutView
-      workspaceId={workspaceId}
-      layout={layout}
-      sessions={sessions}
-      focusedSessionId={focusedSessionId}
-      registry={registry}
-      bridge={bridge}
-      onFocusPane={onFocusPane}
-      onSetRatio={onSetRatio}
-      solo={solo}
-    />
+    <PaneDragProvider workspaceId={workspaceId}>
+      <PaneLayoutView
+        workspaceId={workspaceId}
+        layout={layout}
+        sessions={sessions}
+        focusedSessionId={focusedSessionId}
+        registry={registry}
+        bridge={bridge}
+        onFocusPane={onFocusPane}
+        onSetRatio={onSetRatio}
+        solo={solo}
+      />
+    </PaneDragProvider>
   );
+}
+
+/**
+ * M3.6's drag state, scoped to one workspace's `SplitTree` — every
+ * `PaneHeader` inside starts a drag (`beginDrag`), every non-dragged leaf's
+ * drop-zone overlay (`PaneLeafView` below) tracks the hovered border
+ * (`setDropTarget`) and commits a move on drop (`drop`), all through the
+ * same `PaneDragContext` instance so neither has to import the other.
+ * `drop` is the only place that ever calls the store's `movePane` — it runs
+ * `computePaneDrop` (`pane-drag.ts`) itself, so a drop that lands back on
+ * the source pane, off every border, or with nothing being dragged, is a
+ * true no-op (section 2's "nada muda" cases), and always clears the drag
+ * state first, whether or not a move actually happens.
+ */
+function PaneDragProvider({ workspaceId, children }: { workspaceId: string; children: ReactNode }) {
+  const [state, setState] = useState<PaneDragState>({
+    draggingSessionId: null,
+    dropTarget: null,
+  });
+
+  const api = useMemo<PaneDragApi>(
+    () => ({
+      state,
+      beginDrag: (sessionId: SessionId) => {
+        setState({ draggingSessionId: sessionId, dropTarget: null });
+      },
+      endDrag: () => {
+        setState({ draggingSessionId: null, dropTarget: null });
+      },
+      setDropTarget: (target: PaneDropTarget | null) => {
+        setState((prev) => ({ ...prev, dropTarget: target }));
+      },
+      drop: (targetSessionId: SessionId, edge: MoveEdge | null) => {
+        const sourceSessionId = state.draggingSessionId;
+        setState({ draggingSessionId: null, dropTarget: null });
+        const result = computePaneDrop({ sourceSessionId, targetSessionId, edge });
+        if (result === null) {
+          return;
+        }
+        useTermhubStore
+          .getState()
+          .movePane(
+            workspaceId,
+            result.sourceSessionId,
+            result.targetSessionId,
+            result.edge,
+            crypto.randomUUID(),
+          );
+      },
+    }),
+    [state, workspaceId],
+  );
+
+  return <PaneDragContext.Provider value={api}>{children}</PaneDragContext.Provider>;
 }
 
 function PaneLayoutView({
@@ -296,6 +367,25 @@ function PaneLeafView({
   onFocusPane: (sessionId: number) => void;
 }) {
   const session = sessions[sessionId];
+
+  // M3.6's drop-zone overlay — armadilha 2 (this task's prompt): it exists
+  // in the DOM *only* while a pane drag is in progress and this leaf is a
+  // valid target, never otherwise, so it can never intercept a click,
+  // text selection or scroll inside the terminal at rest. `dragApi === null`
+  // can't happen under a real `SplitTree` (it always renders inside a
+  // `PaneDragProvider`, above), only guarded here for the same defensive
+  // reason `PaneHeader.tsx`'s own `dragApi === null` check exists.
+  const dragApi = useContext(PaneDragContext);
+  const dragState = dragApi?.state ?? { draggingSessionId: null, dropTarget: null };
+  const showDropZone =
+    dragState.draggingSessionId !== null &&
+    dragState.draggingSessionId !== sessionId &&
+    !isPaneDragDisabled({ solo, maximized });
+  const hoveredEdge =
+    dragState.dropTarget !== null && dragState.dropTarget.sessionId === sessionId
+      ? dragState.dropTarget.edge
+      : null;
+
   return (
     <div
       onClick={() => onFocusPane(sessionId)}
@@ -307,6 +397,7 @@ function PaneLeafView({
         minWidth: 0,
         minHeight: 0,
         background: '#1e1e1e',
+        position: 'relative',
         // `.pane.solo { outline: none !important }` (prototype): the solo
         // pane never gets a focus outline, regardless of `focused`.
         outline: !solo && focused ? '1px solid #007acc' : 'none',
@@ -336,6 +427,39 @@ function PaneLeafView({
       >
         <TerminalSlot sessionId={sessionId} registry={registry} />
       </div>
+      {showDropZone && dragApi !== null && (
+        <div
+          className="th-pane-dropzone"
+          onDragOver={(event) => {
+            if (!event.dataTransfer.types.includes(PANE_DRAG_MIME)) {
+              return;
+            }
+            event.preventDefault();
+            const rect = event.currentTarget.getBoundingClientRect();
+            const edge = edgeForPoint(rect, { x: event.clientX, y: event.clientY });
+            dragApi.setDropTarget(edge === null ? null : { sessionId, edge });
+          }}
+          onDragLeave={() => {
+            if (dragApi.state.dropTarget?.sessionId === sessionId) {
+              dragApi.setDropTarget(null);
+            }
+          }}
+          onDrop={(event) => {
+            const sourceSessionId = decodePaneDragPayload(event.dataTransfer);
+            if (sourceSessionId === null) {
+              return;
+            }
+            event.preventDefault();
+            const rect = event.currentTarget.getBoundingClientRect();
+            const edge = edgeForPoint(rect, { x: event.clientX, y: event.clientY });
+            dragApi.drop(sessionId, edge);
+          }}
+        >
+          {hoveredEdge !== null && (
+            <div className={`th-pane-dropzone-hint th-pane-dropzone-hint--${hoveredEdge}`} />
+          )}
+        </div>
+      )}
     </div>
   );
 }

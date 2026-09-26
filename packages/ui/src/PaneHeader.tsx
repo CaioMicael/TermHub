@@ -1,3 +1,4 @@
+import { useContext } from 'react';
 import type { SessionId, SessionSummary } from '@termhub/shared';
 
 import {
@@ -6,6 +7,12 @@ import {
   handleSplitClick,
   type MaximizeStoreApi,
 } from './pane-header-actions.js';
+import {
+  encodePaneDragPayload,
+  isPaneDragDisabled,
+  PANE_DRAG_MIME,
+  PaneDragContext,
+} from './pane-drag.js';
 import './pane-header.css';
 import { paneStatusVisual } from './pane-header-status.js';
 import type { SessionActionsBridge, SessionActionsStoreApi } from './store/session-actions.js';
@@ -141,10 +148,23 @@ export function PaneHeader({
   solo,
   bridge,
 }: PaneHeaderProps) {
+  // M3.6: dragging a pane starts only from this header (armadilha 1 —
+  // dragging inside the terminal area itself is xterm text selection, and
+  // must stay that way). `PaneDragContext` is `null` when this header
+  // somehow renders outside a `SplitTree` (never happens in the app today,
+  // but keeps this component from crashing if it ever did) — treated the
+  // same as "drag disabled". `isPaneDragDisabled` is the same function
+  // `SplitTree.tsx`'s drop-zone overlay uses to decide whether *any* pane
+  // in this workspace can be a drop target (section 2's last bullet: solo
+  // or maximized means there is no other pane to move to or from).
+  const dragApi = useContext(PaneDragContext);
+  const dragDisabled = dragApi === null || isPaneDragDisabled({ solo, maximized });
+
   const headClassName = [
     'th-pane-head',
     focused ? 'th-pane-head--focused' : '',
     solo ? 'th-pane-head--solo' : '',
+    !dragDisabled ? 'th-pane-head--draggable' : '',
   ]
     .filter((c) => c !== '')
     .join(' ');
@@ -169,12 +189,33 @@ export function PaneHeader({
   const meta = session.tag !== undefined ? `· ${session.tag} — ${session.cwd}` : `— ${session.cwd}`;
 
   return (
-    <div className={headClassName}>
+    <div
+      className={headClassName}
+      draggable={!dragDisabled}
+      onDragStart={(event) => {
+        if (dragDisabled || dragApi === null) {
+          event.preventDefault();
+          return;
+        }
+        event.dataTransfer.effectAllowed = 'move';
+        event.dataTransfer.setData(PANE_DRAG_MIME, encodePaneDragPayload(sessionId));
+        dragApi.beginDrag(sessionId);
+      }}
+      onDragEnd={() => {
+        dragApi?.endDrag();
+      }}
+    >
       <span className={dotClassName} />
       <span className="th-pname">{session.name}</span>
       <span className="th-pmeta">{meta}</span>
       <span className={stateClassName}>{visual.label}</span>
-      <span className="th-acts">
+      {/* `draggable={false}`: without it, a mousedown-drag gesture starting
+          on one of these buttons would still be picked up as a pane drag by
+          the header's own `draggable` ancestor above (native HTML5 DnD
+          bubbles a drag gesture up to the nearest draggable ancestor when
+          the element the gesture started on isn't draggable itself — buttons
+          aren't, by default, but that's not enough on its own to stop it). */}
+      <span className="th-acts" draggable={false}>
         <button
           type="button"
           className="th-icon-btn"

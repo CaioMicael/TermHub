@@ -29,3 +29,59 @@
 .th-divider-h {
   cursor: row-resize;
 }
+
+/*
+ * M3.6's pane drop-zone overlay (`SplitTree.tsx`'s `PaneLeafView`) — exists
+ * in the DOM only while a pane drag is in progress and only over a valid
+ * target pane (armadilha 2: never at rest, so it never blocks a click,
+ * text selection or scroll in the terminal underneath). `inset: 0` covers
+ * the whole pane, header included — dropping anywhere on the target pane's
+ * rectangle is valid, not just over its terminal area.
+ */
+.th-pane-dropzone {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+}
+
+/*
+ * The highlighted half of the target pane under the pointer, in the
+ * prototype's own accent (`--accent-hi: #0098ff`), translucent — same color
+ * `.th-divider:hover`/`.th-tab-active::before` already use for "this is
+ * interactive/active", reused here for "this is where the drop lands".
+ */
+.th-pane-dropzone-hint {
+  position: absolute;
+  background: rgba(0, 152, 255, 0.25);
+  border: 2px solid #0098ff;
+  box-sizing: border-box;
+  pointer-events: none;
+}
+
+.th-pane-dropzone-hint--top {
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 50%;
+}
+
+.th-pane-dropzone-hint--bottom {
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 50%;
+}
+
+.th-pane-dropzone-hint--left {
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 50%;
+}
+
+.th-pane-dropzone-hint--right {
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: 50%;
+}

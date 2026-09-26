@@ -43,6 +43,14 @@
   border-bottom-color: #232323;
 }
 
+/* M3.6: only a header this drag-enabled (`PaneHeader.tsx`'s `dragDisabled`
+   — off for solo/maximized, section 2's last bullet) gets the "grab"
+   cursor; the icon buttons inside still get their own pointer cursor from
+   `.th-icon-btn` below, unaffected by this. */
+.th-pane-head--draggable {
+  cursor: grab;
+}
+
 .th-pane-head .th-dot {
   width: 8px;
   height: 8px;

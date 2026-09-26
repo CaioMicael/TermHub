@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import type { SessionStatus } from '@termhub/shared';
 
 import { selectAggregatedWorkspaceStatus, selectSessionCount } from './store/selectors.js';
@@ -12,6 +12,14 @@ import {
   type CloseWorkspaceStoreApi,
 } from './tab-bar-actions.js';
 import './tab-bar.css';
+import {
+  decodeTabDragPayload,
+  encodeTabDragPayload,
+  reorderWorkspaceIds,
+  tabInsertionIndex,
+  TAB_DRAG_MIME,
+  type TabRect,
+} from './tab-drag.js';
 
 export interface TabBarProps {
   workspaces: Workspace[];
@@ -77,9 +85,32 @@ const closeWorkspaceStore: CloseWorkspaceStoreApi = {
   },
 };
 
+/**
+ * M3.6's tab-reorder drag state, local to one `TabBar` instance (there is
+ * only ever one). `insertionIndex` is `tab-drag.ts`'s `tabInsertionIndex`
+ * result — an index into the tab list *with the dragged tab removed*, ready
+ * to hand straight to `reorderWorkspaceIds` on drop. `indicatorLeft` is a
+ * pixel offset (relative to the tab strip's own left edge) purely for
+ * rendering the insertion-point indicator; it's derived from the same DOM
+ * measurement `onDragOver` already does to compute `insertionIndex`, so
+ * it's kept alongside it instead of recomputed at render.
+ */
+interface TabDragState {
+  draggingWorkspaceId: string;
+  insertionIndex: number;
+  indicatorLeft: number;
+}
+
 export function TabBar({ workspaces, activeWorkspaceId, onSelect, bridge }: TabBarProps) {
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | undefined>(undefined);
+  const [dragState, setDragState] = useState<TabDragState | null>(null);
+  // One `<div>` ref per tab, keyed by workspace id — `onDragOver`/`onDrop`
+  // (on the strip itself, not per tab: reordering needs every tab's
+  // position at once, not just the one under the pointer) read
+  // `getBoundingClientRect()` off these to build the `TabRect[]`
+  // `tabInsertionIndex` (`tab-drag.ts`) takes.
+  const tabRefs = useRef(new Map<string, HTMLDivElement>());
 
   const handleCreate = () => {
     const active = workspaces.find((w) => w.id === activeWorkspaceId);
@@ -94,6 +125,10 @@ export function TabBar({ workspaces, activeWorkspaceId, onSelect, bridge }: TabB
       });
   };
 
+  const clearDrag = () => {
+    setDragState(null);
+  };
+
   return (
     <div
       style={{
@@ -103,8 +138,48 @@ export function TabBar({ workspaces, activeWorkspaceId, onSelect, bridge }: TabB
         alignItems: 'stretch',
         background: '#252526', // prototype --bg-side
         userSelect: 'none',
+        position: 'relative',
       }}
       title={createError}
+      onDragOver={(event) => {
+        if (dragState === null || !event.dataTransfer.types.includes(TAB_DRAG_MIME)) {
+          return;
+        }
+        event.preventDefault();
+        const stripRect = event.currentTarget.getBoundingClientRect();
+        const rects: TabRect[] = workspaces.map((w) => {
+          const el = tabRefs.current.get(w.id);
+          const rect = el?.getBoundingClientRect();
+          return {
+            id: w.id,
+            left: (rect?.left ?? stripRect.left) - stripRect.left,
+            width: rect?.width ?? 0,
+          };
+        });
+        const pointerX = event.clientX - stripRect.left;
+        const insertionIndex = tabInsertionIndex(rects, dragState.draggingWorkspaceId, pointerX);
+        const others = rects.filter((r) => r.id !== dragState.draggingWorkspaceId);
+        const last = others[others.length - 1];
+        const indicatorLeft =
+          others[insertionIndex]?.left ?? (last !== undefined ? last.left + last.width : 0);
+        setDragState({ ...dragState, insertionIndex, indicatorLeft });
+      }}
+      onDrop={(event) => {
+        if (dragState === null) {
+          return;
+        }
+        const draggedId = decodeTabDragPayload(event.dataTransfer);
+        if (draggedId !== null) {
+          event.preventDefault();
+          const nextIds = reorderWorkspaceIds(
+            workspaces.map((w) => w.id),
+            draggedId,
+            dragState.insertionIndex,
+          );
+          useTermhubStore.getState().reorderWorkspaces(nextIds);
+        }
+        clearDrag();
+      }}
     >
       {workspaces.map((workspace) => (
         <Tab
@@ -113,6 +188,21 @@ export function TabBar({ workspaces, activeWorkspaceId, onSelect, bridge }: TabB
           active={workspace.id === activeWorkspaceId}
           workspaceCount={workspaces.length}
           onSelect={onSelect}
+          tabRef={(el) => {
+            if (el === null) {
+              tabRefs.current.delete(workspace.id);
+            } else {
+              tabRefs.current.set(workspace.id, el);
+            }
+          }}
+          onDragStart={() => {
+            setDragState({
+              draggingWorkspaceId: workspace.id,
+              insertionIndex: 0,
+              indicatorLeft: 0,
+            });
+          }}
+          onDragEnd={clearDrag}
         />
       ))}
       <button
@@ -133,6 +223,9 @@ export function TabBar({ workspaces, activeWorkspaceId, onSelect, bridge }: TabB
           <path d="M8 3v10M3 8h10" strokeLinecap="round" />
         </svg>
       </button>
+      {dragState !== null && (
+        <div className="th-tab-drop-indicator" style={{ left: dragState.indicatorLeft }} />
+      )}
     </div>
   );
 }
@@ -154,11 +247,18 @@ function Tab({
   active,
   workspaceCount,
   onSelect,
+  tabRef,
+  onDragStart,
+  onDragEnd,
 }: {
   workspace: Workspace;
   active: boolean;
   workspaceCount: number;
   onSelect: (workspaceId: string) => void;
+  /** Registers/unregisters this tab's own element in `TabBar`'s `tabRefs` map — see that map's doc comment. */
+  tabRef: (el: HTMLDivElement | null) => void;
+  onDragStart: () => void;
+  onDragEnd: () => void;
 }) {
   const status = useTermhubStore((state) => selectAggregatedWorkspaceStatus(state, workspace.id));
   const count = useTermhubStore((state) => selectSessionCount(state, workspace.id));
@@ -166,10 +266,18 @@ function Tab({
 
   return (
     <div
+      ref={tabRef}
       className={active ? 'th-tab th-tab-active' : 'th-tab'}
+      draggable
       onClick={() => {
         onSelect(workspace.id);
       }}
+      onDragStart={(event) => {
+        event.dataTransfer.effectAllowed = 'move';
+        event.dataTransfer.setData(TAB_DRAG_MIME, encodeTabDragPayload(workspace.id));
+        onDragStart();
+      }}
+      onDragEnd={onDragEnd}
     >
       <span
         style={{
@@ -187,6 +295,7 @@ function Tab({
         className="th-tab-close"
         title={closable ? 'Fechar aba' : 'O último workspace não pode ser fechado'}
         disabled={!closable}
+        draggable={false}
         onClick={(event) => {
           event.stopPropagation();
           closeWorkspaceTab(closeWorkspaceStore, workspace.id, workspaceCount);
