@@ -4,15 +4,22 @@ import { randomUUID } from 'node:crypto';
 import { Terminal } from '@xterm/headless';
 import { PROTOCOL_ERROR_CODE, ProtocolError } from '@termhub/shared';
 import type {
+  GraveyardListResult,
+  ProfilesListResult,
   SessionAttachResult,
   SessionCreateResult,
   SessionExitPayload,
   SessionId,
   SessionListResult,
+  SessionRestoreResult,
+  ShellProfile,
 } from '@termhub/shared';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { TerminalBuffer } from './buffer.js';
+import { Graveyard, MAX_TTL_MS, MIN_TTL_MS } from './graveyard.js';
+import type { GraveyardClock } from './graveyard.js';
+import type { ProfileService } from './profiles.js';
 import { Registry } from './registry.js';
 import type { SessionFactory, SessionLike } from './registry.js';
 import {
@@ -162,15 +169,21 @@ interface Harness {
   service: SessionService;
 }
 
-/** Starts a server with the session service registered, a matching registry, and one connected+handshaked client. */
-async function startHarness(options: { sessionFactory?: SessionFactory } = {}): Promise<Harness> {
+/** Starts a server with the session service registered, a matching registry, and one connected+handshaked client. `graveyard` (M4.4) lets a test inject one built with a fake clock — see `graveyard.test.ts`'s own fake clock for the pattern — while keeping everything else in this harness on real timers. `profiles` (M4.6) similarly lets a test inject a fake `ProfileService` instead of `registerSessionService`'s default (real shell detection for whatever OS the test runs on). */
+async function startHarness(
+  options: {
+    sessionFactory?: SessionFactory;
+    graveyard?: Graveyard;
+    profiles?: ProfileService;
+  } = {},
+): Promise<Harness> {
   const address = uniqueAddress();
   const token = `tok-${randomUUID()}`;
   const registry = new Registry(
     options.sessionFactory !== undefined ? { sessionFactory: options.sessionFactory } : {},
   );
   const server = new TransportServer({ token, address });
-  const service = registerSessionService(server, registry);
+  const service = registerSessionService(server, registry, options.graveyard, options.profiles);
   cleanup.push(() => server.close());
   await server.listen();
 
@@ -334,7 +347,7 @@ describe('session service: real PTY end to end over the real pipe', () => {
     'session.create spawns a real PTY, and (once attached, per M1.7) its prompt streams back as binary frames; ' +
       'sending "echo hi" via client.sendData() over the real pipe reaches the shell and "hi" streams back too; ' +
       'the shell exiting on its own reports the real exit code via session.exit and session.list; ' +
-      'session.close afterward is a harmless no-op that removes it from session.list',
+      'session.kill afterward is a harmless no-op that removes it from session.list',
     async () => {
       const { registry, client } = await startHarness();
       realRegistries.push(registry);
@@ -398,9 +411,12 @@ describe('session service: real PTY end to end over the real pipe', () => {
       expect(listedSession?.status).toBe('exited');
       expect(listedSession?.exitCode).toBe(5);
 
-      // 5. session.close on an already-dead session doesn't throw and
-      // session.list reflects the closure (registry.close()'s idempotency).
-      await client.request('session.close', { sessionId });
+      // 5. session.kill (M4.4: not session.close, which would bury this
+      // already-dead session in the graveyard for its default 10-minute TTL
+      // instead of removing it right away) on an already-dead session
+      // doesn't throw and session.list reflects the removal
+      // (registry.close()'s idempotency).
+      await client.request('session.kill', { sessionId });
       const listedAfterClose = await client.request<SessionListResult>('session.list', {});
       expect(listedAfterClose.sessions.some((s) => s.id === sessionId)).toBe(false);
     },
@@ -464,7 +480,7 @@ describe('session service: RPC wiring and broadcast (fake session)', () => {
     await expect(client.request('session.list', {})).resolves.toBeDefined();
   });
 
-  it('session.list reflects creations and closures', async () => {
+  it('session.list reflects creations and removals (session.kill, not session.close — M4.4: session.close would bury it, not remove it right away)', async () => {
     const { factory } = fakeFactory();
     const { client } = await startHarness({ sessionFactory: factory });
 
@@ -476,12 +492,12 @@ describe('session service: RPC wiring and broadcast (fake session)', () => {
       [a.session.id, b.session.id].sort(),
     );
 
-    await client.request('session.close', { sessionId: a.session.id });
+    await client.request('session.kill', { sessionId: a.session.id });
     const afterClose = await client.request<SessionListResult>('session.list', {});
     expect(afterClose.sessions.map((s) => s.id)).toEqual([b.session.id]);
   });
 
-  it('session.close kills the session and sends session.exit with the exact code to every client attached to it (M1.7: targeted, not broadcast)', async () => {
+  it('session.kill kills the session and sends session.exit with the exact code to every client attached to it (M1.7: targeted, not broadcast)', async () => {
     const { factory } = fakeFactory();
     const { client: clientA, addClient } = await startHarness({ sessionFactory: factory });
     const clientB = await addClient();
@@ -514,7 +530,7 @@ describe('session service: RPC wiring and broadcast (fake session)', () => {
     const [exitA, exitB] = await Promise.all([
       waitForExit(clientA),
       waitForExit(clientB),
-      clientA.request('session.close', { sessionId }),
+      clientA.request('session.kill', { sessionId }),
     ]);
 
     expect(exitA).toEqual({ sessionId, exitCode: 0 });
@@ -1169,4 +1185,540 @@ describe('session.resize keeps the summary in sync with the buffer (M2.6 require
     reconstructed.dispose();
     groundTruth.dispose();
   });
+});
+
+// ---------------------------------------------------------------------------
+// M4.4 — session.close (bury) / session.kill / session.restore /
+// graveyard.list
+//
+// Two describe blocks: a fast one against a FakeSession (in the style of
+// the rest of this file's non-PTY tests — session.list excludes the buried
+// entry, graveyard.list shows it with the right closedAt/expiresAt, restore
+// puts it back), and a slow one with a REAL PTY proving the actual
+// end-to-end promise: a real shell survives session.close, keeps its
+// scrollback, and session.restore + session.attach hands it back alive —
+// while a buried session nobody ever restores really does have its real OS
+// process killed once the TTL elapses.
+// ---------------------------------------------------------------------------
+
+describe('graveyard: session.close buries, session.list/graveyard.list, session.restore (fake session)', () => {
+  it('session.close removes the session from session.list but not from graveyard.list, with the closedAt/expiresAt this ttlMs implies', async () => {
+    const fakeNow = 1_700_000_000_000;
+    const graveyard = new Graveyard({
+      clock: { now: () => fakeNow, setTimeout: () => undefined, clearTimeout: () => undefined },
+    });
+    const { factory } = fakeFactory();
+    const { client } = await startHarness({ sessionFactory: factory, graveyard });
+
+    const created = await client.request<SessionCreateResult>('session.create', baseCreateParams());
+    const sessionId = created.session.id;
+
+    await client.request('session.close', { sessionId, ttlMs: 300_000 });
+
+    const listed = await client.request<SessionListResult>('session.list', {});
+    expect(listed.sessions.some((s) => s.id === sessionId)).toBe(false);
+
+    const buried = await client.request<GraveyardListResult>('graveyard.list', {});
+    const entry = buried.entries.find((e) => e.session.id === sessionId);
+    expect(entry).toBeDefined();
+    expect(entry?.closedAt).toBe(fakeNow);
+    expect(entry?.expiresAt).toBe(fakeNow + 300_000);
+    expect(entry?.session.status).toBe('running');
+  });
+
+  it('session.close on an already-buried session is idempotent and does not reset expiresAt', async () => {
+    let fakeNow = 0;
+    const graveyard = new Graveyard({
+      clock: { now: () => fakeNow, setTimeout: () => undefined, clearTimeout: () => undefined },
+    });
+    const { factory } = fakeFactory();
+    const { client } = await startHarness({ sessionFactory: factory, graveyard });
+
+    const created = await client.request<SessionCreateResult>('session.create', baseCreateParams());
+    const sessionId = created.session.id;
+
+    await client.request('session.close', { sessionId, ttlMs: 120_000 });
+    const firstListing = await client.request<GraveyardListResult>('graveyard.list', {});
+    const firstExpiresAt = firstListing.entries.find((e) => e.session.id === sessionId)?.expiresAt;
+
+    fakeNow = 60_000; // time passes...
+    // ...and a second session.close, with a much longer ttl, must change nothing.
+    await client.request('session.close', { sessionId, ttlMs: 86_400_000 });
+    const secondListing = await client.request<GraveyardListResult>('graveyard.list', {});
+    const secondExpiresAt = secondListing.entries.find(
+      (e) => e.session.id === sessionId,
+    )?.expiresAt;
+
+    expect(secondExpiresAt).toBe(firstExpiresAt);
+  });
+
+  it('session.close rejects a ttlMs outside [60_000, 86_400_000] with invalid_params, and does not bury the session', async () => {
+    const { factory } = fakeFactory();
+    const { client } = await startHarness({ sessionFactory: factory });
+
+    const created = await client.request<SessionCreateResult>('session.create', baseCreateParams());
+    const sessionId = created.session.id;
+
+    let caught: unknown;
+    try {
+      await client.request('session.close', { sessionId, ttlMs: 500 });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(ProtocolError);
+    expect((caught as ProtocolError).code).toBe(PROTOCOL_ERROR_CODE.INVALID_PARAMS);
+
+    // Rejected before anything happened: still live, not buried.
+    const listed = await client.request<SessionListResult>('session.list', {});
+    expect(listed.sessions.some((s) => s.id === sessionId)).toBe(true);
+  });
+
+  it('session.restore puts a buried session back into session.list, and its runtime (buffer + attach) keeps working untouched', async () => {
+    const { factory, sessions } = fakeFactory();
+    const { client } = await startHarness({ sessionFactory: factory });
+
+    const created = await client.request<SessionCreateResult>('session.create', baseCreateParams());
+    const sessionId = created.session.id;
+    const fake = sessions[0]!;
+
+    await client.request('session.close', { sessionId });
+    expect((await client.request<SessionListResult>('session.list', {})).sessions).toEqual([]);
+
+    const restored = await client.request<SessionRestoreResult>('session.restore', { sessionId });
+    expect(restored.session.id).toBe(sessionId);
+
+    const listed = await client.request<SessionListResult>('session.list', {});
+    expect(listed.sessions.map((s) => s.id)).toEqual([sessionId]);
+
+    // The runtime never stopped: attach still works and streams whatever
+    // arrived while buried, exactly like test 9's "nobody attached" case.
+    fake.emitData('WHILE-BURIED\r\n');
+    let received = '';
+    client.onData((sid, data) => {
+      if (sid === sessionId) received += Buffer.from(data).toString('utf8');
+    });
+    await client.request('session.attach', { sessionId });
+    await waitFor(() => received.includes('WHILE-BURIED'), 2_000);
+  });
+
+  it('session.restore on an unknown/never-buried/already-restored id fails with session_not_found', async () => {
+    const { factory } = fakeFactory();
+    const { client } = await startHarness({ sessionFactory: factory });
+
+    await expect(client.request('session.restore', { sessionId: 999_999 })).rejects.toMatchObject({
+      code: PROTOCOL_ERROR_CODE.SESSION_NOT_FOUND,
+    });
+
+    const created = await client.request<SessionCreateResult>('session.create', baseCreateParams());
+    const sessionId = created.session.id;
+    // Never buried at all.
+    await expect(client.request('session.restore', { sessionId })).rejects.toMatchObject({
+      code: PROTOCOL_ERROR_CODE.SESSION_NOT_FOUND,
+    });
+
+    await client.request('session.close', { sessionId });
+    await client.request('session.restore', { sessionId }); // succeeds once
+    // Already restored: not buried anymore.
+    await expect(client.request('session.restore', { sessionId })).rejects.toMatchObject({
+      code: PROTOCOL_ERROR_CODE.SESSION_NOT_FOUND,
+    });
+  });
+
+  it('session.kill on a buried session kills it immediately: gone from both session.list and graveyard.list, and restore afterward fails', async () => {
+    const { factory, sessions } = fakeFactory();
+    const { client } = await startHarness({ sessionFactory: factory });
+
+    const created = await client.request<SessionCreateResult>('session.create', baseCreateParams());
+    const sessionId = created.session.id;
+    const fake = sessions[0]!;
+
+    await client.request('session.close', { sessionId });
+    await client.request('session.kill', { sessionId });
+
+    expect(fake.killCalls).toBe(1);
+    const buried = await client.request<GraveyardListResult>('graveyard.list', {});
+    expect(buried.entries.some((e) => e.session.id === sessionId)).toBe(false);
+    await expect(client.request('session.restore', { sessionId })).rejects.toMatchObject({
+      code: PROTOCOL_ERROR_CODE.SESSION_NOT_FOUND,
+    });
+  });
+
+  it('a session that exits on its own while buried is reported as exited (with exitCode) by graveyard.list, and by session.restore', async () => {
+    const { factory, sessions } = fakeFactory();
+    const { client } = await startHarness({ sessionFactory: factory });
+
+    const created = await client.request<SessionCreateResult>('session.create', baseCreateParams());
+    const sessionId = created.session.id;
+    const fake = sessions[0]!;
+
+    await client.request('session.close', { sessionId });
+    fake.emitExit({ exitCode: 4 });
+
+    const buried = await client.request<GraveyardListResult>('graveyard.list', {});
+    const entry = buried.entries.find((e) => e.session.id === sessionId);
+    expect(entry?.session.status).toBe('exited');
+    expect(entry?.session.exitCode).toBe(4);
+
+    const restored = await client.request<SessionRestoreResult>('session.restore', { sessionId });
+    expect(restored.session.status).toBe('exited');
+    expect(restored.session.exitCode).toBe(4);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M4.4 — real PTY: session.close survives a real shell, session.restore
+// hands it back alive with its scrollback, and an expired/never-restored
+// buried session's real OS process is actually dead.
+//
+// Shell chosen by platform (docs/milestones.md's own instruction for this
+// specific test): PowerShell everywhere else in this package's PTY suites is
+// Windows-only and hard-fails on this Linux CI container, which is exactly
+// why this test — the one that has to run here AND in Windows CI — doesn't
+// hardcode it.
+// ---------------------------------------------------------------------------
+
+function platformShell(): { shell: string; args: string[] } {
+  if (process.platform === 'win32') {
+    return { shell: 'powershell.exe', args: ['-NoLogo', '-NoProfile'] };
+  }
+  return { shell: '/bin/sh', args: [] };
+}
+
+/**
+ * A `GraveyardClock` this test steps by hand, entirely independent of real
+ * wall-clock time — see graveyard.ts's own header comment for why that
+ * independence matters here specifically: this test's real PTY needs real,
+ * live I/O on the real event loop at the same time as the graveyard's own
+ * TTL is being driven artificially, so `vi.useFakeTimers()` (which would
+ * freeze every timer in the process, including the transport's) is not an
+ * option.
+ */
+function manualGraveyardClock(): { clock: GraveyardClock; fire: () => void } {
+  let currentTime = 0;
+  const pending: Array<() => void> = [];
+  const clock: GraveyardClock = {
+    now: () => currentTime,
+    setTimeout: (handler) => {
+      pending.push(handler);
+      return handler;
+    },
+    clearTimeout: (handle) => {
+      const idx = pending.indexOf(handle as () => void);
+      if (idx !== -1) {
+        pending.splice(idx, 1);
+      }
+    },
+  };
+  return {
+    clock,
+    fire: () => {
+      currentTime += MAX_TTL_MS; // guarantees every pending timer is "due"
+      const toFire = pending.splice(0);
+      for (const handler of toFire) {
+        handler();
+      }
+    },
+  };
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+describe('graveyard: real PTY end to end (M4.4)', () => {
+  it('session.close buries a real shell; session.restore + session.attach hands it back alive, with the marker written before closing still in the snapshot', async () => {
+    const { registry, client } = await startHarness();
+    realRegistries.push(registry);
+
+    const { shell, args } = platformShell();
+    const createResult = await client.request<SessionCreateResult>('session.create', {
+      shell,
+      args,
+      cwd: process.cwd(),
+      cols: 80,
+      rows: 24,
+    });
+    const sessionId = createResult.session.id;
+    const pid = registry.get(sessionId)?.session.pid;
+    expect(pid).toBeDefined();
+    if (pid === undefined) throw new Error('unreachable');
+
+    let output = '';
+    client.onData((sid, data) => {
+      if (sid === sessionId) output += Buffer.from(data).toString('utf8');
+    });
+    await client.request('session.attach', { sessionId });
+    await waitFor(() => output.length > 0, 15_000);
+
+    // `\r`, not `\n`: it is the Enter key a terminal sends. PowerShell under
+    // ConPTY only runs the line on `\r` (CI on Windows timed out waiting for
+    // the echo with `\n`), and a POSIX tty turns `\r` into `\n` for /bin/sh.
+    client.sendData(sessionId, Buffer.from('echo BEFORE-CLOSE-MARK\r', 'utf8'));
+    // Not hasStandaloneLine: under ConPTY the next prompt can land right
+    // after the echoed text with no line break (see hasEchoOutput), and
+    // whether it does depends on when ConPTY repaints. CI on Windows failed
+    // this wait intermittently for exactly that reason.
+    await waitFor(() => hasEchoOutput(output, 'BEFORE-CLOSE-MARK'), 15_000);
+
+    await client.request('session.close', { sessionId });
+    // A closed session's pane goes away client-side too — session.detach,
+    // same as any other close, so the *next* session.attach (after restore)
+    // is a genuine re-attach, not a no-op against a client this
+    // SessionRuntime still thinks is live (attachClient's own "attaching
+    // twice is a no-op that doesn't re-send the snapshot" rule — without
+    // this detach, the assertion below would trivially pass for the wrong
+    // reason: because the connection never stopped streaming live, not
+    // because the snapshot actually reproduced the buried buffer).
+    await client.request('session.detach', { sessionId });
+    // Buried, not dead: no longer listed, but the real OS process is
+    // untouched.
+    const listed = await client.request<SessionListResult>('session.list', {});
+    expect(listed.sessions.some((s) => s.id === sessionId)).toBe(false);
+    expect(processExists(pid)).toBe(true);
+
+    const restored = await client.request<SessionRestoreResult>('session.restore', {
+      sessionId,
+    });
+    expect(restored.session.status).not.toBe('exited');
+
+    let afterRestore = '';
+    client.onData((sid, data) => {
+      if (sid === sessionId) afterRestore += Buffer.from(data).toString('utf8');
+    });
+    await client.request('session.attach', { sessionId });
+    // The snapshot (sent ahead of session.attach's own response, per the
+    // M1.7 client contract this file already relies on elsewhere) must
+    // contain the marker written before session.close — proving the
+    // buffer really did survive being buried.
+    await waitFor(() => hasEchoOutput(afterRestore, 'BEFORE-CLOSE-MARK'), 15_000);
+
+    client.sendData(sessionId, Buffer.from('echo AFTER-RESTORE-MARK\r', 'utf8'));
+    await waitFor(() => hasEchoOutput(afterRestore, 'AFTER-RESTORE-MARK'), 15_000);
+
+    await client.request('session.kill', { sessionId });
+  }, 30_000);
+
+  it('a buried real shell that is never restored has its real OS process killed once the (artificially elapsed) TTL is reached', async () => {
+    const manual = manualGraveyardClock();
+    const graveyard = new Graveyard({ clock: manual.clock });
+    const { registry, client } = await startHarness({ graveyard });
+    realRegistries.push(registry);
+
+    const { shell, args } = platformShell();
+    const createResult = await client.request<SessionCreateResult>('session.create', {
+      shell,
+      args,
+      cwd: process.cwd(),
+      cols: 80,
+      rows: 24,
+    });
+    const sessionId = createResult.session.id;
+
+    let output = '';
+    client.onData((sid, data) => {
+      if (sid === sessionId) output += Buffer.from(data).toString('utf8');
+    });
+    await client.request('session.attach', { sessionId });
+    await waitFor(() => output.length > 0, 15_000);
+
+    const realPid = registry.get(sessionId)?.session.pid;
+    expect(realPid).toBeDefined();
+    if (realPid === undefined) throw new Error('unreachable');
+    expect(processExists(realPid)).toBe(true);
+
+    await client.request('session.close', { sessionId, ttlMs: MIN_TTL_MS });
+    // Still alive right after burying it — nothing kills it until the TTL.
+    expect(processExists(realPid)).toBe(true);
+
+    manual.fire(); // simulates the TTL elapsing, with no restore in between
+
+    await waitFor(() => !processExists(realPid), 15_000);
+    expect(processExists(realPid)).toBe(false);
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// M4.6 (first half) — `profiles.list`
+// ---------------------------------------------------------------------------
+
+describe('profiles.list: RPC wiring (fake ProfileService)', () => {
+  it('returns whatever the injected ProfileService reports, and forwards `refresh` to it', async () => {
+    const fakeProfiles: ShellProfile[] = [
+      { id: 'posix:/bin/sh', name: 'sh', kind: 'posix', shell: '/bin/sh', args: [] },
+    ];
+    const list = vi.fn(() => Promise.resolve(fakeProfiles));
+    const { client } = await startHarness({ profiles: { list } });
+
+    const first = await client.request<ProfilesListResult>('profiles.list', {});
+    expect(first).toEqual({ profiles: fakeProfiles });
+    expect(list).toHaveBeenNthCalledWith(1, undefined);
+
+    await client.request<ProfilesListResult>('profiles.list', { refresh: true });
+    expect(list).toHaveBeenNthCalledWith(2, true);
+  });
+});
+
+/**
+ * Whether `marker` shows up as the *output* of `echo <marker>`, not only as
+ * the typed command. A line-based check is not enough under ConPTY: it
+ * repaints the screen with cursor moves, so cmd's next prompt can land
+ * right after the echoed text with no line break in between (CI on Windows:
+ * `echo M\r\nMD:\a\...>`). Any occurrence not right after `echo ` counts,
+ * which also ignores a repaint of the command line itself.
+ */
+function hasEchoOutput(output: string, marker: string): boolean {
+  let from = 0;
+  for (;;) {
+    const at = output.indexOf(marker, from);
+    if (at === -1) {
+      return false;
+    }
+    if (!output.slice(Math.max(0, at - 5), at).endsWith('echo ')) {
+      return true;
+    }
+    from = at + marker.length;
+  }
+}
+
+/** CSI escape sequences (colors, cursor moves), stripped from a failure's output tail so it reads as text. Built from a string so the ESC byte is not a literal control character in a regex. */
+const CSI_SEQUENCE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;?]*[A-Za-z]`, 'g');
+
+describe('profiles.list: real detection end to end over the real pipe (M4.6)', () => {
+  it(
+    'every profile the daemon actually detects on THIS machine opens a real PTY that runs a command and echoes ' +
+      'it back — the same test on Windows CI proves whatever profiles that runner has (pwsh/powershell/cmd/Git ' +
+      'Bash/WSL), and on this Linux container proves at least /bin/sh',
+    async () => {
+      const { registry, client } = await startHarness(); // default: real ProfileService, real shell detection
+      realRegistries.push(registry);
+
+      const profilesResult = await client.request<ProfilesListResult>('profiles.list', {});
+      expect(profilesResult.profiles.length).toBeGreaterThan(0);
+      // docs/milestones.md's own M4.6 acceptance for this half: at minimum,
+      // /bin/sh shows up on this Linux container.
+      if (process.platform !== 'win32') {
+        expect(profilesResult.profiles.some((p) => p.id === 'posix:/bin/sh')).toBe(true);
+      }
+
+      // Every profile is tried before failing, and a failure names the
+      // profile and shows the end of its output: CI on Windows runs this
+      // with whatever shells its runner has, and a bare timeout there does
+      // not say which one broke or why.
+      const failures: Array<{ id: string; stage: string; tail: string }> = [];
+      for (const profile of profilesResult.profiles) {
+        const createResult = await client.request<SessionCreateResult>('session.create', {
+          shell: profile.shell,
+          args: profile.args,
+          cwd: process.cwd(),
+          cols: 80,
+          rows: 24,
+        });
+        const sessionId = createResult.session.id;
+
+        let output = '';
+        const onData = (sid: SessionId, data: Uint8Array): void => {
+          if (sid === sessionId) output += Buffer.from(data).toString('utf8');
+        };
+        client.onData(onData);
+        await client.request('session.attach', { sessionId });
+
+        // `\r`, not `\n` — the Enter key a terminal sends. See
+        // service.test.ts's own M4.4 real-PTY suite (above) for why: it's
+        // the only line ending every one of these shells (ConPTY-hosted
+        // PowerShell/cmd included) agrees actually submits the line.
+        const marker = `TERMHUB-PROFILE-${profile.id}-OK`;
+        const tail = (): string => JSON.stringify(output.replace(CSI_SEQUENCE, '').slice(-600));
+        try {
+          await waitFor(() => output.length > 0, 20_000);
+        } catch {
+          failures.push({ id: profile.id, stage: 'no output at all', tail: tail() });
+          await client.request('session.kill', { sessionId });
+          continue;
+        }
+        client.sendData(sessionId, Buffer.from(`echo ${marker}\r`, 'utf8'));
+        try {
+          await waitFor(() => hasEchoOutput(output, marker), 20_000);
+        } catch {
+          failures.push({ id: profile.id, stage: 'marker never echoed', tail: tail() });
+        }
+
+        await client.request('session.kill', { sessionId });
+      }
+      expect(failures).toEqual([]);
+    },
+    // Scales with however many profiles this machine actually has (Windows
+    // CI can have 4-5: pwsh, powershell, cmd, Git Bash, maybe a WSL distro).
+    120_000,
+  );
+});
+
+/**
+ * Platform-appropriate shell for the `command` test below (M4.7) — `/bin/sh`
+ * off Windows (this container's real environment; every other real-PTY test
+ * in this file assumes pwsh/powershell exist, which only holds on Windows),
+ * `powershell.exe` on Windows (this file's other real-PTY suites' own
+ * assumption). Kept separate from this file's own `resolveShell()`
+ * (Windows-only, pwsh-preferred-over-powershell) rather than changed: that
+ * one is used by tests this task's prompt does not ask to touch.
+ */
+function resolveShellForPlatform(): string {
+  return process.platform === 'win32' ? 'powershell.exe' : '/bin/sh';
+}
+
+describe('session.create with `command` (M4.7): the daemon actually runs it, not just records it', () => {
+  it(
+    'writes `command + "\\r"` to the real PTY right after spawning the shell, and the shell ' +
+      'itself survives after the command exits — proven by running a second command down the ' +
+      'same session afterward',
+    async () => {
+      const { registry, client } = await startHarness();
+      realRegistries.push(registry);
+
+      const createResult = await client.request<SessionCreateResult>('session.create', {
+        shell: resolveShellForPlatform(),
+        cwd: process.cwd(),
+        cols: 80,
+        rows: 24,
+        command: 'echo M47-LAUNCH-OK',
+      });
+      const sessionId = createResult.session.id;
+      // `registry.create()` records `command` onto the summary too (M1.4) —
+      // the defect this test's own suite name calls out is that it used to
+      // stop there, never actually running it.
+      expect(createResult.session.command).toBe('echo M47-LAUNCH-OK');
+
+      let output = '';
+      client.onData((sid, data) => {
+        if (sid === sessionId) {
+          output += Buffer.from(data).toString('utf8');
+        }
+      });
+      // Per M1.7's client contract (see this file's other real-PTY suite,
+      // above): install the data handler before session.attach, since the
+      // snapshot's frame(s) — which, here, already include the command's
+      // own output, written before this client ever attached — arrive ahead
+      // of that RPC's response, on the same ordered stream.
+      await client.request('session.attach', { sessionId });
+
+      // Not hasStandaloneLine: under ConPTY the next prompt can land right
+      // after the echoed text with no line break (see hasEchoOutput's own
+      // doc comment, and commits 66a73e7/78a1804 for the real case that
+      // broke a line-based check like this one).
+      await waitFor(() => hasEchoOutput(output, 'M47-LAUNCH-OK'), 15_000);
+
+      // The shell survives the command exiting — never killed, exactly a
+      // normal prompt back — proven by running a second command down the
+      // very same session and seeing IT echo too.
+      client.sendData(sessionId, Buffer.from('echo M47-STILL-ALIVE\r', 'utf8'));
+      await waitFor(() => hasEchoOutput(output, 'M47-STILL-ALIVE'), 15_000);
+
+      await client.request('session.kill', { sessionId });
+    },
+    20_000,
+  );
 });

@@ -123,6 +123,16 @@ export interface SessionSummary {
   tag?: string;
   cwd: string;
   shell: string;
+  /**
+   * Extra arguments `session.create` passed to `shell` when this session was
+   * spawned (mirrors `SessionCreateParams.args`), present whenever the
+   * creator supplied any. M4.6's second half needs this on the summary so a
+   * pane split can relaunch the *same* shell profile the split pane is
+   * running — without it, splitting a WSL pane would spawn `wsl.exe` with no
+   * `-d <distro>` and land in the default distro instead of the one actually
+   * open.
+   */
+  args?: string[];
   /** Command run inside the shell instead of an interactive prompt (e.g. `claude`), if any. */
   command?: string;
   /** Epoch milliseconds. */
@@ -143,7 +153,15 @@ export interface SessionSummary {
 }
 
 // ---------------------------------------------------------------------------
-// RPC methods: session.create / resize / close / list / attach / detach
+// RPC methods: session.create / resize / close / list / attach / detach /
+// kill / restore, graveyard.list
+//
+// `session.kill`/`session.restore`/`graveyard.list` are M4.4: `session.close`
+// stopped meaning "kill immediately" and instead moves a session to the
+// daemon's graveyard (packages/daemon/src/graveyard.ts) for a TTL, mirrored
+// by `session.list` no longer listing it. `session.kill` is what a caller
+// that still means "right now" uses; `session.restore` reverses a
+// `session.close`; `graveyard.list` is the only way to see what's buried.
 //
 // Keyboard/pasted input (formerly a `session.write` RPC here) travels as a
 // binary `type: FRAME_TYPE.DATA` frame instead (`Frame` below), the same
@@ -176,13 +194,31 @@ export interface SessionResizeParams {
 }
 export type SessionResizeResult = Record<string, never>;
 
+/**
+ * M4.4: moves a session to the daemon's graveyard instead of killing it —
+ * the PTY and its headless buffer stay alive for `ttlMs`, restorable with
+ * `session.restore`. Idempotent, same as before M4.4: an unknown
+ * `sessionId` is a no-op, and closing a `sessionId` that's already buried
+ * does not change its `expiresAt` (see `packages/daemon/src/graveyard.ts`).
+ * A caller that means "kill it right now, no grace period" uses
+ * `session.kill` instead.
+ */
 export interface SessionCloseParams {
   sessionId: SessionId;
+  /**
+   * How long the session survives in the graveyard, in milliseconds.
+   * Defaults to 10 minutes when omitted. Must be an integer in
+   * `[60_000, 86_400_000]` (1 minute to 24 hours) — anything else is
+   * `invalid_params`. Ignored (not re-applied) if `sessionId` is already
+   * buried.
+   */
+  ttlMs?: number;
 }
 export type SessionCloseResult = Record<string, never>;
 
 export type SessionListParams = Record<string, never>;
 export interface SessionListResult {
+  /** Never includes a session currently in the graveyard — see `graveyard.list` for those. */
   sessions: SessionSummary[];
 }
 
@@ -210,6 +246,86 @@ export interface SessionDetachParams {
 }
 export type SessionDetachResult = Record<string, never>;
 
+/**
+ * M4.4: kills a session right now, whether it's currently live or sitting in
+ * the graveyard — the opposite of `session.close`'s "give it a grace
+ * period". Idempotent: an unknown or already-dead `sessionId` is a no-op.
+ */
+export interface SessionKillParams {
+  sessionId: SessionId;
+}
+export type SessionKillResult = Record<string, never>;
+
+/**
+ * M4.4: takes a session out of the graveyard and makes it live again — back
+ * in `session.list`, killable/closable normally, and (after a fresh
+ * `session.attach`) streaming its snapshot plus anything that arrived while
+ * buried. Fails with `session_not_found` if `sessionId` is unknown, was
+ * never buried, or its TTL already elapsed — restoring an expired session is
+ * exactly as impossible as attaching to one that was never created.
+ */
+export interface SessionRestoreParams {
+  sessionId: SessionId;
+}
+export interface SessionRestoreResult {
+  session: SessionSummary;
+}
+
+export type GraveyardListParams = Record<string, never>;
+
+/** One buried session, as `graveyard.list` reports it. */
+export interface GraveyardEntry {
+  session: SessionSummary;
+  /** Epoch milliseconds `session.close` buried this session at. */
+  closedAt: number;
+  /** Epoch milliseconds this session's PTY is killed for good, absent a `session.restore` before then. */
+  expiresAt: number;
+}
+
+/** M4.4: every session currently in the daemon's graveyard — what `session.list` deliberately omits. */
+export interface GraveyardListResult {
+  entries: GraveyardEntry[];
+}
+
+// ---------------------------------------------------------------------------
+// RPC method: profiles.list (M4.6, first half — packages/daemon/src/
+// profiles.ts)
+//
+// One entry per shell the daemon found installed on this machine (PowerShell
+// 7, Windows PowerShell 5.1, cmd, Git Bash, one per WSL distro, or — off
+// Windows — $SHELL/bash/zsh/sh), for a future `+` button menu to list and
+// `session.create` to launch (that wiring, and making profiles user-
+// configurable, is this milestone's second half — see this task's final
+// report for the exact split).
+//
+// `profiles.list` is a daemon RPC like any other, so it is part of
+// `RequestParamsByMethod`/`RequestResultByMethod` below. Reaching it from the
+// renderer is a separate step: `REQUEST_METHODS` in the app's
+// `ipc-contract.ts` does not list it yet.
+// ---------------------------------------------------------------------------
+
+/** One shell the daemon can launch a session with, as detected by `packages/daemon/src/profiles.ts`. */
+export interface ShellProfile {
+  /** Stable across daemon runs: `'pwsh'`, `'powershell'`, `'cmd'`, `'git-bash'`, `'wsl:<distro>'`, `'posix:<path>'`. */
+  id: string;
+  /** Shown in the (future) profile menu, e.g. `"PowerShell 7"`, `"Ubuntu (WSL)"`. */
+  name: string;
+  kind: 'pwsh' | 'powershell' | 'cmd' | 'git-bash' | 'wsl' | 'posix';
+  /** What a `session.create` call for this profile should pass as `shell`. */
+  shell: string;
+  /** What a `session.create` call for this profile should pass as `args`. */
+  args: string[];
+}
+
+export interface ProfilesListParams {
+  /** Forces detection to run again instead of returning the daemon's cached result. Defaults to `false`. */
+  refresh?: boolean;
+}
+
+export interface ProfilesListResult {
+  profiles: ShellProfile[];
+}
+
 /** Every request method's params type, keyed by method name — the single source of truth `RequestMethod` and the discriminated envelopes below are derived from. */
 export interface RequestParamsByMethod {
   'session.create': SessionCreateParams;
@@ -218,6 +334,10 @@ export interface RequestParamsByMethod {
   'session.list': SessionListParams;
   'session.attach': SessionAttachParams;
   'session.detach': SessionDetachParams;
+  'session.kill': SessionKillParams;
+  'session.restore': SessionRestoreParams;
+  'graveyard.list': GraveyardListParams;
+  'profiles.list': ProfilesListParams;
 }
 
 /** Every request method's success result type, keyed by method name. */
@@ -228,6 +348,10 @@ export interface RequestResultByMethod {
   'session.list': SessionListResult;
   'session.attach': SessionAttachResult;
   'session.detach': SessionDetachResult;
+  'session.kill': SessionKillResult;
+  'session.restore': SessionRestoreResult;
+  'graveyard.list': GraveyardListResult;
+  'profiles.list': ProfilesListResult;
 }
 
 export type RequestMethod = keyof RequestParamsByMethod;

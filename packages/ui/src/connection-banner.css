@@ -1,0 +1,36 @@
+/*
+ * `ConnectionBanner.tsx` visuals — docs/specs/m4.8-daemon-resilience.md
+ * section 3.3: a thin strip above the tab bar, never a full-screen
+ * takeover and never a permanent status bar (it only renders while there is
+ * something to say). Same dark-theme palette convention `sidebar.css`/
+ * `tab-bar.css`/`activity-bar.css` already use (`termhub-prototipo.html`'s
+ * own `:root` custom properties) — this task received no prototype mockup
+ * of its own (M4.8 is a resilience task, not a UI one; the banner's
+ * behavior and copy are normative from the techspec, its exact pixels are
+ * not), so this stays a small, unobtrusive strip in that same palette
+ * rather than inventing a new visual language.
+ */
+
+.th-connection-banner {
+  flex: 0 0 auto;
+  padding: 6px 16px;
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: center;
+  user-select: none;
+}
+
+.th-connection-banner--reconnecting {
+  background: #3a3a1f; /* muted amber, on the prototype's dark background */
+  color: #e0c070;
+}
+
+.th-connection-banner--blocked {
+  background: #3a1f1f; /* muted red */
+  color: #e08080;
+}
+
+.th-connection-banner--restarted {
+  background: #1f2f3a; /* muted blue */
+  color: #7ec0e0;
+}

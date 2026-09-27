@@ -149,9 +149,12 @@ async function buildPipeline(label: string): Promise<Pipeline> {
 
   // Let the 'connected' state message land before returning, exactly as a
   // real renderer would see it before issuing its first request.
-  await vi.waitFor(() => expect(bridge.getConnectionState()).toEqual({ state: 'connected' }), {
-    timeout: 2000,
-  });
+  await vi.waitFor(
+    () => expect(bridge.getConnectionState()).toEqual({ state: 'connected', epoch: 1 }),
+    {
+      timeout: 2000,
+    },
+  );
 
   return { client, server, gateway, bridge };
 }

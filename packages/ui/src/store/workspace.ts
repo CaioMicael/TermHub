@@ -14,9 +14,11 @@
 
 import type { SessionId, SessionStatus, SessionSummary } from '@termhub/shared';
 
+import { resolveSplitTarget } from '../graveyard-model.js';
 import {
   closePane as closePaneInTree,
   collectSessionIds,
+  makeLeaf,
   movePane as movePaneInTree,
   setRatio as setRatioInTree,
   splitPane as splitPaneInTree,
@@ -98,6 +100,91 @@ export function splitInWorkspace(
     root: outcome.root,
     focusedSessionId: newSessionId,
   });
+}
+
+/**
+ * Places `session` into workspace `workspaceId`'s tree — the "pôr uma
+ * sessão num workspace" action M4.5's prompt asks for, used to restore a
+ * session out of the daemon's graveyard back into the layout
+ * (`Sidebar.tsx`'s `session.restore` round trip; `graveyard-model.ts`'s
+ * `resolveRestoreWorkspaceId` is what picks `workspaceId` in the first
+ * place). Also `upsertSession`s `session`'s own metadata, in the same pass —
+ * the same "one `set`, no intermediate render with a tree leaf pointing at
+ * unknown session metadata" reasoning `App.tsx`'s boot `hydrate` call
+ * already gives.
+ *
+ * Two cases:
+ * - the workspace's tree is empty (`root: null`) — `session` becomes the
+ *   tree's sole root leaf;
+ * - otherwise, `session` splits `'row'` into whichever pane
+ *   `resolveSplitTarget` (`graveyard-model.ts`) picks — the workspace's own
+ *   focused pane, or its first leaf if the focused one no longer exists —
+ *   same `'row'` direction every other split-creation entry point in this
+ *   codebase uses (`pane-header-actions.ts`'s own `handleSplitClick` doc
+ *   comment). Imported rather than re-derived here so there is exactly one
+ *   implementation of "which pane does a lone new leaf split into", tested
+ *   once (`graveyard-model.test.ts`) — `graveyard-model.ts` has no
+ *   React/DOM/Zustand dependency of its own (its own header comment), so
+ *   importing it here doesn't pull anything heavier into `workspace.ts`'s
+ *   dependency graph than `tree.ts` already is.
+ *
+ * Either way, the restored leaf becomes focused and `workspaceId` becomes
+ * the active workspace (M4.5's prompt: "o workspace dela fica ativo e o
+ * painel dela, focado").
+ *
+ * Rejects (returns `state` unchanged) when `workspaceId` doesn't name a
+ * workspace, or `session.id` is already placed *anywhere* (armadilha 1 —
+ * same guard `splitInWorkspace` already enforces; a session mid-restore
+ * twice in a race is exactly the shape this catches).
+ */
+export function placeSessionInWorkspace(
+  state: StoreState,
+  workspaceId: string,
+  session: SessionSummary,
+  newNodeId: string,
+): StoreState {
+  const workspace = findWorkspace(state, workspaceId);
+  if (workspace === undefined) {
+    return state;
+  }
+  if (isSessionPlaced(state, session.id)) {
+    return state;
+  }
+
+  const stateWithSession: StoreState = {
+    ...state,
+    sessions: { ...state.sessions, [session.id]: session },
+  };
+
+  if (workspace.root === null) {
+    return {
+      ...replaceWorkspace(stateWithSession, workspaceId, {
+        ...workspace,
+        root: makeLeaf(session.id),
+        focusedSessionId: session.id,
+      }),
+      activeWorkspaceId: workspaceId,
+    };
+  }
+
+  const target = resolveSplitTarget(workspace.root, workspace.focusedSessionId);
+  if (target === undefined) {
+    // Unreachable: a non-null root (`tree.ts`'s own invariant) always has at
+    // least one leaf.
+    return state;
+  }
+  const outcome = splitPaneInTree(workspace.root, target, session.id, 'row', newNodeId);
+  if (!outcome.ok) {
+    return state;
+  }
+  return {
+    ...replaceWorkspace(stateWithSession, workspaceId, {
+      ...workspace,
+      root: outcome.root,
+      focusedSessionId: session.id,
+    }),
+    activeWorkspaceId: workspaceId,
+  };
 }
 
 /**

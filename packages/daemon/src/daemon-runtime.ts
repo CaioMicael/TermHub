@@ -1,3 +1,4 @@
+import type { Graveyard } from './graveyard.js';
 import { Registry } from './registry.js';
 import type { SessionFactory } from './registry.js';
 import { registerSessionService } from './service.js';
@@ -30,6 +31,15 @@ export interface RunDaemonOptions extends StartDaemonOptions {
   idleCheckIntervalMs?: number;
   /** Overrides how sessions are spawned — tests inject a fake in place of a real `node-pty`-backed `Session` (registry.ts's own `SessionFactory` pattern). Production callers leave this unset. */
   sessionFactory?: SessionFactory;
+  /**
+   * M4.4: overrides the daemon's graveyard — tests inject one built with a
+   * fake `GraveyardClock` so a buried session's TTL can be made to elapse
+   * without a real wait (see graveyard.ts's own header comment for why this
+   * needs to be an injectable *instance*, not just an `idleTimeoutMs`-style
+   * number). Production callers leave this unset; `registerSessionService`
+   * defaults to a real `Graveyard()` on its own.
+   */
+  graveyard?: Graveyard;
 }
 
 /** Everything a caller needs to operate a running daemon: its advertised connection info, the underlying pieces (mainly useful for tests), and how to shut it down cleanly. */
@@ -78,9 +88,20 @@ export interface DaemonRuntime {
 export type RunDaemonResult =
   { outcome: 'started'; runtime: DaemonRuntime } | { outcome: 'already-running' };
 
-/** Every session currently tracked whose status isn't `'exited'` — the "sessão viva" idle-shutdown must never fire while any of these exist (docs/specs/m1.8-single-instance.md section 3.4). */
-function hasLiveSessions(registry: Registry): boolean {
-  return registry.list().some((summary) => summary.status !== 'exited');
+/**
+ * Every session currently tracked whose status isn't `'exited'`, OR any
+ * session currently sitting in the graveyard — the "sessão viva"
+ * idle-shutdown must never fire while any of these exist (docs/specs/
+ * m1.8-single-instance.md section 3.4; the graveyard half is M4.4's own
+ * addition to that rule). Without the graveyard check, a daemon with zero
+ * clients and only buried sessions would shut itself down and kill exactly
+ * what the user might still want back via `session.restore` — the M4.4
+ * failure mode docs/milestones.md names explicitly.
+ */
+function hasLiveSessions(registry: Registry, service: SessionService): boolean {
+  return (
+    registry.list().some((summary) => summary.status !== 'exited') || service.hasBuriedSessions()
+  );
 }
 
 /**
@@ -117,7 +138,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<RunDaem
   }
 
   const { server, info } = started;
-  const service = registerSessionService(server, registry);
+  const service = registerSessionService(server, registry, options.graveyard);
 
   let settling: Promise<void> | undefined;
   const shutdownListeners: Array<(error?: unknown) => void> = [];
@@ -140,6 +161,11 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<RunDaem
       for (const summary of registry.list()) {
         registry.close(summary.id);
       }
+      // M4.4: the graveyard's own sessions are this process's children too
+      // — leaving them running (and their TTL timers pending) would both
+      // orphan their shells and keep a `setTimeout` alive past this
+      // process's own intended lifetime.
+      service.killAllBuried();
       await server.close();
       await removeDaemonJsonIfOwnedByPid(daemonJsonPath, info.pid);
     })();
@@ -167,7 +193,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<RunDaem
 
   const idle = startIdleShutdown({
     hasClients: () => server.connectionCount > 0,
-    hasLiveSessions: () => hasLiveSessions(registry),
+    hasLiveSessions: () => hasLiveSessions(registry, service),
     onIdleTimeout: () => {
       // Fire-and-forget from idle-shutdown's own perspective — see
       // idle-shutdown.ts: it only guarantees `onIdleTimeout` runs, not that

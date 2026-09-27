@@ -82,6 +82,8 @@ export interface XTermLike {
   hasSelection(): boolean;
   getSelection(): string;
   paste(text: string): void;
+  /** M4.8, section 2.2: clears the buffer and scrollback entirely — `reattach()`'s own doc comment on why this has to run *before* the fresh snapshot arrives. */
+  reset(): void;
   dispose(): void;
 }
 
@@ -127,6 +129,25 @@ export interface TerminalHost {
   attachWebgl(): void;
   /** No-op if not currently attached. Never disposes the xterm itself — only the WebGL addon, falling back to the DOM renderer (`terminal-webgl.ts`). */
   detachWebgl(): void;
+  /**
+   * M4.8, section 3.4 step 4: forgets the current attach and gets a
+   * brand-new one from scratch — the daemon's own fresh snapshot, never
+   * whatever this xterm already has drawn. Resets the xterm buffer *first*
+   * (section 2.2: "o host tem que zerar o xterm antes de o snapshot
+   * chegar"), so the incoming snapshot can never land on top of stale
+   * content and duplicate it.
+   *
+   * The caller (`terminal-registry.ts`'s `reattachAll`) must have already
+   * called `forgetSessionOwnership` (`terminal-session.ts`) on this host's
+   * whole bridge *before* calling this — see that function's own doc
+   * comment for why a plain detach-then-reattach on a bridge whose
+   * ownership map hasn't been forgotten would silently reuse the old,
+   * post-reconnect-meaningless ref count and never reach the daemon at all.
+   * Safe to call on a disposed host (a no-op) — the registry may have
+   * already reconciled this session out of every tree by the time
+   * `reattachAll` runs, in the same tick.
+   */
+  reattach(): void;
   /**
    * Tears down everything: the resize observer/controller, the attach (the
    * real `session.detach` may still be deferred — `terminal-session.ts`'s
@@ -228,15 +249,19 @@ export function createTerminalHost(options: TerminalHostOptions): TerminalHost {
   };
   options.element.addEventListener('contextmenu', onContextMenu as unknown as EventListener);
 
-  // Subscribed before `session.attach` — the ordering contract
-  // `terminal-session.ts`'s header comment requires.
-  const session = attachTerminalSession(options.bridge, options.sessionId, {
-    write: (data) => {
+  const sink = {
+    write: (data: Uint8Array) => {
       if (!disposed) {
         term.write(data);
       }
     },
-  });
+  };
+  // Subscribed before `session.attach` — the ordering contract
+  // `terminal-session.ts`'s header comment requires. `let`, not `const`:
+  // `reattach()` (M4.8) replaces this with a brand-new attach, and every
+  // other reference in this closure (`dispose()`) always reads the current
+  // one.
+  let session = attachTerminalSession(options.bridge, options.sessionId, sink);
   session.ready.catch((err: unknown) => {
     console.error('[terminal-host] attach failed', options.sessionId, err);
   });
@@ -321,6 +346,25 @@ export function createTerminalHost(options: TerminalHostOptions): TerminalHost {
     detachWebgl(): void {
       webglHandle?.detach();
       webglHandle = undefined;
+    },
+    reattach(): void {
+      if (disposed) {
+        return;
+      }
+      // Section 2.2: zero the xterm *before* the fresh snapshot can arrive
+      // — never write a reattach's snapshot on top of whatever this xterm
+      // already had drawn, which would duplicate the visible history.
+      term.reset();
+      // Unsubscribes the old `onData` listener and releases the old hold —
+      // safe to call even though the caller has already forgotten this
+      // bridge's whole ownership map (`session.detach()`'s own doc comment:
+      // idempotent, never throws), and this is what stops the *old*
+      // attach's listener from double-writing alongside the new one.
+      session.detach();
+      session = attachTerminalSession(options.bridge, options.sessionId, sink);
+      session.ready.catch((err: unknown) => {
+        console.error('[terminal-host] reattach failed', options.sessionId, err);
+      });
     },
     dispose(): void {
       if (disposed) {

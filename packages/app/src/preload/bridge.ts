@@ -5,6 +5,7 @@ import type {
   RequestParamsByMethod,
   RequestResultByMethod,
   SessionId,
+  WorkspacesFile,
 } from '@termhub/shared';
 
 import { IPC_CHANNEL } from '../main/ipc-contract.js';
@@ -15,6 +16,8 @@ import type {
   BridgeContextMenuMessage,
   BridgeErrorPayload,
   BridgeHelloMessage,
+  BridgeLayoutLoadMessage,
+  BridgeLayoutSaveMessage,
   BridgeRequestMessage,
   BridgeSendDataMessage,
   RelayInboundMessage,
@@ -47,6 +50,8 @@ export interface MinimalIpcRenderer {
 export interface BridgeConnectionStateSnapshot {
   state: BridgeConnectionState;
   reason?: string;
+  /** M4.8: the daemon-supervisor's generation number for this connection — present whenever `state` is `'connected'` (`ipc-contract.ts`'s `BridgeStateMessage.epoch` doc comment). The renderer's own resync logic (`daemon-resync.ts`) keys off this changing to tell "still the same connection" from "reconnected". */
+  epoch?: number;
 }
 
 /** The bridge surface `createBridge` returns — everything `window.termhub` exposes *except* `versions`, which `preload/index.ts` adds separately (it comes from `process.versions`, not from any IPC round-trip). */
@@ -81,6 +86,22 @@ export interface PreloadBridge {
   writeClipboardText(text: string): Promise<void>;
   /** M2.5, section 2.3: opens the native OS context menu ("Copiar"/"Colar") and resolves with the user's choice, or `undefined` if dismissed without one. */
   openContextMenu(hasSelection: boolean): Promise<'copy' | 'paste' | undefined>;
+  /**
+   * M4.3: reads the persisted layout (`workspaces.json`, via the main
+   * process's `StateFile`) — never the daemon. Rejects with a plain
+   * `BridgeErrorPayload` the same way `request()` does (e.g.
+   * `bridge_internal_error` if the main process has no `LayoutAccess`
+   * configured — see `bridge-gateway.ts`'s `handleLayoutLoad`).
+   */
+  loadLayout(): Promise<WorkspacesFile>;
+  /**
+   * M4.3: persists `layout`. Fire-and-forget — no response, ever
+   * (`ipc-contract.ts`'s `BridgeLayoutSaveMessage` doc comment) — so unlike
+   * every other method here, this one cannot report success or failure to
+   * its caller; `main`'s `StateFile.save` logs a refusal on an invalid
+   * value instead.
+   */
+  saveLayout(layout: unknown): void;
 }
 
 /**
@@ -155,10 +176,11 @@ export function createBridge(
         }
         return;
       case 'state':
-        currentState =
-          message.reason !== undefined
-            ? { state: message.state, reason: message.reason }
-            : { state: message.state };
+        currentState = {
+          state: message.state,
+          ...(message.reason !== undefined ? { reason: message.reason } : {}),
+          ...(message.epoch !== undefined ? { epoch: message.epoch } : {}),
+        };
         for (const listener of stateListeners) {
           listener(currentState);
         }
@@ -288,6 +310,18 @@ export function createBridge(
         };
         return message;
       }).then((result) => result.choice);
+    },
+
+    loadLayout() {
+      return sendAwaitable<WorkspacesFile>((id) => {
+        const message: BridgeLayoutLoadMessage = { kind: 'layoutLoad', id, instanceId };
+        return message;
+      });
+    },
+
+    saveLayout(layout) {
+      const message: BridgeLayoutSaveMessage = { kind: 'layoutSave', instanceId, layout };
+      ipc.send(IPC_CHANNEL.FROM_RENDERER, message);
     },
   };
 }

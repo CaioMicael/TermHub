@@ -256,7 +256,9 @@ describe('boot reattach — full pipeline (M2.6 required tests 2 and 6)', () => 
 
     // Instance 1 (the original page): attaches and receives normally.
     const bridge1 = createBridge(makeIpc(), 'instance-1');
-    await vi.waitFor(() => expect(bridge1.getConnectionState()).toEqual({ state: 'connected' }));
+    await vi.waitFor(() =>
+      expect(bridge1.getConnectionState()).toEqual({ state: 'connected', epoch: 1 }),
+    );
     let receivedByInstance1 = Buffer.alloc(0);
     bridge1.onData((sid, data) => {
       if (sid === sessionId) {
@@ -333,7 +335,7 @@ describe('boot reattach — full pipeline (M2.6 required tests 2 and 6)', () => 
     // Instance 2 went from 'connecting' straight to 'connected' via its own
     // `hello`'s answer — no separate transition in between (required test 3's
     // guarantee, reused here in the full pipeline).
-    expect(bridge2.getConnectionState()).toEqual({ state: 'connected' });
+    expect(bridge2.getConnectionState()).toEqual({ state: 'connected', epoch: 1 });
 
     reconstructed.dispose();
     groundTruth.dispose();
@@ -389,7 +391,9 @@ describe('boot reattach — full pipeline (M2.6 required tests 2 and 6)', () => 
     });
 
     const bridge: PreloadBridge = createBridge(makeIpc(), 'instance-1');
-    await vi.waitFor(() => expect(bridge.getConnectionState()).toEqual({ state: 'connected' }));
+    await vi.waitFor(() =>
+      expect(bridge.getConnectionState()).toEqual({ state: 'connected', epoch: 1 }),
+    );
 
     // The scenario terminal-session.ts's own header comment documents:
     // React.StrictMode's mount -> cleanup -> remount would, without that

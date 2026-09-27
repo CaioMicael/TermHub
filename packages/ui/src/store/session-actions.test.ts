@@ -3,6 +3,7 @@ import type { SessionSummary } from '@termhub/shared';
 
 import { makeLeaf } from './tree.js';
 import {
+  buryClosedSession,
   closePaneAction,
   createWorkspaceWithNewSession,
   estimateSplitSize,
@@ -118,6 +119,41 @@ describe('splitPaneWithNewSession', () => {
     expect(store.calls.upsertSession.length).toBe(1);
   });
 
+  // M4.6's second half, and this task's own named pitfall: without this
+  // test, a version of `splitPaneWithNewSession` that still hardcodes
+  // `NEW_SESSION_SHELL` would pass every other test in this file (they all
+  // use `session()`'s default shell, `'powershell.exe'`, which happens to
+  // equal `NEW_SESSION_SHELL`) for the wrong reason. A profile with real
+  // `args` (a WSL distro) is what actually proves reuse instead of
+  // coincidence.
+  it("reuses the target session's own shell and args, not a fixed shell (M4.6)", async () => {
+    const store = createFakeStore({
+      workspaces: [workspace()],
+      activeWorkspaceId: 'ws1',
+      sessions: {
+        1: session({ id: 1, shell: 'wsl.exe', args: ['-d', 'Ubuntu'], cols: 80, rows: 30 }),
+      },
+    });
+    const created = session({ id: 2, shell: 'wsl.exe', args: ['-d', 'Ubuntu'] });
+    const request = vi.fn().mockResolvedValue({ session: created });
+    const bridge: SessionActionsBridge = { request };
+
+    await splitPaneWithNewSession(store, bridge, {
+      workspaceId: 'ws1',
+      targetSessionId: 1,
+      dir: 'row',
+      newNodeId: 'n1',
+    });
+
+    expect(request).toHaveBeenCalledWith('session.create', {
+      shell: 'wsl.exe',
+      args: ['-d', 'Ubuntu'],
+      cwd: 'C:\\projects\\termhub',
+      cols: 40,
+      rows: 30,
+    });
+  });
+
   it('falls back to an 80x24 size hint when the target session metadata is not in the store yet', async () => {
     const store = createFakeStore({
       workspaces: [workspace()],
@@ -179,11 +215,14 @@ describe('createWorkspaceWithNewSession', () => {
         name: 'novo',
         cwd: 'C:\\dev\\x',
         size: { cols: 100, rows: 30 },
+        shell: 'pwsh.exe',
+        args: [],
       },
     );
 
     expect(request).toHaveBeenCalledWith('session.create', {
-      shell: NEW_SESSION_SHELL,
+      shell: 'pwsh.exe',
+      args: [],
       cwd: 'C:\\dev\\x',
       cols: 100,
       rows: 30,
@@ -210,5 +249,24 @@ describe('closePaneAction', () => {
     });
     closePaneAction(store, 'ws1', 1);
     expect(store.calls.closePane).toEqual([['ws1', 1]]);
+  });
+});
+
+describe('buryClosedSession', () => {
+  it('calls session.close with no ttlMs (the daemon default)', () => {
+    const request = vi.fn().mockResolvedValue({});
+    buryClosedSession({ request }, 7);
+    expect(request).toHaveBeenCalledWith('session.close', { sessionId: 7 });
+  });
+
+  it('never throws or leaves a rejection unhandled when the daemon call fails', async () => {
+    const request = vi.fn().mockRejectedValue(new Error('daemon unreachable'));
+    const errors: unknown[] = [];
+    expect(() => {
+      buryClosedSession({ request }, 7, (err) => errors.push(err));
+    }).not.toThrow();
+    await vi.waitFor(() => {
+      expect(errors).toHaveLength(1);
+    });
   });
 });

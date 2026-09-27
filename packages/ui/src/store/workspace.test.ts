@@ -1,13 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import type { SessionSummary } from '@termhub/shared';
 
-import { makeLeaf, type PaneNode } from './tree.js';
+import { collectSessionIds, makeLeaf, treeFromSessions, type PaneNode } from './tree.js';
 import {
   addWorkspace,
   closePaneInWorkspace,
   closeWorkspace,
   focusPane,
   movePaneInWorkspace,
+  placeSessionInWorkspace,
   removeSession,
   renameWorkspace,
   reorderWorkspaces,
@@ -264,6 +265,67 @@ describe('workspace CRUD', () => {
     const s = state();
     const next = renameWorkspace(s, 'ws1', 'novo nome');
     expect(next.workspaces[0]?.name).toBe('novo nome');
+  });
+});
+
+describe('placeSessionInWorkspace', () => {
+  // M4.5: the restore half of "fechar enterra, Ctrl+Shift+T traz de volta".
+
+  it("becomes the tree root leaf when the workspace is empty (root: null) — armadilha named in this task's prompt", () => {
+    const s = state({
+      workspaces: [workspace({ root: null, focusedSessionId: undefined })],
+      activeWorkspaceId: 'ws2', // some other workspace is active beforehand
+      sessions: {},
+    });
+    const restored = session({ id: 42, name: 'claude' });
+    const next = placeSessionInWorkspace(s, 'ws1', restored, 'n1');
+    expect(next.workspaces[0]?.root).toEqual(makeLeaf(42));
+    expect(next.workspaces[0]?.focusedSessionId).toBe(42);
+    expect(next.sessions[42]).toEqual(restored);
+    // Restoring makes its own workspace active and its own pane focused.
+    expect(next.activeWorkspaceId).toBe('ws1');
+  });
+
+  it('splits into the focused pane when the workspace already has panes', () => {
+    const s = state({
+      workspaces: [workspace({ root: makeLeaf(1), focusedSessionId: 1 })],
+      activeWorkspaceId: 'ws2',
+      sessions: { 1: session({ id: 1 }) },
+    });
+    const restored = session({ id: 42 });
+    const next = placeSessionInWorkspace(s, 'ws1', restored, 'n1');
+    expect(next.workspaces[0]?.root).toEqual({
+      kind: 'split',
+      id: 'n1',
+      dir: 'row',
+      ratio: 0.5,
+      a: makeLeaf(1),
+      b: makeLeaf(42),
+    });
+    expect(next.workspaces[0]?.focusedSessionId).toBe(42);
+    expect(next.activeWorkspaceId).toBe('ws1');
+  });
+
+  it('falls back to the first leaf when the recorded focused pane is stale', () => {
+    const s = state({
+      workspaces: [workspace({ root: treeFromSessions([1, 2, 3], 'b'), focusedSessionId: 999 })],
+    });
+    const next = placeSessionInWorkspace(s, 'ws1', session({ id: 42 }), 'n1');
+    const ids = collectSessionIds(next.workspaces[0]?.root ?? null);
+    expect(ids.has(1)).toBe(true); // the tree's first leaf (treeLeaves order)
+    expect(ids.has(42)).toBe(true);
+    expect(next.workspaces[0]?.focusedSessionId).toBe(42);
+  });
+
+  it('rejects a session already placed anywhere (armadilha 1)', () => {
+    const s = state({ workspaces: [workspace({ root: makeLeaf(1), focusedSessionId: 1 })] });
+    const next = placeSessionInWorkspace(s, 'ws1', session({ id: 1 }), 'n1');
+    expect(next).toBe(s);
+  });
+
+  it('rejects an unknown workspace', () => {
+    const s = state();
+    expect(placeSessionInWorkspace(s, 'nope', session({ id: 42 }), 'n1')).toBe(s);
   });
 });
 

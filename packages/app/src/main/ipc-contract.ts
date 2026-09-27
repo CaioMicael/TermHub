@@ -166,13 +166,53 @@ export interface BridgeContextMenuMessage {
   hasSelection: boolean;
 }
 
+/**
+ * Renderer -> main (M4.3): reads the persisted layout (`workspaces.json`,
+ * via the main process's `StateFile<WorkspacesFile>` — docs/specs/
+ * m4.1-atomic-state.md). Answered with a `BridgeResponseMessage` whose
+ * `result` is a `WorkspacesFile`, the same request/response mechanism as
+ * `BridgeClipboardReadMessage` (routed through `requestOwners`/
+ * `sendFiltered` so a stale instance's late response is dropped the same
+ * way). Never touches the daemon — `BridgeGateway`'s own `options.layout`
+ * reads straight from the `StateFile` `main/index.ts` already opened at
+ * boot (M4.1), independent of `state`/`relay`.
+ */
+export interface BridgeLayoutLoadMessage {
+  kind: 'layoutLoad';
+  id: string;
+  instanceId?: string;
+}
+
+/**
+ * Renderer -> main (M4.3): persists `layout` to `workspaces.json`.
+ * Deliberately **no response** — see this task's final report for why this
+ * is *not* modeled on `BridgeClipboardWriteMessage` (which, despite this
+ * file's original header comment analogy, does answer with `result: {}`):
+ * `layoutSave` fires on every store change once the renderer starts saving
+ * (this task's prompt, section 2), and a caller that never reads the
+ * response has no use for one — same shape/reasoning as
+ * `BridgeSendDataMessage`, just for the layout instead of PTY input.
+ * `layout` is untrusted, renderer-supplied `unknown`: `BridgeGateway`
+ * forwards it to `StateFile.save`, which validates against
+ * `WorkspacesFileSchema` before ever writing anything — an invalid value is
+ * refused and logged, never persisted (docs/specs/m4.1-atomic-state.md
+ * section 3.6).
+ */
+export interface BridgeLayoutSaveMessage {
+  kind: 'layoutSave';
+  instanceId?: string;
+  layout: unknown;
+}
+
 export type RelayInboundMessage =
   | BridgeHelloMessage
   | BridgeRequestMessage
   | BridgeSendDataMessage
   | BridgeClipboardReadMessage
   | BridgeClipboardWriteMessage
-  | BridgeContextMenuMessage;
+  | BridgeContextMenuMessage
+  | BridgeLayoutLoadMessage
+  | BridgeLayoutSaveMessage;
 
 /** Main -> renderer: the reply to one `BridgeRequestMessage`. */
 export interface BridgeResponseMessage {
@@ -206,11 +246,12 @@ export interface BridgeEventMessage {
 export type BridgeConnectionState =
   'connecting' | 'connected' | 'blocked' | 'failed' | 'disconnected';
 
-/** Main -> renderer: a connection-state transition. `reason` is a human-readable string (e.g. `daemon-client.ts`'s `'blocked'` reason, or a `'failed'` outcome's last error message) — never a structured code; nothing here has parsed it as one anywhere in this bridge. */
+/** Main -> renderer: a connection-state transition. `reason` is a human-readable string (e.g. `daemon-client.ts`'s `'blocked'` reason, or a `'failed'` outcome's last error message) — never a structured code; nothing here has parsed it as one anywhere in this bridge. `epoch` (docs/specs/m4.8-daemon-resilience.md section 3.2) is present whenever `state` is `'connected'`: the daemon-supervisor's generation number for *this* connection, so the renderer can tell "still the same connection" from "reconnected, possibly to a different daemon lifetime" without inspecting anything else. */
 export interface BridgeStateMessage {
   kind: 'state';
   state: BridgeConnectionState;
   reason?: string;
+  epoch?: number;
 }
 
 export type RelayOutboundMessage =
@@ -238,4 +279,12 @@ export const REQUEST_METHODS: readonly RequestMethod[] = [
   'session.list',
   'session.attach',
   'session.detach',
+  // M4.4: the graveyard RPCs, added for M4.5 (the graveyard UI) to call —
+  // this task only extends the allowlist, it does not build anything that
+  // calls these yet.
+  'session.kill',
+  'session.restore',
+  'graveyard.list',
+  // M4.6: the shell profiles the daemon detected, for the new-session menu.
+  'profiles.list',
 ];

@@ -1,6 +1,22 @@
 export { TabBar } from './TabBar.js';
 export type { TabBarProps } from './TabBar.js';
 
+export { ActivityBar } from './ActivityBar.js';
+export type { ActivityBarProps, SidebarView } from './ActivityBar.js';
+
+export { Sidebar } from './Sidebar.js';
+export type { SidebarProps } from './Sidebar.js';
+
+export { ConnectionBanner } from './ConnectionBanner.js';
+export type { ConnectionBannerKind, ConnectionBannerProps } from './ConnectionBanner.js';
+
+export {
+  activeFocusedTarget,
+  buildSidebarGroups,
+  totalPlacedSessionCount,
+} from './sidebar-model.js';
+export type { SidebarGroup, SidebarRow } from './sidebar-model.js';
+
 export {
   canCloseWorkspace,
   closeWorkspaceTab,
@@ -53,6 +69,7 @@ export {
   attachTerminalSession,
   encodeTerminalBinaryInput,
   encodeTerminalTextInput,
+  forgetSessionOwnership,
 } from './terminal-session.js';
 export type {
   AttachedTerminalSession,
@@ -134,6 +151,7 @@ export {
   closeWorkspace,
   focusPane,
   movePaneInWorkspace,
+  placeSessionInWorkspace,
   removeSession,
   renameWorkspace,
   reorderWorkspaces,
@@ -154,7 +172,20 @@ export {
 export { initialStoreState, useTermhubStore } from './store/store.js';
 export type { TermhubStore, TermhubStoreActions } from './store/store.js';
 
+// ─── M4.3: pure store <-> WorkspacesFile projection/reconciliation ────────
+
 export {
+  applyRelaunchedSession,
+  reconcileLayout,
+  toPersistedLayout,
+  RECOVERED_WORKSPACE_CWD_FALLBACK,
+  RECOVERED_WORKSPACE_ID,
+  RECOVERED_WORKSPACE_NAME,
+} from './layout-persistence.js';
+export type { PendingRelaunch, ReconcileOutcome, ReconcileRestored } from './layout-persistence.js';
+
+export {
+  buryClosedSession,
   closePaneAction,
   createWorkspaceWithNewSession,
   estimateSplitSize,
@@ -169,3 +200,40 @@ export type {
   SessionActionsStoreApi,
   Size,
 } from './store/session-actions.js';
+
+// ─── M4.5: the graveyard ("Fechados recentemente") pure model, and the
+// terminal-clipboard shortcut it shares with `Ctrl+Shift+T` ──────────────
+
+export {
+  buildGraveyardRows,
+  collectSessionLocations,
+  formatAliveRemaining,
+  formatClosedAgo,
+  mostRecentlyClosedSessionId,
+  resolveRestoreWorkspaceId,
+  resolveSplitTarget,
+  sessionsJustUnplaced,
+  sessionsToBury,
+  sortGraveyardEntries,
+} from './graveyard-model.js';
+export type { GraveyardRow, JustUnplacedSession, SessionOrigin } from './graveyard-model.js';
+
+// ─── M4.7: workspace launch specs and templates ("Workspaces" sidebar view) ─
+
+export {
+  buildAutoGridTree,
+  nextTemplateId,
+  nextTemplateName,
+  templateFromWorkspace,
+} from './workspace-templates.js';
+
+export {
+  openWorkspaceFromTemplate,
+  saveCurrentWorkspaceAsTemplate,
+} from './workspace-templates-actions.js';
+
+export { removeTemplate, upsertTemplate, useTemplatesStore } from './store/templates.js';
+export type { TemplatesActions, TemplatesState, TemplatesStore } from './store/templates.js';
+
+export { WorkspacesView } from './WorkspacesView.js';
+export type { WorkspacesViewProps } from './WorkspacesView.js';

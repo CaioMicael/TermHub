@@ -76,6 +76,8 @@ interface FakeHostRecord {
   attachWebglCalls: number;
   detachWebglCalls: number;
   isOpen: boolean;
+  /** M4.8: how many times `reattach()` was called on this host. */
+  reattachCalls: number;
 }
 
 /**
@@ -102,6 +104,7 @@ function createFakeHostFactory(startsOpen: boolean = true): {
       attachWebglCalls: 0,
       detachWebglCalls: 0,
       isOpen: startsOpen,
+      reattachCalls: 0,
     };
     records.set(options.sessionId, record);
     options.bridge.request('session.attach', { sessionId: options.sessionId }).catch(() => {});
@@ -121,6 +124,10 @@ function createFakeHostFactory(startsOpen: boolean = true): {
       detachWebgl(): void {
         record.detachWebglCalls += 1;
         record.usingWebgl = false;
+      },
+      reattach(): void {
+        record.reattachCalls += 1;
+        options.bridge.request('session.attach', { sessionId: options.sessionId }).catch(() => {});
       },
       dispose(): void {
         if (record.disposed) {
@@ -540,6 +547,84 @@ describe('terminal-registry — test 4: dispose only when a session leaves every
     expect(records.get(2)?.disposed).toBe(false);
     expect(attachCountFor(calls, 1)).toBe(1);
     expect(attachCountFor(calls, 2)).toBe(1);
+    registry.dispose();
+  });
+});
+
+describe('terminal-registry — reattachAll() (M4.8, docs/specs/m4.8-daemon-resilience.md section 3.4 step 4)', () => {
+  it('calls reattach() on every currently-held host, exactly once each', () => {
+    const { bridge } = createFakeBridge();
+    const { dom } = createFakeDom();
+    const { createHost, records } = createFakeHostFactory();
+
+    useTermhubStore.getState().hydrate({
+      ...initialStoreState,
+      workspaces: [
+        {
+          id: 'ws1',
+          name: 'ws1',
+          cwd: 'C:\\',
+          root: {
+            kind: 'split',
+            id: 'split-1',
+            dir: 'row',
+            ratio: 0.5,
+            a: { kind: 'leaf', sessionId: 1 },
+            b: { kind: 'leaf', sessionId: 2 },
+          },
+          focusedSessionId: 1,
+          maximizedSessionId: undefined,
+        },
+      ],
+      activeWorkspaceId: 'ws1',
+      sessions: { 1: makeSession(1), 2: makeSession(2) },
+    });
+
+    const registry = createTerminalRegistry({ bridge, store: useTermhubStore, dom, createHost });
+    registry.place(1, makeSlot());
+    registry.place(2, makeSlot());
+
+    registry.reattachAll();
+
+    expect(records.get(1)?.reattachCalls).toBe(1);
+    expect(records.get(2)?.reattachCalls).toBe(1);
+
+    registry.reattachAll();
+    expect(records.get(1)?.reattachCalls).toBe(2);
+    expect(records.get(2)?.reattachCalls).toBe(2);
+
+    registry.dispose();
+  });
+
+  it('never calls reattach() on a host that has already been disposed (left every tree)', () => {
+    const { bridge } = createFakeBridge();
+    const { dom } = createFakeDom();
+    const { createHost, records } = createFakeHostFactory();
+
+    useTermhubStore.getState().hydrate({
+      ...initialStoreState,
+      workspaces: [
+        {
+          id: 'ws1',
+          name: 'ws1',
+          cwd: 'C:\\',
+          root: { kind: 'leaf', sessionId: 1 },
+          focusedSessionId: 1,
+          maximizedSessionId: undefined,
+        },
+      ],
+      activeWorkspaceId: 'ws1',
+      sessions: { 1: makeSession(1) },
+    });
+
+    const registry = createTerminalRegistry({ bridge, store: useTermhubStore, dom, createHost });
+    registry.place(1, makeSlot());
+    useTermhubStore.getState().closePane('ws1', 1);
+    expect(records.get(1)?.disposed).toBe(true);
+
+    expect(() => registry.reattachAll()).not.toThrow();
+    expect(records.get(1)?.reattachCalls).toBe(0);
+
     registry.dispose();
   });
 });

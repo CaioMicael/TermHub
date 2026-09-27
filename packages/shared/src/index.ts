@@ -3,3 +3,6 @@
 export const PROTOCOL_VERSION = 1;
 
 export * from './protocol.js';
+
+// Schemas for the app's state files, config.json and workspaces.json (M4.1).
+export * from './config-schema.js';

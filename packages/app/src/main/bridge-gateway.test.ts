@@ -2,15 +2,21 @@ import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 
 import { PROTOCOL_ERROR_CODE, ProtocolError } from '@termhub/shared';
-import type { SessionAttachResult, SessionId } from '@termhub/shared';
+import type { SessionAttachResult, SessionId, WorkspacesFile } from '@termhub/shared';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { resolvePipeAddress } from '@termhub/daemon/src/transport-address.js';
 import { TransportClient } from '@termhub/daemon/src/transport-client.js';
 import { TransportServer } from '@termhub/daemon/src/transport-server.js';
 
-import { BridgeGateway, wireWebContentsLifecycle } from './bridge-gateway.js';
+import {
+  BridgeGateway,
+  createDaemonReconnectSource,
+  wireWebContentsLifecycle,
+} from './bridge-gateway.js';
+import type { DaemonReconnectSource, DaemonReconnectState } from './bridge-gateway.js';
 import type { DaemonConnection, DaemonInfo } from './daemon-client.js';
+import type { DaemonSupervisor, DaemonSupervisorState } from './daemon-supervisor.js';
 import type { RelayOutboundMessage } from './ipc-contract.js';
 import { SessionAttachments } from './session-attachments.js';
 
@@ -94,7 +100,7 @@ describe('BridgeGateway', () => {
 
     expect(messages).toEqual([
       { kind: 'state', state: 'connecting' },
-      { kind: 'state', state: 'connected' },
+      { kind: 'state', state: 'connected', epoch: 1 },
     ]);
   });
 
@@ -225,7 +231,7 @@ describe('BridgeGateway', () => {
     cleanup.push(() => gateway.dispose());
 
     await flushMicrotasks();
-    expect(messages).toContainEqual({ kind: 'state', state: 'connected' });
+    expect(messages).toContainEqual({ kind: 'state', state: 'connected', epoch: 1 });
 
     // Simulates the daemon connection dropping out from under an already-
     // 'connected' bridge (a real client-side close, not a server-initiated
@@ -362,14 +368,14 @@ describe('BridgeGateway — M2.6 renderer instances', () => {
     messages.length = 0;
 
     gateway.handleRendererMessage({ kind: 'hello', instanceId: 'instance-1' });
-    expect(messages).toEqual([{ kind: 'state', state: 'connected' }]);
+    expect(messages).toEqual([{ kind: 'state', state: 'connected', epoch: 1 }]);
 
     // A second `hello` (the reload) also gets 'connected' — the connection
     // itself never changed, so there is no separate transition to observe
     // in between; the *answer* to hello is what carries the state.
     messages.length = 0;
     gateway.handleRendererMessage({ kind: 'hello', instanceId: 'instance-2' });
-    expect(messages).toEqual([{ kind: 'state', state: 'connected' }]);
+    expect(messages).toEqual([{ kind: 'state', state: 'connected', epoch: 1 }]);
   });
 
   it("required test 4: a stale response from instance 1 never resolves instance 2's request sharing the same numbered id (docs/specs/m2.6-boot-reattach.md section 2.5)", async () => {
@@ -699,7 +705,10 @@ describe('BridgeGateway — M2.5 clipboard/context menu', () => {
     expect(messages.filter((m) => m.kind === 'response')).toHaveLength(0);
   });
 
-  it('REQUEST_METHODS is untouched by M2.5 — clipboard/menu are not daemon methods', async () => {
+  // Pinned on purpose: every change to what the renderer may reach in the
+  // daemon has to show up here. M2.5 kept clipboard/menu out of it; M4.4
+  // added the three graveyard methods, M4.6 the shell profiles.
+  it('REQUEST_METHODS is exactly the daemon methods the renderer may call — clipboard/menu are not daemon methods', async () => {
     const { REQUEST_METHODS } = await import('./ipc-contract.js');
     expect(REQUEST_METHODS).toEqual([
       'session.create',
@@ -708,6 +717,316 @@ describe('BridgeGateway — M2.5 clipboard/context menu', () => {
       'session.list',
       'session.attach',
       'session.detach',
+      'session.kill',
+      'session.restore',
+      'graveyard.list',
+      'profiles.list',
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M4.3: layoutLoad/layoutSave — never touches the daemon at all, backed by
+// `options.layout` (a `LayoutAccess` fake here, the real `StateFile<
+// WorkspacesFile>` in `main/index.ts`).
+// ---------------------------------------------------------------------------
+
+function sampleLayoutFile(): WorkspacesFile {
+  return {
+    version: 1,
+    activeWorkspaceId: 'ws',
+    workspaces: [
+      {
+        id: 'ws',
+        name: 'default',
+        cwd: 'C:\\w',
+        root: { kind: 'leaf', sessionId: 1, sessionCreatedAt: 100 },
+      },
+    ],
+  };
+}
+
+describe('BridgeGateway — M4.3 layout persistence', () => {
+  it('layoutLoad resolves with the current layout, and layoutSave forwards to LayoutAccess.save — neither ever touches the daemon connection (still "connecting")', async () => {
+    const { promise } = deferred<DaemonConnection>(); // never resolves
+    const { sink, messages } = collectOutbound();
+    const saved: unknown[] = [];
+    const gateway = new BridgeGateway({
+      sendToRenderer: sink,
+      connectionPromise: promise,
+      layout: Promise.resolve({
+        load: () => Promise.resolve(sampleLayoutFile()),
+        save: (value: unknown) => {
+          saved.push(value);
+          return true;
+        },
+      }),
+    });
+    cleanup.push(() => gateway.dispose());
+    await flushMicrotasks(); // let the `layout` promise resolve into `layoutAccess`
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'inst-1' });
+    messages.length = 0;
+
+    gateway.handleRendererMessage({ kind: 'layoutLoad', id: 'l1', instanceId: 'inst-1' });
+    await flushMicrotasks();
+    expect(messages).toEqual([
+      { kind: 'response', id: 'l1', outcome: { ok: true, result: sampleLayoutFile() } },
+    ]);
+    messages.length = 0;
+
+    const toSave: WorkspacesFile = { ...sampleLayoutFile(), activeWorkspaceId: undefined };
+    gateway.handleRendererMessage({ kind: 'layoutSave', instanceId: 'inst-1', layout: toSave });
+    await flushMicrotasks();
+    expect(saved).toEqual([toSave]);
+    // layoutSave never answers, whether it succeeds or not.
+    expect(messages).toEqual([]);
+  });
+
+  it('layoutLoad without a configured LayoutAccess fails closed with bridge_internal_error', async () => {
+    const { promise } = deferred<DaemonConnection>();
+    const { sink, messages } = collectOutbound();
+    const gateway = new BridgeGateway({ sendToRenderer: sink, connectionPromise: promise });
+    cleanup.push(() => gateway.dispose());
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'inst-1' });
+    messages.length = 0;
+
+    gateway.handleRendererMessage({ kind: 'layoutLoad', id: 'l1', instanceId: 'inst-1' });
+    await flushMicrotasks();
+    expect(messages).toEqual([
+      {
+        kind: 'response',
+        id: 'l1',
+        outcome: {
+          ok: false,
+          error: {
+            code: 'bridge_internal_error',
+            message: 'layout storage is not available in this environment',
+          },
+        },
+      },
+    ]);
+  });
+
+  it('layoutSave without a configured LayoutAccess is dropped silently — no crash, no response', () => {
+    const { promise } = deferred<DaemonConnection>();
+    const { sink, messages } = collectOutbound();
+    const gateway = new BridgeGateway({ sendToRenderer: sink, connectionPromise: promise });
+    cleanup.push(() => gateway.dispose());
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'inst-1' });
+    messages.length = 0;
+
+    gateway.handleRendererMessage({
+      kind: 'layoutSave',
+      instanceId: 'inst-1',
+      layout: sampleLayoutFile(),
+    });
+    expect(messages).toEqual([]);
+  });
+
+  it('rejects (refuses to save) an invalid layout without writing it — LayoutAccess.save itself is the trust boundary', async () => {
+    const { promise } = deferred<DaemonConnection>();
+    const { sink } = collectOutbound();
+    const saved: unknown[] = [];
+    const gateway = new BridgeGateway({
+      sendToRenderer: sink,
+      connectionPromise: promise,
+      layout: Promise.resolve({
+        load: () => Promise.resolve(sampleLayoutFile()),
+        // Mirrors the real `StateFile.save`'s contract: invalid input (e.g.
+        // a ratio of 5 — schema-invalid) is refused and never recorded.
+        save: (value: unknown) => {
+          const isValidRatio =
+            typeof value === 'object' &&
+            value !== null &&
+            'workspaces' in value &&
+            Array.isArray(value.workspaces);
+          if (!isValidRatio) {
+            return false;
+          }
+          saved.push(value);
+          return true;
+        },
+      }),
+    });
+    cleanup.push(() => gateway.dispose());
+    await flushMicrotasks();
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'inst-1' });
+
+    gateway.handleRendererMessage({
+      kind: 'layoutSave',
+      instanceId: 'inst-1',
+      layout: { ratio: 5 }, // structurally invalid — no `workspaces` array at all
+    });
+    await flushMicrotasks();
+    expect(saved).toEqual([]);
+  });
+
+  it('a layoutLoad from a superseded instance never delivers its response to the new one', async () => {
+    const { promise } = deferred<DaemonConnection>();
+    const { sink, messages } = collectOutbound();
+    let resolveLoad!: (file: WorkspacesFile) => void;
+    const gateway = new BridgeGateway({
+      sendToRenderer: sink,
+      connectionPromise: promise,
+      layout: Promise.resolve({
+        load: () =>
+          new Promise((resolve) => {
+            resolveLoad = resolve;
+          }),
+        save: () => true,
+      }),
+    });
+    cleanup.push(() => gateway.dispose());
+    await flushMicrotasks();
+
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'instance-1' });
+    gateway.handleRendererMessage({ kind: 'layoutLoad', id: 'l1', instanceId: 'instance-1' });
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'instance-2' }); // reload, mid-flight
+    messages.length = 0;
+
+    resolveLoad(sampleLayoutFile());
+    await flushMicrotasks();
+    expect(messages.filter((m) => m.kind === 'response')).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M4.8, required test 5 (docs/specs/m4.8-daemon-resilience.md section 4): a
+// drop and a reconnect, via `options.reconnect` — the old relay discarded,
+// the new one delivering data, the state message carrying the epoch, and an
+// in-flight request at the moment of the drop rejected rather than hanging.
+// ---------------------------------------------------------------------------
+
+describe('BridgeGateway — M4.8 reconnect (options.reconnect)', () => {
+  it('a drop and a reconnect: the old relay is discarded, the new one delivers data, the state message carries the new epoch, and an in-flight request at the drop receives an error', async () => {
+    const { server: server1, client: client1 } = await startServerAndClient('reconnect-1');
+    const { server: server2, client: client2 } = await startServerAndClient('reconnect-2');
+    // `startServerAndClient` already registers a `session.list` handler that
+    // resolves immediately; this test needs one that never resolves on its
+    // own, so its in-flight request is only ever settled by the drop's own
+    // rejection, never by a race with the real handler.
+    server1.registerMethod('session.resize', () => new Promise(() => {}));
+
+    const { sink, messages } = collectOutbound();
+    const listeners = new Set<(next: DaemonReconnectState) => void>();
+    const reconnect: DaemonReconnectSource = {
+      onChange: (listener) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    };
+    const emit = (state: DaemonSupervisorState): void => {
+      for (const listener of listeners) {
+        listener({ supervisorState: state, sessionAttachments: undefined });
+      }
+    };
+
+    const gateway = new BridgeGateway({
+      sendToRenderer: sink,
+      connectionPromise: Promise.resolve<DaemonConnection>({
+        outcome: 'connected',
+        client: client1,
+        info: fakeInfo(),
+      }),
+      reconnect,
+    });
+    cleanup.push(() => gateway.dispose());
+    await flushMicrotasks();
+    expect(messages).toContainEqual({ kind: 'state', state: 'connected', epoch: 1 });
+
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'instance-1' });
+    messages.length = 0;
+
+    // An in-flight request at the moment of the drop.
+    gateway.handleRendererMessage({
+      kind: 'request',
+      id: 'req-1',
+      instanceId: 'instance-1',
+      method: 'session.resize',
+      params: { sessionId: 1, cols: 80, rows: 24 },
+    });
+    messages.length = 0;
+
+    await client1.close();
+    await flushMicrotasks();
+    // The in-flight request receives an error response, never hangs.
+    const errorResponse = messages.find((m) => m.kind === 'response' && m.id === 'req-1');
+    expect(errorResponse).toMatchObject({ kind: 'response', outcome: { ok: false } });
+
+    messages.length = 0;
+    emit({ state: 'disconnected' });
+    expect(messages).toContainEqual({ kind: 'state', state: 'disconnected' });
+
+    messages.length = 0;
+    emit({ state: 'connected', epoch: 2, client: client2, info: fakeInfo() });
+    expect(messages).toContainEqual({ kind: 'state', state: 'connected', epoch: 2 });
+
+    // The new connection actually delivers data through this gateway.
+    gateway.handleRendererMessage({ kind: 'hello', instanceId: 'instance-1' });
+    messages.length = 0;
+    server2.broadcastData(7, new Uint8Array([1, 2, 3]));
+    await vi.waitFor(() =>
+      expect(messages.some((m) => m.kind === 'data' && m.sessionId === 7)).toBe(true),
+    );
+
+    // The *old* connection's server, meanwhile, has nothing left listening
+    // for it on the gateway side — the old relay was discarded, so pushing
+    // more data through it (were it even still connected) could never reach
+    // this gateway's renderer.
+    messages.length = 0;
+    server1.broadcastData(9, new Uint8Array([9]));
+    await flushMicrotasks();
+    expect(messages.some((m) => m.kind === 'data' && m.sessionId === 9)).toBe(false);
+  });
+});
+
+describe('createDaemonReconnectSource', () => {
+  it('builds one SessionAttachments per epoch, memoized, and drops it once the connection stops being connected', () => {
+    const seenStates: DaemonSupervisorState[] = [];
+    const listeners = new Set<(state: DaemonSupervisorState) => void>();
+    const supervisor: Pick<DaemonSupervisor, 'onChange'> = {
+      onChange: (listener) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    };
+    const emit = (state: DaemonSupervisorState): void => {
+      for (const listener of listeners) listener(state);
+    };
+
+    const source = createDaemonReconnectSource(supervisor);
+    const received: DaemonReconnectState[] = [];
+    source.onChange((next) => {
+      received.push(next);
+      seenStates.push(next.supervisorState);
+    });
+
+    const client1 = { onClose: () => ({ dispose: () => {} }) } as unknown as TransportClient;
+    const client2 = { onClose: () => ({ dispose: () => {} }) } as unknown as TransportClient;
+
+    emit({ state: 'connected', epoch: 1, client: client1, info: fakeInfo() });
+    const book1 = received[0]?.sessionAttachments;
+    expect(book1).toBeInstanceOf(SessionAttachments);
+
+    // Same epoch observed again (defensive — the supervisor never actually
+    // re-emits the same epoch twice, but this proves the cache is keyed by
+    // epoch, not rebuilt unconditionally): the same instance comes back.
+    emit({ state: 'connected', epoch: 1, client: client1, info: fakeInfo() });
+    expect(received[1]?.sessionAttachments).toBe(book1);
+
+    emit({ state: 'disconnected' });
+    expect(received[2]?.sessionAttachments).toBeUndefined();
+
+    emit({ state: 'connected', epoch: 2, client: client2, info: fakeInfo() });
+    const book2 = received[3]?.sessionAttachments;
+    expect(book2).toBeInstanceOf(SessionAttachments);
+    expect(book2).not.toBe(book1);
+
+    expect(seenStates.map((s) => s.state)).toEqual([
+      'connected',
+      'connected',
+      'disconnected',
+      'connected',
     ]);
   });
 });

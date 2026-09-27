@@ -1,13 +1,21 @@
 import { join } from 'node:path';
 import { app, BrowserWindow, clipboard, ipcMain, Menu } from 'electron';
 import type { IpcMainEvent } from 'electron';
+import type { WorkspacesFile } from '@termhub/shared';
 
-import { BridgeGateway, wireWebContentsLifecycle } from './bridge-gateway.js';
-import { connectToDaemon } from './daemon-client.js';
+import {
+  BridgeGateway,
+  createDaemonReconnectSource,
+  wireWebContentsLifecycle,
+} from './bridge-gateway.js';
+import type { DaemonReconnectSource, LayoutAccess } from './bridge-gateway.js';
 import type { DaemonConnection } from './daemon-client.js';
+import { createDaemonSupervisor } from './daemon-supervisor.js';
 import { IPC_CHANNEL } from './ipc-contract.js';
 import type { RelayInboundMessage, RelayOutboundMessage } from './ipc-contract.js';
+import { installQuitFlush } from './quit-flush.js';
 import { SessionAttachments } from './session-attachments.js';
+import { openAppStateFiles } from './store-files.js';
 
 // packages/app has its own package.json without "type": "module" (unlike
 // the repo root), so main and preload build as CommonJS and __dirname is
@@ -69,9 +77,12 @@ async function loadRenderer(mainWindow: BrowserWindow): Promise<void> {
  * below — the daemon connection and the window showing up are independent
  * concerns, and a slow/backed-off daemon connection must never delay the
  * window from appearing. Takes the same `connectionPromise` handed to
- * `attachDaemonBridge` (a single `connectToDaemon()` call per app start,
- * not one per window) so this is purely an observer of it, never a second
- * connection attempt.
+ * `attachDaemonBridge` (docs/specs/m4.8-daemon-resilience.md section 3.1's
+ * `supervisor.firstConnection` — the *very first* `connectToDaemon()` call,
+ * once per app start, not one per window; every reconnect after that is
+ * `reconnectSource`'s job, logged nowhere on purpose — see
+ * `daemon-supervisor.ts`'s own header comment) so this is purely an
+ * observer of it, never a second connection attempt.
  */
 async function logDaemonConnectionOutcome(
   connectionPromise: Promise<DaemonConnection>,
@@ -176,6 +187,8 @@ function attachDaemonBridge(
   window: BrowserWindow,
   connectionPromise: Promise<DaemonConnection>,
   sessionAttachments: Promise<SessionAttachments | undefined>,
+  layout: Promise<LayoutAccess | undefined>,
+  reconnect: DaemonReconnectSource,
 ): { dispose: () => void } {
   const sendToRenderer = (message: RelayOutboundMessage): void => {
     if (window.isDestroyed()) {
@@ -188,6 +201,13 @@ function attachDaemonBridge(
     sendToRenderer,
     connectionPromise,
     sessionAttachments,
+    layout,
+    // docs/specs/m4.8-daemon-resilience.md section 3.2: everything that
+    // happens to the connection *after* it first settles — a drop, then a
+    // reconnect (this app's own supervisor never spawns a replacement for a
+    // daemon it merely lost touch with, see daemon-supervisor.ts's header
+    // comment). Shared by every window, same as `sessionAttachments`.
+    reconnect,
     // M2.5, section 2.4: clipboard access lives in the main process — never
     // `navigator.clipboard` in the sandboxed renderer (see
     // `@termhub/ui`'s `TerminalBridge.readClipboardText` doc comment).
@@ -239,50 +259,140 @@ function attachDaemonBridge(
 }
 
 async function main(): Promise<void> {
+  // docs/specs/m4.1-atomic-state.md section 3.1: one main process per user.
+  // A second one would be a second writer of workspaces.json, each
+  // overwriting the other's layout. Taken before anything else, so a
+  // process that loses never connects to the daemon or reads state files.
+  if (!app.requestSingleInstanceLock()) {
+    app.quit();
+    return;
+  }
+
   await app.whenReady();
 
-  // One `connectToDaemon()` call for the whole app start, shared by the
-  // logger above and every window's bridge — never one call per window.
-  const connectionPromise = connectToDaemon();
+  // Loaded once, at boot, from the daemon's state directory (section 3.2).
+  // M4.3 threads this into the renderer's layout; until then the load
+  // still runs for real, so a bad file is backed up by the real app.
+  const stateFilesPromise = openAppStateFiles();
+  stateFilesPromise.catch((error: unknown) => {
+    console.error('[TermHub] unexpected error while loading state files', error);
+  });
+  // Section 3.7: before-quit waits for every state file's write queue.
+  installQuitFlush(app, [
+    () => stateFilesPromise.then((files) => files.config.flush()),
+    () => stateFilesPromise.then((files) => files.workspaces.flush()),
+  ]);
+
+  // docs/specs/m4.8-daemon-resilience.md section 3.1: the supervisor
+  // replaces the single, never-retried `connectToDaemon()` call this used to
+  // be. `firstConnection` is that exact first call's own result (section
+  // 3.1: "faz a primeira conexão com connectToDaemon(), como hoje") — every
+  // pre-M4.8 consumer of what used to be `connectionPromise` (the logger
+  // below, `sessionAttachmentsPromise`, every window's bridge) keeps working
+  // against it unmodified. What's new is `reconnectSource`: everything that
+  // happens *after* that first connection settles (a drop, then any later
+  // reconnect), which `attachDaemonBridge` below also threads into every
+  // window's `BridgeGateway`. `app.on('before-quit', ...)` stops the
+  // supervisor from ever retrying again once the app itself is going down
+  // (section 3.1: "no app saindo, para de tentar").
+  const supervisor = createDaemonSupervisor();
+  app.on('before-quit', () => {
+    supervisor.dispose();
+  });
+  const connectionPromise: Promise<DaemonConnection> = supervisor.firstConnection;
   logDaemonConnectionOutcome(connectionPromise).catch((error: unknown) => {
     console.error('[TermHub] unexpected error while connecting to the daemon', error);
   });
+  const reconnectSource: DaemonReconnectSource = createDaemonReconnectSource(supervisor);
 
-  // docs/specs/m2.6-boot-reattach.md section 3.2: one `SessionAttachments`
-  // for the whole app, derived from the *same* `connectionPromise` every
-  // window's `BridgeGateway` already shares — never one per window.
-  // `.then()` on a single promise memoizes its result, so every gateway
-  // that awaits `sessionAttachmentsPromise` observes the identical
-  // instance. `undefined` when the daemon connection itself never reached
-  // `'connected'` (blocked/failed) — there is no `TransportClient` to hand
-  // it in that case, and `BridgeGateway`/`handleAttachmentRequest` already
-  // handle an absent book by rejecting `session.attach`/`session.detach`
-  // the same way every other method fails without a connection.
-  const sessionAttachmentsPromise: Promise<SessionAttachments | undefined> = connectionPromise.then(
-    (result) =>
-      result.outcome === 'connected' ? new SessionAttachments(result.client) : undefined,
+  // docs/specs/m2.6-boot-reattach.md section 3.2, updated by M4.8 section
+  // 3.1: one `SessionAttachments` per *connection* (not per app any more,
+  // and never per window) — for the very first connection specifically,
+  // `reconnectSource` is reused here too (via its own internal cache keyed
+  // by epoch, `createDaemonReconnectSource`'s doc comment), so there is
+  // exactly one `SessionAttachments` for epoch 1, shared between this
+  // promise and whatever `reconnectSource.onChange` later reports for that
+  // same epoch — never two different instances for the same connection.
+  // `undefined` when the daemon connection itself never reached `'connected'`
+  // (blocked/failed) — there is no `TransportClient` to hand it in that
+  // case, and `BridgeGateway`/`handleAttachmentRequest` already handle an
+  // absent book by rejecting `session.attach`/`session.detach` the same way
+  // every other method fails without a connection.
+  const sessionAttachmentsPromise: Promise<SessionAttachments | undefined> = new Promise(
+    (resolve) => {
+      const unsubscribe = reconnectSource.onChange((next) => {
+        unsubscribe();
+        resolve(next.sessionAttachments);
+      });
+    },
   );
 
-  const mainWindow = createWindow();
-  const bridge = attachDaemonBridge(mainWindow, connectionPromise, sessionAttachmentsPromise);
-  mainWindow.on('closed', () => {
-    bridge.dispose();
-  });
+  // M4.3: the app's persisted-layout access, shared by every window's
+  // `BridgeGateway` the same way `sessionAttachmentsPromise` is (there is
+  // exactly one `workspaces.json` `StateFile`/writer for the whole process
+  // — docs/specs/m4.1-atomic-state.md section 3.1). Both `load`/`save`
+  // below are already synchronous once `stateFilesPromise` itself resolves
+  // (`StateFile.get()`/`StateFile.save()` never do I/O synchronously — the
+  // write is queued/debounced internally); `.then`'s second callback (never
+  // `.catch`) means a rejected `stateFilesPromise` — logged separately,
+  // right after it is created, below — yields `undefined` here instead of
+  // an unhandled rejection.
+  const layoutAccessPromise: Promise<LayoutAccess | undefined> = stateFilesPromise.then(
+    (files) => ({
+      load: () => Promise.resolve(files.workspaces.get()),
+      save: (value: unknown) =>
+        // `unknown` here is exactly the renderer-supplied, untrusted value
+        // `StateFile.save`'s own `WorkspacesFileSchema.safeParse` validates
+        // before ever writing anything (docs/specs/m4.1-atomic-state.md
+        // section 3.6) — this assertion only satisfies
+        // `StateFile<WorkspacesFile>.save`'s parameter type, it is not the
+        // trust boundary itself.
+        files.workspaces.save(value as WorkspacesFile),
+    }),
+    () => undefined,
+  );
+
+  const openWindow = (): BrowserWindow => {
+    const window = createWindow();
+    const windowBridge = attachDaemonBridge(
+      window,
+      connectionPromise,
+      sessionAttachmentsPromise,
+      layoutAccessPromise,
+      reconnectSource,
+    );
+    window.on('closed', () => {
+      windowBridge.dispose();
+    });
+    return window;
+  };
+
+  const mainWindow = openWindow();
   await loadRenderer(mainWindow);
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length > 0) {
       return;
     }
-
-    const nextWindow = createWindow();
-    const nextBridge = attachDaemonBridge(nextWindow, connectionPromise, sessionAttachmentsPromise);
-    nextWindow.on('closed', () => {
-      nextBridge.dispose();
-    });
-    loadRenderer(nextWindow).catch((error: unknown) => {
+    loadRenderer(openWindow()).catch((error: unknown) => {
       console.error('[TermHub] failed to load renderer after activate', error);
     });
+  });
+
+  // Someone launched TermHub again: that process quit on the lock above,
+  // and this one surfaces its existing window instead (section 3.1).
+  app.on('second-instance', () => {
+    const [existing] = BrowserWindow.getAllWindows();
+    if (existing === undefined) {
+      loadRenderer(openWindow()).catch((error: unknown) => {
+        console.error('[TermHub] failed to load renderer for a second launch', error);
+      });
+      return;
+    }
+    if (existing.isMinimized()) {
+      existing.restore();
+    }
+    existing.focus();
   });
 }
 

@@ -4,6 +4,7 @@ import {
   classifyClipboardShortcut,
   createClipboardKeyHandler,
   dispatchContextMenuChoice,
+  isRestoreLastClosedShortcut,
   performCopy,
   performPaste,
   type ClipboardActionDeps,
@@ -81,6 +82,41 @@ describe('classifyClipboardShortcut', () => {
       classifyClipboardShortcut({ type: 'keyup', ctrlKey: true, shiftKey: true, key: 'c' }),
     ).toBeUndefined();
   });
+
+  it('never classifies Ctrl+Shift+T as a clipboard action — it is the restore shortcut', () => {
+    expect(
+      classifyClipboardShortcut({ type: 'keydown', ctrlKey: true, shiftKey: true, key: 'T' }),
+    ).toBeUndefined();
+  });
+});
+
+describe('isRestoreLastClosedShortcut', () => {
+  it('recognizes Ctrl+Shift+T (M4.5: restores the most recently closed session)', () => {
+    expect(
+      isRestoreLastClosedShortcut({ type: 'keydown', ctrlKey: true, shiftKey: true, key: 'T' }),
+    ).toBe(true);
+    expect(
+      isRestoreLastClosedShortcut({ type: 'keydown', ctrlKey: true, shiftKey: true, key: 't' }),
+    ).toBe(true);
+  });
+
+  it('requires both modifiers held together with keydown', () => {
+    expect(
+      isRestoreLastClosedShortcut({ type: 'keydown', ctrlKey: true, shiftKey: false, key: 't' }),
+    ).toBe(false);
+    expect(
+      isRestoreLastClosedShortcut({ type: 'keydown', ctrlKey: false, shiftKey: true, key: 't' }),
+    ).toBe(false);
+    expect(
+      isRestoreLastClosedShortcut({ type: 'keyup', ctrlKey: true, shiftKey: true, key: 't' }),
+    ).toBe(false);
+  });
+
+  it('does not fire for an unrelated key under the same modifiers', () => {
+    expect(
+      isRestoreLastClosedShortcut({ type: 'keydown', ctrlKey: true, shiftKey: true, key: 'c' }),
+    ).toBe(false);
+  });
 });
 
 describe('createClipboardKeyHandler', () => {
@@ -114,6 +150,26 @@ describe('createClipboardKeyHandler', () => {
     const result = handler({ type: 'keydown', ctrlKey: true, shiftKey: false, key: 'c' });
     expect(result).toBe(true);
     expect(writeCalls).toEqual([]);
+  });
+
+  it('intercepts Ctrl+Shift+T: returns false, never touches copy/paste — the actual restore lives outside this handler', () => {
+    const { deps, pasteCalls, writeCalls } = createDeps({
+      hasSelection: () => true,
+      getSelection: () => 'irrelevant',
+    });
+    const handler = createClipboardKeyHandler(deps);
+    const result = handler({ type: 'keydown', ctrlKey: true, shiftKey: true, key: 'T' });
+    expect(result).toBe(false);
+    expect(writeCalls).toEqual([]);
+    expect(pasteCalls).toEqual([]);
+  });
+
+  it('still lets ordinary keys through once Ctrl+Shift+T has been handled once (no leaked state)', () => {
+    const { deps } = createDeps();
+    const handler = createClipboardKeyHandler(deps);
+    handler({ type: 'keydown', ctrlKey: true, shiftKey: true, key: 'T' });
+    expect(handler({ type: 'keydown', ctrlKey: false, shiftKey: false, key: 'a' })).toBe(true);
+    expect(handler({ type: 'keydown', ctrlKey: true, shiftKey: true, key: 'x' })).toBe(true);
   });
 
   it('does not paste into a disposed terminal', async () => {

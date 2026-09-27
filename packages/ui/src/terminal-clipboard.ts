@@ -59,6 +59,43 @@ export function classifyClipboardShortcut(
   return undefined;
 }
 
+/**
+ * `Ctrl+Shift+T` — M4.5's "traz a última fechada de volta"
+ * (`termhub-prototipo.html`'s own global handler: `if(e.ctrlKey &&
+ * e.shiftKey && e.key.toLowerCase() === 't')`). Classified here, next to
+ * the clipboard shortcuts, for the exact same reason they're intercepted at
+ * this layer and not left to reach the PTY (this module's header comment,
+ * "Why the shortcuts never reach the PTY"): xterm's own keydown handling
+ * has to be skipped for it too, or the physical keys `t`/`T` would be typed
+ * into whatever shell prompt has focus.
+ *
+ * This function only *classifies* — it never restores anything itself.
+ * `createClipboardKeyHandler` below wires it into the same
+ * `attachCustomKeyEventHandler` return-`false` path `terminal-host.ts`
+ * installs, but the actual restore (finding the most-recently-closed
+ * session, calling `session.restore`, placing it back in its workspace) is
+ * `Sidebar.tsx`'s own global `keydown` listener — a *second*, independent
+ * listener on `window`, in bubble phase. It still receives this same event:
+ * returning `false` from xterm's custom key handler makes xterm skip its
+ * own data-sending pipeline entirely (`_keyDown` in `@xterm/xterm`'s
+ * `CoreBrowserTerminal` returns before ever calling `evaluateKeyboardEvent`/
+ * `triggerDataEvent`), but it never calls `preventDefault`/
+ * `stopPropagation` on the native event to do so — exactly the same
+ * behavior `Ctrl+Shift+C`/`Ctrl+Shift+V` already rely on above (a copy/paste
+ * still needs the *next* handler, `performCopy`/`performPaste`, to run; the
+ * only difference here is that "next handler" lives outside this module).
+ * Verified against `@xterm/xterm`'s own source
+ * (`node_modules/@xterm/xterm/src/browser/CoreBrowserTerminal.ts`): the
+ * keydown listener is registered directly on the hidden textarea, not
+ * `document`/`window`, so nothing there stops this event from bubbling all
+ * the way up to `Sidebar.tsx`'s listener afterward.
+ */
+export function isRestoreLastClosedShortcut(event: ClipboardKeyEvent): boolean {
+  return (
+    event.type === 'keydown' && event.ctrlKey && event.shiftKey && event.key.toLowerCase() === 't'
+  );
+}
+
 /** The terminal/bridge operations `performCopy`/`performPaste`/`createClipboardKeyHandler` need — `Terminal.tsx` supplies these backed by a real `@xterm/xterm` instance and `window.termhub`; tests pass plain fakes. */
 export interface ClipboardActionDeps {
   hasSelection(): boolean;
@@ -118,6 +155,12 @@ export function createClipboardKeyHandler(
     }
     if (action === 'paste') {
       performPaste(deps);
+      return false;
+    }
+    if (isRestoreLastClosedShortcut(event)) {
+      // No action performed here (see `isRestoreLastClosedShortcut`'s doc
+      // comment) — only intercepted, so it neither reaches the PTY as
+      // input nor falls through to xterm's own key handling.
       return false;
     }
     return true;

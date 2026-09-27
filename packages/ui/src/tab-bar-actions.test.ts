@@ -12,12 +12,11 @@ import {
   type CloseWorkspaceStoreApi,
 } from './tab-bar-actions.js';
 import { makeLeaf } from './store/tree.js';
-import {
-  NEW_SESSION_SHELL,
-  type SessionActionsBridge,
-  type SessionActionsStoreApi,
-} from './store/session-actions.js';
+import type { SessionActionsBridge, SessionActionsStoreApi } from './store/session-actions.js';
 import type { StoreState, Workspace } from './store/workspace.js';
+
+/** A profile with real `args` — proves `createWorkspaceTab` passes the chosen profile's shell/args through, not a fixed constant (M4.6's own named pitfall, mirrored in `session-actions.test.ts`'s split test). */
+const WSL_PROFILE = { shell: 'wsl.exe', args: ['-d', 'Ubuntu'] };
 
 function session(overrides: Partial<SessionSummary> = {}): SessionSummary {
   return {
@@ -138,15 +137,16 @@ describe('createWorkspaceTab', () => {
       activeWorkspaceId: 'default',
       sessions: {},
     });
-    const created = session({ id: 42 });
+    const created = session({ id: 42, shell: 'wsl.exe', args: ['-d', 'Ubuntu'] });
     const request = vi.fn().mockResolvedValue({ session: created });
     const bridge: SessionActionsBridge = { request };
 
-    const result = await createWorkspaceTab(store, bridge, active);
+    const result = await createWorkspaceTab(store, bridge, active, WSL_PROFILE);
 
     expect(result).toEqual(created);
     expect(request).toHaveBeenCalledWith('session.create', {
-      shell: NEW_SESSION_SHELL,
+      shell: WSL_PROFILE.shell,
+      args: WSL_PROFILE.args,
       cwd: 'C:\\dev\\termhub',
       cols: NEW_WORKSPACE_SIZE.cols,
       rows: NEW_WORKSPACE_SIZE.rows,
@@ -160,13 +160,14 @@ describe('createWorkspaceTab', () => {
 
   it('falls back to the fixed cwd guess when there is no active workspace', async () => {
     const store = createFakeStore({ workspaces: [], activeWorkspaceId: undefined, sessions: {} });
-    const created = session({ id: 5 });
+    const created = session({ id: 5, shell: 'pwsh.exe' });
     const request = vi.fn().mockResolvedValue({ session: created });
 
-    await createWorkspaceTab(store, { request }, undefined);
+    await createWorkspaceTab(store, { request }, undefined, { shell: 'pwsh.exe', args: [] });
 
     expect(request).toHaveBeenCalledWith('session.create', {
-      shell: NEW_SESSION_SHELL,
+      shell: 'pwsh.exe',
+      args: [],
       cwd: NEW_WORKSPACE_CWD_FALLBACK,
       cols: NEW_WORKSPACE_SIZE.cols,
       rows: NEW_WORKSPACE_SIZE.rows,

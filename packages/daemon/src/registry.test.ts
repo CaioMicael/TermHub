@@ -125,7 +125,10 @@ describe('Registry', () => {
     registered?.session.write('echo hi\r');
     registered?.session.resize(100, 40);
     const fake = registered?.session as FakeSession;
-    expect(fake.writes).toEqual(['echo hi\r']);
+    // M4.7: `create()` itself already wrote `command + '\r'` right after
+    // spawning (this params fixture passes `command: 'claude'`) — that
+    // write is asserted on its own, below; `echo hi\r` here is on top of it.
+    expect(fake.writes).toEqual(['claude\r', 'echo hi\r']);
     expect(fake.resizes).toEqual([{ cols: 100, rows: 40 }]);
   });
 
@@ -138,6 +141,54 @@ describe('Registry', () => {
     expect(summary.name).toBe('cmd.exe');
     expect(summary.tag).toBeUndefined();
     expect(summary.command).toBeUndefined();
+  });
+
+  // M4.6 (second half): a pane split relaunches the split pane's own shell
+  // profile by reading `args` off its `SessionSummary` — this is that wire
+  // straight through `create()`. Without it a WSL pane's split would spawn
+  // `wsl.exe` with no `-d <distro>` and land in the wrong distro (this
+  // task's own prompt names this pitfall).
+  it('propagates args into the summary, for a future split to reuse (M4.6)', () => {
+    const { factory } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    const summary = registry.create(baseParams({ shell: 'wsl.exe', args: ['-d', 'Ubuntu'] }));
+
+    expect(summary.args).toEqual(['-d', 'Ubuntu']);
+  });
+
+  it('omits args from the summary when session.create was not given any', () => {
+    const { factory } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    const summary = registry.create(baseParams({ shell: 'pwsh.exe' }));
+
+    expect(summary.args).toBeUndefined();
+  });
+
+  // M4.7: `command` used to be recorded onto the summary and never actually
+  // run — a session created with `command: 'claude'` opened a blank
+  // interactive shell. `create()` now writes it as a line of input right
+  // after spawning, `\r`-terminated (the Enter keystroke), so the shell
+  // itself runs it instead of just remembering it happened.
+  it('writes command + "\\r" to the freshly spawned session right after creating it', () => {
+    const { factory, sessions } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    registry.create(baseParams({ command: 'claude' }));
+
+    const [session] = sessions;
+    expect(session?.writes).toEqual(['claude\r']);
+  });
+
+  it('writes nothing at all when session.create has no command (an ordinary interactive shell)', () => {
+    const { factory, sessions } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    registry.create(baseParams());
+
+    const [session] = sessions;
+    expect(session?.writes).toEqual([]);
   });
 
   it('get() returns undefined for an id that was never created', () => {
@@ -339,5 +390,88 @@ describe('Registry', () => {
 
     expect(thrown).toBeInstanceOf(ProtocolError);
     expect((thrown as ProtocolError).code).toBe(PROTOCOL_ERROR_CODE.SESSION_NOT_FOUND);
+  });
+
+  // ---------------------------------------------------------------------------
+  // M4.4: evict()/reinstate() — the graveyard building blocks close()'s own
+  // doc comment predicted. Not exercised through a Graveyard here (that's
+  // graveyard.test.ts's job); these tests only prove the registry's own two
+  // new methods do exactly what they promise, standing alone.
+  // ---------------------------------------------------------------------------
+
+  it('evict() removes the record without killing the session, and it is gone from get()/list()', () => {
+    const { factory, sessions } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    const summary = registry.create(baseParams({ name: 'buried-1' }));
+    const fake = sessions[0];
+
+    const evicted = registry.evict(summary.id);
+
+    expect(evicted?.summary).toEqual(summary);
+    expect(evicted?.session).toBe(fake);
+    expect(fake?.killCalls).toBe(0); // evict never kills
+    expect(fake?.isAlive).toBe(true);
+    expect(registry.get(summary.id)).toBeUndefined();
+    expect(registry.list()).toEqual([]);
+  });
+
+  it('evict() on an unknown id returns undefined and does not throw', () => {
+    const { factory } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    expect(registry.evict(999_999)).toBeUndefined();
+  });
+
+  it('reinstate() puts an evicted session back under the same id, visible again in get()/list()', () => {
+    const { factory } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    const summary = registry.create(baseParams({ name: 'buried-2' }));
+    const evicted = registry.evict(summary.id);
+    expect(evicted).toBeDefined();
+    if (evicted === undefined) throw new Error('unreachable');
+
+    // Simulates the graveyard reporting the session died while buried.
+    const revivedSummary = { ...evicted.summary, status: 'exited' as const };
+    registry.reinstate(revivedSummary, evicted.session);
+
+    expect(registry.get(summary.id)?.summary).toEqual(revivedSummary);
+    expect(registry.list().map((s) => s.id)).toEqual([summary.id]);
+  });
+
+  it('reinstate() re-wires exit tracking: a later exit updates the summary just like a never-buried session', () => {
+    const { factory, sessions } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    const summary = registry.create(baseParams());
+    const evicted = registry.evict(summary.id);
+    if (evicted === undefined) throw new Error('unreachable');
+    registry.reinstate(evicted.summary, evicted.session);
+
+    const fake = sessions[0];
+    fake?.emitExit({ exitCode: 7 });
+
+    expect(registry.get(summary.id)?.summary.status).toBe('exited');
+    expect(registry.get(summary.id)?.exit).toEqual({ exitCode: 7 });
+  });
+
+  it('reinstate() throws INTERNAL_ERROR if the id is already registered', () => {
+    const { factory, sessions } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    const summary = registry.create(baseParams());
+    const fake = sessions[0];
+    if (fake === undefined) throw new Error('unreachable');
+
+    let thrown: unknown;
+    try {
+      registry.reinstate(summary, fake);
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(ProtocolError);
+    expect((thrown as ProtocolError).code).toBe(PROTOCOL_ERROR_CODE.INTERNAL_ERROR);
   });
 });

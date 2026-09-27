@@ -1,0 +1,268 @@
+/*
+ * `Sidebar.tsx` visuals, matching `termhub-prototipo.html`'s `.sidebar`/
+ * `.side-title`/`.group`/`.group-head`/`.row` rules (colors below are that
+ * file's `:root` custom properties — same convention `tab-bar.css`/
+ * `pane-header.css`/`activity-bar.css` already use). Side-effect CSS
+ * import, same pattern as those files: hover, the collapsed-group chevron
+ * rotation and the hover-revealed row actions aren't expressible with
+ * inline `style={{...}}` objects.
+ *
+ * Dots here are **not animated** (no `breathe`/`pulse` keyframes, unlike the
+ * prototype's `.dot.run`/`.dot.wait`) — `TabBar.tsx`'s and `PaneHeader.tsx`'s
+ * own status dots don't animate yet either (M5.4's job, per
+ * docs/milestones.md: "Badges na UI: bolinhas e animações do protótipo").
+ * This file matches that current, pre-M5.4 state rather than jumping ahead
+ * of the other two components.
+ */
+
+.th-sidebar {
+  width: 270px;
+  flex: 0 0 270px;
+  background: #252526; /* prototype --bg-side */
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  user-select: none;
+}
+
+.th-side-title {
+  height: 35px;
+  flex: 0 0 35px;
+  display: flex;
+  align-items: center;
+  padding: 0 8px 0 20px;
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: #bbbbbb;
+}
+
+.th-side-acts {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+}
+
+.th-icon-btn {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 5px;
+  color: #c5c5c5;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.th-icon-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.th-icon-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.th-side-body {
+  flex: 1;
+  overflow-y: auto;
+  padding-bottom: 12px;
+}
+
+.th-group {
+  margin-top: 2px;
+}
+
+.th-group-head {
+  height: 22px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: #cccccc;
+  letter-spacing: 0.4px;
+  cursor: pointer;
+  /* Without this, a flex child (`.th-group-path`) can never shrink below
+     its content's intrinsic width — the same reasoning `pane-header.css`'s
+     `.th-pane-head` gives for its own `min-width: 0`. */
+  min-width: 0;
+}
+
+.th-group-head:hover {
+  background: #2a2d2e; /* prototype --hover */
+}
+
+.th-group-name {
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.th-group-path {
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  color: #858585; /* prototype --fg-dim */
+  font-size: 11px;
+  margin-left: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.th-group-count {
+  margin-left: auto;
+  color: #858585; /* prototype --fg-dim */
+  font-weight: 400;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.th-group-waiting-mark {
+  color: #ffcc00; /* prototype --st-wait */
+  margin-right: 2px;
+}
+
+.th-chev {
+  transition: transform 0.12s;
+  flex: 0 0 auto;
+}
+
+.th-group-collapsed .th-chev {
+  transform: rotate(-90deg);
+}
+
+.th-group-collapsed .th-group-items {
+  display: none;
+}
+
+.th-row {
+  height: 22px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px 0 22px;
+  cursor: pointer;
+  position: relative;
+  white-space: nowrap;
+}
+
+.th-row:hover {
+  background: #2a2d2e; /* prototype --hover */
+}
+
+.th-row.th-row-active {
+  background: #04395e; /* prototype --list-focus */
+  /* prototype: `outline:1px solid var(--focus-border)` — that custom
+     property is never defined in :root (this task's report), so the
+     prototype itself never actually draws this outline. The project's own
+     focus color, #007acc (SplitTree.tsx's focused-pane outline), is used
+     here instead of reproducing the no-op. */
+  outline: 1px solid #007acc;
+  outline-offset: -1px;
+}
+
+.th-row-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.th-row-meta {
+  color: #858585; /* prototype --fg-dim */
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.th-row-acts {
+  margin-left: auto;
+  display: none;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+.th-row:hover .th-row-acts {
+  display: flex;
+}
+
+.th-row-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: #6e7681; /* prototype --st-idle */
+}
+
+.th-row-dot--run {
+  background: #89d185; /* prototype --st-run */
+}
+
+.th-row-dot--wait {
+  background: #ffcc00; /* prototype --st-wait */
+}
+
+.th-row-dot--err {
+  background: #f14c4c; /* prototype --st-err */
+}
+
+/*
+ * M4.5's "Fechados recentemente" section — `termhub-prototipo.html`'s
+ * `.dot.wait` override (`background:#6a9955;animation:none`, a *different*
+ * green from `.dot.run`'s `--st-run`) and `.dot.dead`
+ * (`background:transparent;border:1px solid var(--st-idle)`).
+ */
+.th-row-dot--graveyard-alive {
+  background: #6a9955;
+}
+
+.th-row-dot--graveyard-dead {
+  background: transparent;
+  border: 1px solid #6e7681; /* prototype --st-idle */
+}
+
+.th-row-name--dim {
+  color: #8d8d8d; /* prototype's exited-entry name color */
+}
+
+.th-row-ttl {
+  margin-left: auto;
+  color: #858585; /* prototype --fg-dim */
+  font-size: 10px;
+  flex: 0 0 auto;
+}
+
+/* Same swap the prototype's `.row:hover .ttl{display:none}` makes — the
+   restore button (`.th-row-acts`, already `display:none` until hover) takes
+   the time text's place once the row is hovered. */
+.th-row:hover .th-row-ttl {
+  display: none;
+}
+
+.th-graveyard-footer {
+  padding: 10px 12px 0 22px;
+  color: #858585; /* prototype --fg-dim */
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.th-graveyard-footer b {
+  color: #c4c4c4;
+  font-weight: 700;
+}
+
+.th-graveyard-footer kbd {
+  font-family: inherit;
+  font-size: 10px;
+  background: #3c3c3c;
+  border: 1px solid #4a4a4a;
+  border-radius: 3px;
+  padding: 0 4px;
+}

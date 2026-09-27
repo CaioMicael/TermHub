@@ -1,0 +1,63 @@
+/*
+ * `ActivityBar.tsx` visuals, matching `termhub-prototipo.html`'s `.activity`/
+ * `.act-btn`/`.act-btn.active`/`.act-btn .badge`/`.act-spacer` rules exactly
+ * (colors below are that file's `:root` custom properties — same
+ * "hex value + comment naming the prototype var" convention `tab-bar.css`/
+ * `pane-header.css` already use). Side-effect CSS import, same pattern those
+ * two files already establish: `:hover` and the active button's left border
+ * aren't expressible with inline `style={{...}}` objects.
+ */
+
+.th-activity {
+  width: 48px;
+  flex: 0 0 48px;
+  background: #333333; /* prototype --bg-activity */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.th-act-btn {
+  width: 48px;
+  height: 48px;
+  flex: 0 0 48px;
+  display: grid;
+  place-items: center;
+  color: #858585;
+  border: none;
+  border-left: 2px solid transparent;
+  position: relative;
+  background: none;
+  cursor: pointer;
+  padding: 0;
+  font-family: inherit;
+}
+
+.th-act-btn:hover {
+  color: #fff;
+}
+
+.th-act-btn.th-act-btn-active {
+  color: #fff;
+  border-left-color: #e7e7e7;
+}
+
+.th-act-badge {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  min-width: 15px;
+  height: 15px;
+  background: #007acc; /* prototype --accent */
+  color: #fff;
+  border-radius: 8px;
+  font-size: 9px;
+  display: grid;
+  place-items: center;
+  padding: 0 4px;
+  font-weight: 600;
+}
+
+.th-act-spacer {
+  flex: 1;
+}
