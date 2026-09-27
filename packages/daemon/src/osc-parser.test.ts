@@ -86,7 +86,11 @@ describe('interpretOsc', () => {
 });
 
 describe('TerminalSignalParser — test 1: each signal, isolated, BEL and ST terminators, plus a C1 case', () => {
-  const cases: Array<{ name: string; make: (terminator: string) => string; expected: TerminalSignal[] }> = [
+  const cases: Array<{
+    name: string;
+    make: (terminator: string) => string;
+    expected: TerminalSignal[];
+  }> = [
     {
       name: 'OSC 0 title',
       make: (t) => `${ESC}]0;hello${t}`,
