@@ -7,6 +7,7 @@ import type {
   WorkspacesFile,
 } from '@termhub/shared';
 import {
+  applyRelaunchedSession,
   forgetSessionOwnership,
   reconcileLayout,
   toPersistedLayout,
@@ -132,10 +133,16 @@ function indexById(sessions: readonly SessionSummary[]): Record<SessionId, Sessi
 export interface DaemonResyncResult {
   /**
    * Section 3.4's last paragraph: `true` when the daemon that came back was
-   * a different lifetime — no session survived the reconciliation anywhere,
-   * so rule 6 created exactly one fresh one. `App.tsx` shows "Daemon
-   * reiniciado — as sessões anteriores foram encerradas" for a few seconds
-   * when this is `true`, and just clears the banner otherwise.
+   * a different lifetime — no session survived the reconciliation anywhere
+   * at all (`session.list` reported nothing live), whether what happens
+   * next is rule 6's blank fresh session or M4.7's relaunch of everything
+   * that had a `launch` spec. `App.tsx` shows "Daemon reiniciado — as
+   * sessões anteriores foram encerradas" for a few seconds when this is
+   * `true`, and just clears the banner otherwise. Computed straight from
+   * `liveSessions.length === 0` (not from `needsFreshSessionInWorkspaceId`,
+   * which — since M4.7 — no longer fires whenever *something* is
+   * relaunchable): the banner's own meaning is "the daemon lost every
+   * session", independent of how well this resync recovered from it.
    */
   daemonRestarted: boolean;
 }
@@ -177,7 +184,36 @@ async function runDaemonResyncOnce(
 
   let workspaces = outcome.workspaces;
   let sessions = indexById(liveSessions);
-  const daemonRestarted = outcome.needsFreshSessionInWorkspaceId !== undefined;
+  const daemonRestarted = liveSessions.length === 0;
+
+  // M4.7, rule 6.5: relaunch every dead leaf that carried a `launch` spec —
+  // its own shell/cwd/args/command, same as `session-boot.ts`'s own
+  // handling of this (that module's own doc comment explains why this never
+  // goes through `resolveDefaultShellParams`). `toPersistedLayout` above
+  // built `asFile` straight from the *live* store, so a session that was
+  // just running seconds ago (before the daemon dropped) already carries
+  // its own `launch` — this is what makes a daemon restart relaunch every
+  // agent with the same command it had, not just blank shells.
+  for (const pending of outcome.toRelaunch) {
+    const { cols, rows } = guessSize(currentState.sessions);
+    const params: SessionCreateParams = {
+      shell: pending.launch.shell,
+      cwd: pending.launch.cwd,
+      cols,
+      rows,
+      ...(pending.launch.name !== undefined ? { name: pending.launch.name } : {}),
+      ...(pending.launch.args !== undefined ? { args: pending.launch.args } : {}),
+      ...(pending.launch.command !== undefined ? { command: pending.launch.command } : {}),
+    };
+    const { session } = await bridge.request('session.create', params);
+    workspaces = applyRelaunchedSession(
+      workspaces,
+      pending.workspaceId,
+      pending.sessionId,
+      session,
+    );
+    sessions = { ...sessions, [session.id]: session };
+  }
 
   if (outcome.needsFreshSessionInWorkspaceId !== undefined) {
     // Rule 6: the daemon restarted with nothing surviving anywhere — create

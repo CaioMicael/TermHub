@@ -175,13 +175,14 @@ export type { TermhubStore, TermhubStoreActions } from './store/store.js';
 // ─── M4.3: pure store <-> WorkspacesFile projection/reconciliation ────────
 
 export {
+  applyRelaunchedSession,
   reconcileLayout,
   toPersistedLayout,
   RECOVERED_WORKSPACE_CWD_FALLBACK,
   RECOVERED_WORKSPACE_ID,
   RECOVERED_WORKSPACE_NAME,
 } from './layout-persistence.js';
-export type { ReconcileOutcome, ReconcileRestored } from './layout-persistence.js';
+export type { PendingRelaunch, ReconcileOutcome, ReconcileRestored } from './layout-persistence.js';
 
 export {
   buryClosedSession,
@@ -216,3 +217,23 @@ export {
   sortGraveyardEntries,
 } from './graveyard-model.js';
 export type { GraveyardRow, JustUnplacedSession, SessionOrigin } from './graveyard-model.js';
+
+// ─── M4.7: workspace launch specs and templates ("Workspaces" sidebar view) ─
+
+export {
+  buildAutoGridTree,
+  nextTemplateId,
+  nextTemplateName,
+  templateFromWorkspace,
+} from './workspace-templates.js';
+
+export {
+  openWorkspaceFromTemplate,
+  saveCurrentWorkspaceAsTemplate,
+} from './workspace-templates-actions.js';
+
+export { removeTemplate, upsertTemplate, useTemplatesStore } from './store/templates.js';
+export type { TemplatesActions, TemplatesState, TemplatesStore } from './store/templates.js';
+
+export { WorkspacesView } from './WorkspacesView.js';
+export type { WorkspacesViewProps } from './WorkspacesView.js';

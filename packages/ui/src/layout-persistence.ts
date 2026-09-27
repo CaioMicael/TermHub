@@ -5,14 +5,21 @@
 // `layout-persistence.test.ts` drives them directly, and the round trip
 // (store -> file -> store) is a single, deterministic assertion.
 //
-// `packages/app/src/renderer/src/session-boot.ts` is the only caller: it
-// loads the file (`window.termhub.loadLayout()`), reconciles it against
-// `session.list`'s live sessions, and — only when `reconcileLayout` reports
-// `needsFreshSessionInWorkspaceId` (rule 6 below) — calls `session.create`
-// itself, since this module never touches the daemon or any bridge.
+// `packages/app/src/renderer/src/session-boot.ts` (and, for a live daemon
+// resync, `daemon-resync.ts`) is the only caller: it loads the file
+// (`window.termhub.loadLayout()`), reconciles it against `session.list`'s
+// live sessions, and — only when `reconcileLayout` reports
+// `needsFreshSessionInWorkspaceId` (rule 6 below) or a non-empty
+// `toRelaunch` (M4.7, rule 6.5 below) — calls `session.create` itself,
+// since this module never touches the daemon or any bridge.
 
-import type { SessionId, SessionSummary } from '@termhub/shared';
-import type { PersistedPaneNode, PersistedWorkspace, WorkspacesFile } from '@termhub/shared';
+import type { LaunchSpec, SessionId, SessionSummary } from '@termhub/shared';
+import type {
+  PersistedPaneNode,
+  PersistedWorkspace,
+  WorkspaceTemplate,
+  WorkspacesFile,
+} from '@termhub/shared';
 
 import {
   closePane,
@@ -59,8 +66,18 @@ export const RECOVERED_WORKSPACE_CWD_FALLBACK = 'C:\\';
  * `sessionCreatedAt` can't collide with a real epoch-millisecond timestamp),
  * which is the safe failure mode — it will be treated as dead, not as a
  * false match.
+ *
+ * `templates` (M4.7) rides along in the same file — `WorkspacesView.tsx`'s
+ * own templates store is what actually owns them; this function only
+ * embeds whatever it's handed, verbatim, so a caller saving the layout can
+ * compose one `bridge.saveLayout` call that never wipes out the other half
+ * of the file. Omitted entirely when empty, matching `activeWorkspaceId`'s
+ * own "don't persist a value with nothing behind it" posture just above.
  */
-export function toPersistedLayout(state: StoreState): WorkspacesFile {
+export function toPersistedLayout(
+  state: StoreState,
+  templates: readonly WorkspaceTemplate[] = [],
+): WorkspacesFile {
   const workspaces: PersistedWorkspace[] = state.workspaces.map((workspace) =>
     toPersistedWorkspace(workspace, state.sessions),
   );
@@ -70,6 +87,7 @@ export function toPersistedLayout(state: StoreState): WorkspacesFile {
       ? { activeWorkspaceId: state.activeWorkspaceId }
       : {}),
     workspaces,
+    ...(templates.length > 0 ? { templates: [...templates] } : {}),
   };
 }
 
@@ -93,10 +111,20 @@ function toPersistedNode(
   sessions: Record<SessionId, SessionSummary>,
 ): PersistedPaneNode {
   if (node.kind === 'leaf') {
+    const session = sessions[node.sessionId];
     return {
       kind: 'leaf',
       sessionId: node.sessionId,
-      sessionCreatedAt: sessions[node.sessionId]?.createdAt ?? 0,
+      sessionCreatedAt: session?.createdAt ?? 0,
+      // M4.7: "relançar sessão morta com o mesmo comando" needs to know
+      // what that command *was* — filled in here, from the session's own
+      // metadata, whenever it's known. Omitted (not `launch: undefined`,
+      // `exactOptionalPropertyTypes` per typescript-rules.md) when the
+      // session's metadata isn't in the store at all — the same safe
+      // fallback `sessionCreatedAt`'s own `?? 0` already gives: a leaf with
+      // no launch spec is simply not a relaunch candidate on the next
+      // reconciliation, same as before this task.
+      ...(session !== undefined ? { launch: launchSpecOf(session) } : {}),
     };
   }
   return {
@@ -109,22 +137,69 @@ function toPersistedNode(
   };
 }
 
+/** A leaf's `launch` spec, built from its live `SessionSummary` — the shell/cwd/args/command that would spawn an equivalent session again. */
+function launchSpecOf(session: SessionSummary): LaunchSpec {
+  return {
+    name: session.name,
+    cwd: session.cwd,
+    shell: session.shell,
+    ...(session.args !== undefined ? { args: session.args } : {}),
+    ...(session.command !== undefined ? { command: session.command } : {}),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // reconcileLayout — file + session.list -> initial store state
 // ---------------------------------------------------------------------------
+
+/**
+ * M4.7: one dead leaf `reconcileLayout` found a `launch` spec for, reported
+ * so the caller (`session-boot.ts`/`daemon-resync.ts`) can create a
+ * replacement session and swap it into the tree at the very same spot —
+ * see `applyRelaunchedSession` below, the other half of this contract.
+ */
+export interface PendingRelaunch {
+  /** Which returned workspace (in `ReconcileRestored.workspaces`) this leaf lives in. */
+  workspaceId: string;
+  /**
+   * The placeholder id still sitting in that workspace's tree — the dead
+   * session's own former id, deliberately **not** removed from the tree
+   * (unlike a dead leaf with no `launch`, which `closePane` already
+   * collapsed away) so its exact position — same split node `id`s/`ratio`s
+   * above it, same side of the tree — survives until the caller has an id
+   * to actually replace it with.
+   */
+  sessionId: SessionId;
+  launch: LaunchSpec;
+}
 
 export interface ReconcileRestored {
   kind: 'restored';
   workspaces: Workspace[];
   activeWorkspaceId: string;
   /**
-   * Set only under rule 6: `liveSessions` was empty (the daemon restarted),
-   * so every workspace's tree collapsed to `root: null` — nothing survived
-   * to reconcile against. The caller must create exactly **one** new
-   * session in this workspace (the same `session.create` the M2.6 boot
-   * uses) before hydrating the store, or every pane would start empty.
+   * Set only under rule 6: `liveSessions` was empty (the daemon restarted)
+   * **and** nothing was left to relaunch either (`toRelaunch` below is
+   * empty) — every workspace's tree collapsed to `root: null` and there is
+   * no better information to seed a pane with. The caller must create
+   * exactly **one** new session in this workspace (the same `session.create`
+   * the M2.6 boot uses) before hydrating the store, or every pane would
+   * start empty.
    */
   needsFreshSessionInWorkspaceId?: string;
+  /**
+   * M4.7: every dead leaf that carried a `launch` spec, across every
+   * workspace — still sitting in `workspaces` above under its old,
+   * placeholder id (see `PendingRelaunch.sessionId`'s own doc comment). The
+   * caller creates one new session per entry, with `launch`'s own
+   * shell/cwd/args/command (never re-resolving "the machine's current
+   * default shell" — the whole point is running the *same* thing again),
+   * then calls `applyRelaunchedSession` to swap it in. Always present, even
+   * when empty, so a caller never has to guard against `undefined` — this
+   * function is pure and never calls anything itself (`session-boot.ts`'s
+   * own header comment).
+   */
+  toRelaunch: PendingRelaunch[];
 }
 
 /**
@@ -151,8 +226,8 @@ export type ReconcileOutcome = { kind: 'fresh-boot' } | ReconcileRestored;
  *    correctly (surviving sibling keeps its own `id`/`ratio` — M3.1's
  *    armadilha 2), reused here rather than reimplemented.
  * 2. A workspace whose tree collapses entirely (`root: null`) still exists,
- *    with its `name`/`cwd` intact. Relaunching a session into it is M4.7's
- *    job, not this one's.
+ *    with its `name`/`cwd` intact. Relaunching a session into it (when one
+ *    of its dead leaves has a `launch` spec) is rule 6.5's job, below.
  * 3. `focusedSessionId` that no longer names a surviving leaf becomes the
  *    first surviving leaf (`treeLeaves` order), or `undefined` if none
  *    survived. `activeWorkspaceId` that is missing, or that named a
@@ -163,9 +238,18 @@ export type ReconcileOutcome = { kind: 'fresh-boot' } | ReconcileRestored;
  *    collected into one `RECOVERED_WORKSPACE_ID` workspace, created only
  *    when at least one orphan exists.
  * 5. See `ReconcileOutcome`'s doc comment.
- * 6. See `ReconcileRestored.needsFreshSessionInWorkspaceId`'s doc comment.
- *    This can only apply when `liveSessions` is empty — with any live
- *    session present, an unplaced one is rule 4's orphan case instead.
+ * 6. See `ReconcileRestored.needsFreshSessionInWorkspaceId`'s doc comment —
+ *    only when `liveSessions` is empty **and** `toRelaunch` (rule 6.5) is
+ *    also empty. With any live session present, an unplaced one is rule 4's
+ *    orphan case instead.
+ * 6.5 (M4.7). A dead leaf (rule 1's match failed) that carries a `launch`
+ *     spec is **not** removed via `closePane` like an ordinary dead leaf —
+ *     it stays exactly where it is, still bearing its old, now-dead
+ *     `sessionId`, and is reported in `ReconcileRestored.toRelaunch`
+ *     instead (see that field's own doc comment for what the caller does
+ *     with it). A dead leaf with *no* `launch` is removed exactly as rule 1
+ *     always did — this only changes the leaves that have somewhere to be
+ *     relaunched to.
  */
 export function reconcileLayout(
   file: WorkspacesFile | undefined,
@@ -179,9 +263,10 @@ export function reconcileLayout(
     liveSessions.map((session) => [session.id, session.createdAt]),
   );
   const placed = new Set<SessionId>();
+  const toRelaunch: PendingRelaunch[] = [];
 
   const workspaces: Workspace[] = file.workspaces.map((persisted) =>
-    reconcileWorkspace(persisted, liveCreatedAtById, placed),
+    reconcileWorkspace(persisted, liveCreatedAtById, placed, toRelaunch),
   );
 
   const orphans = liveSessions.filter((session) => !placed.has(session.id));
@@ -203,29 +288,41 @@ export function reconcileLayout(
       ? file.activeWorkspaceId
       : firstWorkspace.id;
 
-  if (liveSessions.length === 0) {
+  if (liveSessions.length === 0 && toRelaunch.length === 0) {
     return {
       kind: 'restored',
       workspaces,
       activeWorkspaceId,
       needsFreshSessionInWorkspaceId: activeWorkspaceId,
+      toRelaunch,
     };
   }
 
-  return { kind: 'restored', workspaces, activeWorkspaceId };
+  return { kind: 'restored', workspaces, activeWorkspaceId, toRelaunch };
 }
 
 function reconcileWorkspace(
   persisted: PersistedWorkspace,
   liveCreatedAtById: ReadonlyMap<SessionId, number>,
   placed: Set<SessionId>,
+  toRelaunch: PendingRelaunch[],
 ): Workspace {
   let root = toLiveNode(persisted.root);
-  for (const deadId of deadLeafIds(persisted.root, liveCreatedAtById)) {
+  for (const dead of deadLeaves(persisted.root, liveCreatedAtById)) {
+    if (dead.launch !== undefined) {
+      // Rule 6.5: left in place, on purpose — see `PendingRelaunch`'s own
+      // doc comment for why this leaf is never handed to `closePane`.
+      toRelaunch.push({
+        workspaceId: persisted.id,
+        sessionId: dead.sessionId,
+        launch: dead.launch,
+      });
+      continue;
+    }
     if (root === null) {
       break;
     }
-    const outcome = closePane(root, deadId);
+    const outcome = closePane(root, dead.sessionId);
     if (outcome.ok) {
       root = outcome.root;
     }
@@ -262,7 +359,7 @@ function buildRecoveredWorkspace(orphans: readonly SessionSummary[]): Workspace 
   };
 }
 
-/** Strips `sessionCreatedAt` (the persisted-only field) to get a plain `PaneNode` `tree.ts` can operate on. Liveness itself is decided by `deadLeafIds`, not here — this is pure reshaping. */
+/** Strips `sessionCreatedAt`/`launch` (the persisted-only fields) to get a plain `PaneNode` `tree.ts` can operate on. Liveness itself is decided by `deadLeaves`, not here — this is pure reshaping. */
 function toLiveNode(node: PersistedPaneNode): PaneNode;
 function toLiveNode(node: PersistedPaneNode | null): PaneNode | null;
 function toLiveNode(node: PersistedPaneNode | null): PaneNode | null {
@@ -282,12 +379,18 @@ function toLiveNode(node: PersistedPaneNode | null): PaneNode | null {
   };
 }
 
-/** Every leaf `sessionId` in `node` whose live session is missing, or whose `createdAt` doesn't match (rule 1's id+createdAt requirement — a same-id session from a different daemon lifetime is not a match). */
-function deadLeafIds(
+/** One dead leaf, as `deadLeaves` reports it — the leaf's own former id, plus its `launch` spec when it has one (rule 6.5). */
+interface DeadLeaf {
+  sessionId: SessionId;
+  launch?: LaunchSpec;
+}
+
+/** Every leaf in `node` whose live session is missing, or whose `createdAt` doesn't match (rule 1's id+createdAt requirement — a same-id session from a different daemon lifetime is not a match). */
+function deadLeaves(
   node: PersistedPaneNode | null,
   liveCreatedAtById: ReadonlyMap<SessionId, number>,
-): SessionId[] {
-  const ids: SessionId[] = [];
+): DeadLeaf[] {
+  const dead: DeadLeaf[] = [];
   function recur(current: PersistedPaneNode | null): void {
     if (current === null) {
       return;
@@ -295,7 +398,10 @@ function deadLeafIds(
     if (current.kind === 'leaf') {
       const createdAt = liveCreatedAtById.get(current.sessionId);
       if (createdAt === undefined || createdAt !== current.sessionCreatedAt) {
-        ids.push(current.sessionId);
+        dead.push({
+          sessionId: current.sessionId,
+          ...(current.launch !== undefined ? { launch: current.launch } : {}),
+        });
       }
       return;
     }
@@ -303,5 +409,62 @@ function deadLeafIds(
     recur(current.b);
   }
   recur(node);
-  return ids;
+  return dead;
+}
+
+// ---------------------------------------------------------------------------
+// applyRelaunchedSession — the other half of rule 6.5's contract
+// ---------------------------------------------------------------------------
+
+/**
+ * Swaps a `PendingRelaunch` entry's placeholder leaf (its dead session's own
+ * former id, still sitting in the tree — see that field's own doc comment)
+ * for the brand-new session the caller just created with that same
+ * `launch` spec. Same workspace, same split node ids/ratios, same side of
+ * the tree — relaunching a pane must never move it (this task's own
+ * "armadilhas" section). Also moves `focusedSessionId` along, when it
+ * pointed at the placeholder.
+ *
+ * Pure and a no-op (returns `workspaces` itself, same reference) if
+ * `workspaceId` doesn't name a workspace in `workspaces`, or that
+ * workspace's tree has no leaf with `oldSessionId` — defensive; every real
+ * caller only ever passes back exactly what `reconcileLayout` itself
+ * reported in `toRelaunch`, straight from `ReconcileRestored.workspaces`.
+ */
+export function applyRelaunchedSession(
+  workspaces: Workspace[],
+  workspaceId: string,
+  oldSessionId: SessionId,
+  newSession: SessionSummary,
+): Workspace[] {
+  const workspace = workspaces.find((w) => w.id === workspaceId);
+  if (workspace === undefined || workspace.root === null) {
+    return workspaces;
+  }
+  const nextRoot = replaceLeafSessionId(workspace.root, oldSessionId, newSession.id);
+  if (nextRoot === workspace.root) {
+    return workspaces;
+  }
+  return workspaces.map((w) =>
+    w.id === workspaceId
+      ? {
+          ...w,
+          root: nextRoot,
+          focusedSessionId:
+            w.focusedSessionId === oldSessionId ? newSession.id : w.focusedSessionId,
+        }
+      : w,
+  );
+}
+
+function replaceLeafSessionId(node: PaneNode, oldId: SessionId, newId: SessionId): PaneNode {
+  if (node.kind === 'leaf') {
+    return node.sessionId === oldId ? { kind: 'leaf', sessionId: newId } : node;
+  }
+  const a = replaceLeafSessionId(node.a, oldId, newId);
+  const b = replaceLeafSessionId(node.b, oldId, newId);
+  if (a === node.a && b === node.b) {
+    return node;
+  }
+  return { ...node, a, b };
 }

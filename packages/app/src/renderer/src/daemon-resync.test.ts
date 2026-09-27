@@ -188,7 +188,7 @@ describe('runDaemonResync (docs/specs/m4.8-daemon-resilience.md required test 4)
     expect(registryFake.reattachAllCalls).toBe(1);
   });
 
-  it('mixed: one workspace survives untouched, another loses its only session and ends up empty — no fresh session created (some live session exists elsewhere)', async () => {
+  it('mixed: one workspace survives untouched, another loses its only session and gets relaunched in place with the same shell (M4.7)', async () => {
     const survivor = makeSession({ id: 1, createdAt: 1000 });
     const dead = makeSession({ id: 2, createdAt: 2000 });
     const initial: StoreState = {
@@ -204,21 +204,32 @@ describe('runDaemonResync (docs/specs/m4.8-daemon-resilience.md required test 4)
       activeWorkspaceId: 'ws1',
       sessions: { 1: survivor, 2: dead },
     };
+    // `dead`'s own metadata (shell/cwd) is known to the store, so
+    // `toPersistedLayout` gives its leaf a `launch` spec — M4.7's rule 6.5
+    // relaunches it in place instead of dropping it, unlike before this task.
     const { bridge, requests } = createFakeBridge({ sessionListResult: [survivor] }); // only session 1 survived
     const { store, hydrateCalls } = createFakeStore(initial);
     const registryFake = createFakeRegistry();
 
     const result = await runDaemonResync(bridge, store, registryFake.registry);
 
-    expect(result.daemonRestarted).toBe(false);
-    expect(requests.some((r) => r.method === 'session.create')).toBe(false); // rule 6 doesn't apply — a live session exists
+    expect(result.daemonRestarted).toBe(false); // a live session (1) exists — the daemon itself never restarted
+    const createCalls = requests.filter((r) => r.method === 'session.create');
+    expect(createCalls).toHaveLength(1); // the relaunch of ws2's dead session — not rule 6 (a live session exists elsewhere)
+    expect(createCalls[0]?.params).toMatchObject({ shell: dead.shell, cwd: dead.cwd });
     const hydrated = hydrateCalls[0];
     expect(hydrated?.workspaces.find((w) => w.id === 'ws1')?.root).toEqual({
       kind: 'leaf',
       sessionId: 1,
     });
-    expect(hydrated?.workspaces.find((w) => w.id === 'ws2')?.root).toBeNull();
-    expect(hydrated?.sessions[2]).toBeUndefined(); // the dead session's metadata is gone
+    // ws2 is no longer empty: it got a brand-new session (the fake bridge's
+    // default `session.create` result, id 99), in the exact same spot.
+    expect(hydrated?.workspaces.find((w) => w.id === 'ws2')?.root).toEqual({
+      kind: 'leaf',
+      sessionId: 99,
+    });
+    expect(hydrated?.sessions[2]).toBeUndefined(); // the dead session's OWN metadata is gone
+    expect(hydrated?.sessions[99]).toBeDefined(); // replaced by the relaunched one's
     expect(registryFake.reattachAllCalls).toBe(1);
   });
 
@@ -286,7 +297,11 @@ describe('runDaemonResync — the restart session uses the real default shell pr
   }
 
   it('a profiles.list that offers pwsh: the fresh session is created with it, not powershell.exe', async () => {
-    const oldSession = makeSession({ id: 1, createdAt: 1000 });
+    // M4.7: `sessions: {}` (no known metadata for the workspace's dead leaf
+    // at all) is what makes this genuinely rule 6's path — with a known
+    // `SessionSummary` in the store, `toPersistedLayout` would give that
+    // leaf a `launch` spec, and rule 6.5's relaunch (using that launch's
+    // OWN shell, never `resolveDefaultShellParams`) would fire instead.
     const { bridge, requests } = createFakeBridge({
       sessionListResult: [],
       createResult: makeSession({ id: 1, createdAt: 5000, shell: 'pwsh.exe', args: ['-NoLogo'] }),
@@ -295,7 +310,7 @@ describe('runDaemonResync — the restart session uses the real default shell pr
     const { store } = createFakeStore({
       workspaces: [makeWorkspace()],
       activeWorkspaceId: 'ws1',
-      sessions: { 1: oldSession },
+      sessions: {},
     });
     const registryFake = createFakeRegistry();
 
@@ -306,7 +321,8 @@ describe('runDaemonResync — the restart session uses the real default shell pr
   });
 
   it('a rejecting profiles.list: the fresh session falls back to the fixed DEFAULT_SHELL, with no args — never blocks the resync', async () => {
-    const oldSession = makeSession({ id: 1, createdAt: 1000 });
+    // Same M4.7 note as the test above: no known session metadata, so this
+    // stays rule 6's path rather than a rule-6.5 relaunch.
     const { bridge, requests } = createFakeBridge({
       sessionListResult: [],
       createResult: makeSession({ id: 1, createdAt: 5000 }),
@@ -315,7 +331,7 @@ describe('runDaemonResync — the restart session uses the real default shell pr
     const { store, hydrateCalls } = createFakeStore({
       workspaces: [makeWorkspace()],
       activeWorkspaceId: 'ws1',
-      sessions: { 1: oldSession },
+      sessions: {},
     });
     const registryFake = createFakeRegistry();
 
@@ -434,10 +450,90 @@ describe('runDaemonResync — at most one resync in flight', () => {
 
     // B's own reconciliation finds that session already matching the store
     // (same id+createdAt, since A's hydrate already placed it) — nothing
-    // missing, so B never needs rule 6 at all.
+    // missing, so B never needs rule 6 (or M4.7's relaunch) at all. Note:
+    // `initial.sessions[1]` above already carries full `SessionSummary`
+    // metadata, so A's own relaunch went through rule 6.5 (M4.7), not
+    // rule 6 — this test's own guarantee ("at most one session.create
+    // across two generations") holds either way, which is exactly what it
+    // is checking.
     expect(resultB.daemonRestarted).toBe(false);
     expect(requests.filter((r) => r.method === 'session.create')).toHaveLength(1); // still just A's
     expect(hydrateCalls).toHaveLength(2); // both A and B actually ran and hydrated
     expect(registryFake.reattachAllCalls).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M4.7: rule 6.5 in the resync path specifically — relaunched in the exact
+// same tree spot (split node id/ratio untouched), with the dead session's
+// own args/command, not just shell/cwd (already covered by the "mixed"
+// test above).
+// ---------------------------------------------------------------------------
+
+describe('runDaemonResync — rule 6.5 relaunch (M4.7)', () => {
+  it('relaunches a dead leaf with args/command intact, in the same split position, without touching profiles.list at all', async () => {
+    const dead = makeSession({
+      id: 1,
+      createdAt: 1000,
+      shell: 'pwsh.exe',
+      cwd: 'C:\\agents',
+      args: ['-NoLogo'],
+      command: 'claude',
+    });
+    const initial: StoreState = {
+      workspaces: [
+        makeWorkspace({
+          root: {
+            kind: 'split',
+            id: 'n1',
+            dir: 'row',
+            ratio: 0.33,
+            a: { kind: 'leaf', sessionId: 1 },
+            b: { kind: 'leaf', sessionId: 2 },
+          },
+          focusedSessionId: 1,
+        }),
+      ],
+      activeWorkspaceId: 'ws1',
+      sessions: { 1: dead, 2: makeSession({ id: 2, createdAt: 2000 }) },
+    };
+    const relaunched = makeSession({
+      id: 55,
+      createdAt: 9000,
+      shell: 'pwsh.exe',
+      cwd: 'C:\\agents',
+    });
+    // Only session 2 survives — session 1 is dead, and it's the one with
+    // the launch spec (args/command).
+    const { bridge, requests } = createFakeBridge({
+      sessionListResult: [makeSession({ id: 2, createdAt: 2000 })],
+      createResult: relaunched,
+    });
+    const { store, hydrateCalls } = createFakeStore(initial);
+    const registryFake = createFakeRegistry();
+
+    const result = await runDaemonResync(bridge, store, registryFake.registry);
+
+    expect(result.daemonRestarted).toBe(false); // session 2 is still live
+    const createCalls = requests.filter((r) => r.method === 'session.create');
+    expect(createCalls).toHaveLength(1);
+    expect(createCalls[0]?.params).toMatchObject({
+      shell: 'pwsh.exe',
+      cwd: 'C:\\agents',
+      args: ['-NoLogo'],
+      command: 'claude',
+    });
+    expect(requests.some((r) => r.method === 'profiles.list')).toBe(false);
+    const hydrated = hydrateCalls[0];
+    // Same split node id/ratio, same side — only the leaf's own id changed.
+    expect(hydrated?.workspaces[0]?.root).toEqual({
+      kind: 'split',
+      id: 'n1',
+      dir: 'row',
+      ratio: 0.33,
+      a: { kind: 'leaf', sessionId: 55 },
+      b: { kind: 'leaf', sessionId: 2 },
+    });
+    expect(hydrated?.workspaces[0]?.focusedSessionId).toBe(55);
   });
 });

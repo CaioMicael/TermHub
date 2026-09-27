@@ -4,6 +4,7 @@ import type { SessionId, SessionSummary } from '@termhub/shared';
 import { collectSessionIds, treeLeaves } from './store/tree.js';
 import type { StoreState, Workspace } from './store/workspace.js';
 import {
+  applyRelaunchedSession,
   reconcileLayout,
   toPersistedLayout,
   RECOVERED_WORKSPACE_ID,
@@ -63,12 +64,60 @@ describe('toPersistedLayout', () => {
             id: 'n1',
             dir: 'row',
             ratio: 0.35,
-            a: { kind: 'leaf', sessionId: 1, sessionCreatedAt: 111 },
-            b: { kind: 'leaf', sessionId: 2, sessionCreatedAt: 222 },
+            // M4.7: every leaf whose session metadata is known also gets a
+            // `launch` spec, built from that same metadata.
+            a: {
+              kind: 'leaf',
+              sessionId: 1,
+              sessionCreatedAt: 111,
+              launch: { name: 'powershell.exe', cwd: 'C:\\repo', shell: 'powershell.exe' },
+            },
+            b: {
+              kind: 'leaf',
+              sessionId: 2,
+              sessionCreatedAt: 222,
+              launch: { name: 'powershell.exe', cwd: 'C:\\repo', shell: 'powershell.exe' },
+            },
           },
         },
       ],
     });
+  });
+
+  it("(M4.7) a leaf's launch spec carries args/command when the session has them, and templates ride along in the same file, omitted when empty", () => {
+    const sessions: Record<SessionId, SessionSummary> = {
+      1: session({ id: 1, shell: 'pwsh.exe', args: ['-NoLogo'], command: 'claude' }),
+    };
+    const workspace: Workspace = {
+      id: 'ws-a',
+      name: 'alpha',
+      cwd: 'C:\\a',
+      root: { kind: 'leaf', sessionId: 1 },
+      focusedSessionId: 1,
+      maximizedSessionId: undefined,
+    };
+    const state: StoreState = { workspaces: [workspace], activeWorkspaceId: 'ws-a', sessions };
+
+    const withoutTemplates = toPersistedLayout(state);
+    expect(withoutTemplates.templates).toBeUndefined();
+    expect(withoutTemplates.workspaces[0]?.root).toEqual({
+      kind: 'leaf',
+      sessionId: 1,
+      sessionCreatedAt: sessions[1]?.createdAt,
+      // `cwd`/`name` come from the *session's own* metadata, not the
+      // workspace's `cwd` — a session can be spawned into a different
+      // directory than the workspace it currently sits in.
+      launch: {
+        name: 'powershell.exe',
+        cwd: 'C:\\repo',
+        shell: 'pwsh.exe',
+        args: ['-NoLogo'],
+        command: 'claude',
+      },
+    });
+
+    const template = { id: 'tpl-1', name: '3 agentes', sessions: [] };
+    expect(toPersistedLayout(state, [template]).templates).toEqual([template]);
   });
 
   it('omits activeWorkspaceId/focusedSessionId when undefined, and persists root: null as is', () => {
@@ -413,5 +462,257 @@ describe('reconcileLayout', () => {
       throw new Error('expected restored');
     }
     expect(outcome.needsFreshSessionInWorkspaceId).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M4.7: rule 6.5 — a dead leaf with a `launch` spec is relaunched in place,
+// not dropped — and `applyRelaunchedSession`, the other half of the
+// contract `session-boot.ts`/`daemon-resync.ts` use to swap the new session
+// into the exact same spot.
+// ---------------------------------------------------------------------------
+
+describe('reconcileLayout — rule 6.5 (M4.7): relaunchable dead leaves', () => {
+  const launchOf = (name: string): { name: string; cwd: string; shell: string } => ({
+    name,
+    cwd: 'C:\\agents',
+    shell: 'pwsh.exe',
+  });
+
+  it('a dead leaf with launch stays in the tree (same split id/ratio) and is reported in toRelaunch, instead of being removed', () => {
+    const file = {
+      version: 1 as const,
+      workspaces: [
+        {
+          id: 'ws-a',
+          name: 'a',
+          cwd: 'C:\\a',
+          root: {
+            kind: 'split' as const,
+            id: 'outer',
+            dir: 'row' as const,
+            ratio: 0.4,
+            a: {
+              kind: 'leaf' as const,
+              sessionId: 1,
+              sessionCreatedAt: 100,
+              launch: launchOf('agent-1'),
+            },
+            b: { kind: 'leaf' as const, sessionId: 2, sessionCreatedAt: 200 }, // dead, no launch
+          },
+          focusedSessionId: 1,
+        },
+      ],
+    };
+
+    const outcome = reconcileLayout(file, []); // nothing survived
+    if (outcome.kind !== 'restored') {
+      throw new Error('expected restored');
+    }
+    // The relaunchable leaf rose to take the whole tree (armadilha 2, same
+    // as an ordinary dead sibling) but is still THERE, under its old id —
+    // not collapsed away like the launch-less one was.
+    expect(outcome.workspaces[0]?.root).toEqual({ kind: 'leaf', sessionId: 1 });
+    expect(outcome.toRelaunch).toEqual([
+      { workspaceId: 'ws-a', sessionId: 1, launch: launchOf('agent-1') },
+    ]);
+    // Rule 6 does NOT fire — there is something to relaunch.
+    expect(outcome.needsFreshSessionInWorkspaceId).toBeUndefined();
+  });
+
+  it('two relaunchable leaves under the same split both survive and are both reported, preserving the split node id/ratio', () => {
+    const file = {
+      version: 1 as const,
+      workspaces: [
+        {
+          id: 'ws-a',
+          name: 'a',
+          cwd: 'C:\\a',
+          root: {
+            kind: 'split' as const,
+            id: 'n1',
+            dir: 'column' as const,
+            ratio: 0.62,
+            a: {
+              kind: 'leaf' as const,
+              sessionId: 1,
+              sessionCreatedAt: 100,
+              launch: launchOf('agent-1'),
+            },
+            b: {
+              kind: 'leaf' as const,
+              sessionId: 2,
+              sessionCreatedAt: 200,
+              launch: launchOf('agent-2'),
+            },
+          },
+        },
+      ],
+    };
+
+    const outcome = reconcileLayout(file, []);
+    if (outcome.kind !== 'restored') {
+      throw new Error('expected restored');
+    }
+    // Untouched: neither leaf was ever handed to closePane, so the split
+    // node's own id/ratio survive verbatim (just stripped of the
+    // persisted-only sessionCreatedAt/launch fields, same as any live node).
+    expect(outcome.workspaces[0]?.root).toEqual({
+      kind: 'split',
+      id: 'n1',
+      dir: 'column',
+      ratio: 0.62,
+      a: { kind: 'leaf', sessionId: 1 },
+      b: { kind: 'leaf', sessionId: 2 },
+    });
+    expect(outcome.toRelaunch).toEqual([
+      { workspaceId: 'ws-a', sessionId: 1, launch: launchOf('agent-1') },
+      { workspaceId: 'ws-a', sessionId: 2, launch: launchOf('agent-2') },
+    ]);
+  });
+
+  it('rule 6 does not fire when nothing survived but something is relaunchable, across two workspaces', () => {
+    const file = {
+      version: 1 as const,
+      activeWorkspaceId: 'ws-b',
+      workspaces: [
+        {
+          id: 'ws-a',
+          name: 'a',
+          cwd: 'C:\\a',
+          root: { kind: 'leaf' as const, sessionId: 1, sessionCreatedAt: 100 }, // no launch: dropped
+        },
+        {
+          id: 'ws-b',
+          name: 'b',
+          cwd: 'C:\\b',
+          root: {
+            kind: 'leaf' as const,
+            sessionId: 2,
+            sessionCreatedAt: 200,
+            launch: launchOf('agent'),
+          },
+        },
+      ],
+    };
+
+    const outcome = reconcileLayout(file, []);
+    if (outcome.kind !== 'restored') {
+      throw new Error('expected restored');
+    }
+    expect(outcome.workspaces.map((w) => ({ id: w.id, root: w.root }))).toEqual([
+      { id: 'ws-a', root: null }, // launch-less dead leaf: gone, as rule 1 always did
+      { id: 'ws-b', root: { kind: 'leaf', sessionId: 2 } }, // relaunchable: kept in place
+    ]);
+    expect(outcome.needsFreshSessionInWorkspaceId).toBeUndefined();
+    expect(outcome.toRelaunch).toEqual([
+      { workspaceId: 'ws-b', sessionId: 2, launch: launchOf('agent') },
+    ]);
+  });
+
+  it('rule 6 still fires when nothing survived and nothing is relaunchable either (no launch anywhere)', () => {
+    const file = {
+      version: 1 as const,
+      workspaces: [
+        {
+          id: 'ws-a',
+          name: 'a',
+          cwd: 'C:\\a',
+          root: { kind: 'leaf' as const, sessionId: 1, sessionCreatedAt: 100 },
+        },
+      ],
+    };
+
+    const outcome = reconcileLayout(file, []);
+    if (outcome.kind !== 'restored') {
+      throw new Error('expected restored');
+    }
+    expect(outcome.toRelaunch).toEqual([]);
+    expect(outcome.needsFreshSessionInWorkspaceId).toBe('ws-a');
+  });
+});
+
+describe('applyRelaunchedSession (M4.7)', () => {
+  function relaunchedSession(
+    overrides: Partial<SessionSummary> & { id: SessionId },
+  ): SessionSummary {
+    return session(overrides);
+  }
+
+  it('swaps the placeholder leaf for the new session, in the exact same spot, and moves focus along', () => {
+    const workspaces: Workspace[] = [
+      {
+        id: 'ws-a',
+        name: 'a',
+        cwd: 'C:\\a',
+        root: {
+          kind: 'split',
+          id: 'n1',
+          dir: 'row',
+          ratio: 0.42,
+          a: { kind: 'leaf', sessionId: 1 }, // the dead placeholder
+          b: { kind: 'leaf', sessionId: 99 },
+        },
+        focusedSessionId: 1,
+        maximizedSessionId: undefined,
+      },
+    ];
+    const newSession = relaunchedSession({ id: 500, createdAt: 5_000 });
+
+    const next = applyRelaunchedSession(workspaces, 'ws-a', 1, newSession);
+
+    expect(next[0]?.root).toEqual({
+      kind: 'split',
+      id: 'n1', // same split node id
+      dir: 'row',
+      ratio: 0.42, // same ratio
+      a: { kind: 'leaf', sessionId: 500 }, // swapped
+      b: { kind: 'leaf', sessionId: 99 }, // untouched
+    });
+    expect(next[0]?.focusedSessionId).toBe(500); // focus followed the swap
+  });
+
+  it('leaves focusedSessionId alone when it pointed somewhere else', () => {
+    const workspaces: Workspace[] = [
+      {
+        id: 'ws-a',
+        name: 'a',
+        cwd: 'C:\\a',
+        root: {
+          kind: 'split',
+          id: 'n1',
+          dir: 'row',
+          ratio: 0.5,
+          a: { kind: 'leaf', sessionId: 1 },
+          b: { kind: 'leaf', sessionId: 99 },
+        },
+        focusedSessionId: 99,
+        maximizedSessionId: undefined,
+      },
+    ];
+
+    const next = applyRelaunchedSession(workspaces, 'ws-a', 1, relaunchedSession({ id: 500 }));
+
+    expect(next[0]?.focusedSessionId).toBe(99);
+  });
+
+  it('is a no-op (same array reference) for an unknown workspace id or a leaf that is not there', () => {
+    const workspaces: Workspace[] = [
+      {
+        id: 'ws-a',
+        name: 'a',
+        cwd: 'C:\\a',
+        root: { kind: 'leaf', sessionId: 1 },
+        focusedSessionId: 1,
+        maximizedSessionId: undefined,
+      },
+    ];
+
+    expect(applyRelaunchedSession(workspaces, 'nope', 1, relaunchedSession({ id: 500 }))).toBe(
+      workspaces,
+    );
+    expect(applyRelaunchedSession(workspaces, 'ws-a', 999, relaunchedSession({ id: 500 }))).toBe(
+      workspaces,
+    );
   });
 });

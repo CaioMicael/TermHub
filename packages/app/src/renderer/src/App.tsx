@@ -7,6 +7,7 @@ import {
   Sidebar,
   SplitTree,
   TabBar,
+  useTemplatesStore,
   useTermhubStore,
   type ConnectionBannerKind,
   type SidebarView,
@@ -15,7 +16,11 @@ import {
 } from '@termhub/ui';
 
 import { runDaemonResync } from './daemon-resync.js';
-import { resolveBootWorkspace, startLayoutPersistence } from './session-boot.js';
+import {
+  resolveBootWorkspace,
+  startLayoutPersistence,
+  startTemplatesPersistence,
+} from './session-boot.js';
 
 // M3.1's casca: a tab strip (one workspace = one tab, docs/plan.md section
 // 2) over a grid of panes for the active workspace, everything read from
@@ -280,6 +285,13 @@ export function App() {
           activeWorkspaceId: result.activeWorkspaceId,
           sessions: nextSessions,
         });
+        // M4.7: seeds the templates store with whatever `workspaces.json`
+        // itself carried — same one-shot-at-boot posture as the layout's
+        // own `hydrate` just above, and for the same reason: nothing has
+        // subscribed to save yet (`startTemplatesPersistence` below only
+        // starts once `bootState` reaches `'ready'`), so this can never be
+        // read back as a "the user just cleared their templates" change.
+        useTemplatesStore.getState().setTemplates(result.templates);
         setBootState({ phase: 'ready' });
         return undefined;
       })
@@ -307,7 +319,17 @@ export function App() {
     if (bootState.phase !== 'ready') {
       return;
     }
-    return startLayoutPersistence(useTermhubStore, window.termhub);
+    return startLayoutPersistence(useTermhubStore, window.termhub, useTemplatesStore);
+  }, [bootState.phase]);
+
+  // M4.7: the other half — a templates-only change (saved/edited/deleted in
+  // `WorkspacesView.tsx`) also has to reach disk, gated the exact same way
+  // (only once boot's own hydrate/seed above has already run).
+  useEffect(() => {
+    if (bootState.phase !== 'ready') {
+      return;
+    }
+    return startTemplatesPersistence(useTemplatesStore, useTermhubStore, window.termhub);
   }, [bootState.phase]);
 
   // docs/specs/m4.8-daemon-resilience.md section 3.3: "Antes de o boot

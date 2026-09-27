@@ -125,7 +125,10 @@ describe('Registry', () => {
     registered?.session.write('echo hi\r');
     registered?.session.resize(100, 40);
     const fake = registered?.session as FakeSession;
-    expect(fake.writes).toEqual(['echo hi\r']);
+    // M4.7: `create()` itself already wrote `command + '\r'` right after
+    // spawning (this params fixture passes `command: 'claude'`) — that
+    // write is asserted on its own, below; `echo hi\r` here is on top of it.
+    expect(fake.writes).toEqual(['claude\r', 'echo hi\r']);
     expect(fake.resizes).toEqual([{ cols: 100, rows: 40 }]);
   });
 
@@ -161,6 +164,31 @@ describe('Registry', () => {
     const summary = registry.create(baseParams({ shell: 'pwsh.exe' }));
 
     expect(summary.args).toBeUndefined();
+  });
+
+  // M4.7: `command` used to be recorded onto the summary and never actually
+  // run — a session created with `command: 'claude'` opened a blank
+  // interactive shell. `create()` now writes it as a line of input right
+  // after spawning, `\r`-terminated (the Enter keystroke), so the shell
+  // itself runs it instead of just remembering it happened.
+  it('writes command + "\\r" to the freshly spawned session right after creating it', () => {
+    const { factory, sessions } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    registry.create(baseParams({ command: 'claude' }));
+
+    const [session] = sessions;
+    expect(session?.writes).toEqual(['claude\r']);
+  });
+
+  it('writes nothing at all when session.create has no command (an ordinary interactive shell)', () => {
+    const { factory, sessions } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    registry.create(baseParams());
+
+    const [session] = sessions;
+    expect(session?.writes).toEqual([]);
   });
 
   it('get() returns undefined for an id that was never created', () => {

@@ -29,6 +29,7 @@ import {
 } from './store/session-actions.js';
 import { useTermhubStore } from './store/store.js';
 import { isRestoreLastClosedShortcut } from './terminal-clipboard.js';
+import { WorkspacesView } from './WorkspacesView.js';
 
 export interface SidebarProps {
   view: SidebarView;
@@ -179,13 +180,13 @@ const GRAVEYARD_POLL_INTERVAL_MS = 15_000;
  * matching `termhub-prototipo.html`'s `.sidebar`/`.side-title`/`.group`/
  * `.row` (colors/spacing in `sidebar.css`).
  *
- * Only the `'terminals'` view has real content — `'search'` is M6's job,
- * `'profiles'` is M4.6's, and `'workspaces'` has no task assigned to it yet
- * in docs/milestones.md; all three render **just the title**, per this
- * task's prompt (section 2: "as vistas que não são Terminais ficam vazias,
- * só com o título" — no fabricated content for them, and no title-bar
- * actions either, since "Novo terminal"/"Dividir painel"/"Recolher tudo" are
- * all terminals-tree actions with nothing to act on in an empty view).
+ * `'terminals'` has its own tree, and `'workspaces'` (M4.7) has
+ * `WorkspacesView.tsx` — the templates list/editor, "salvar como
+ * modelo"/"novo modelo"/"abrir com um clique". `'search'` (M6's job) and
+ * `'profiles'` (M4.6's) still render **just the title** — no title-bar
+ * actions either for those two, since "Novo terminal"/"Dividir painel"/
+ * "Recolher tudo" are all terminals-tree actions with nothing to act on in
+ * an empty view.
  *
  * Collapsed-group state is local React state (`collapsed`, a `Set` of
  * workspace ids) — persisting it across a reload is M4.3's job (this task's
@@ -458,6 +459,7 @@ export function Sidebar({ view, bridge }: SidebarProps) {
             onRestore={restoreSession}
           />
         )}
+        {view === 'workspaces' && <WorkspacesView bridge={bridge} />}
       </div>
     </div>
   );

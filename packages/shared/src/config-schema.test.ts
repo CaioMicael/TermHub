@@ -155,4 +155,90 @@ describe('WorkspacesFileSchema: whole-file validation', () => {
         .success,
     ).toBe(false);
   });
+
+  // -------------------------------------------------------------------------
+  // M4.7: a leaf's optional `launch`, and the file's optional `templates`
+  // -------------------------------------------------------------------------
+
+  it('accepts a leaf with a launch spec (name/args/command included), and one with none at all', () => {
+    const file = validWorkspacesFile();
+    const [first] = file.workspaces;
+    if (first?.root?.kind !== 'split' || first.root.a.kind !== 'split') {
+      throw new Error('fixture: expected the nested split shape');
+    }
+    first.root.a = {
+      ...first.root.a,
+      a: {
+        kind: 'leaf',
+        sessionId: 1,
+        sessionCreatedAt: 1_000,
+        launch: {
+          name: 'claude',
+          cwd: 'C:\\w',
+          shell: 'pwsh.exe',
+          args: ['-NoLogo'],
+          command: 'claude',
+        },
+      },
+      b: leaf(2), // no launch at all — still valid
+    };
+    expect(WorkspacesFileSchema.safeParse(file).success).toBe(true);
+  });
+
+  it('rejects a launch spec missing cwd/shell (the two required fields)', () => {
+    const file = validWorkspacesFile();
+    const [first] = file.workspaces;
+    if (first?.root?.kind !== 'split' || first.root.a.kind !== 'split') {
+      throw new Error('fixture: expected the nested split shape');
+    }
+    // A structurally broken launch spec, same "build at the unknown
+    // boundary" approach the "malformed tree node" test above uses.
+    const brokenLeaf: unknown = {
+      kind: 'leaf',
+      sessionId: 1,
+      sessionCreatedAt: 1_000,
+      launch: { name: 'claude' }, // no cwd, no shell
+    };
+    expect(
+      WorkspacesFileSchema.safeParse({
+        ...file,
+        workspaces: [{ ...first, root: { ...first.root, a: brokenLeaf } }],
+      }).success,
+    ).toBe(false);
+  });
+
+  it('accepts templates (one full spec, one with a bare command-less session) and rejects duplicate template ids', () => {
+    const withTemplates: WorkspacesFile = {
+      ...validWorkspacesFile(),
+      templates: [
+        {
+          id: 'tpl-1',
+          name: '3 agentes',
+          sessions: [
+            {
+              name: 'agent-1',
+              cwd: 'C:\\repo',
+              shell: 'pwsh.exe',
+              args: ['-NoLogo'],
+              command: 'claude',
+            },
+            { name: 'agent-2', cwd: 'C:\\repo', shell: 'pwsh.exe', command: 'claude' },
+            { name: 'shell', cwd: 'C:\\repo', shell: 'pwsh.exe' },
+          ],
+        },
+      ],
+    };
+    expect(WorkspacesFileSchema.safeParse(withTemplates).success).toBe(true);
+
+    const duplicated: WorkspacesFile = {
+      ...withTemplates,
+      templates: [...(withTemplates.templates ?? []), { id: 'tpl-1', name: 'again', sessions: [] }],
+    };
+    expect(WorkspacesFileSchema.safeParse(duplicated).success).toBe(false);
+  });
+
+  it('a file with no templates field at all stays valid (an older workspaces.json, or one nobody ever saved a template into)', () => {
+    expect(WorkspacesFileSchema.safeParse(validWorkspacesFile()).success).toBe(true);
+    expect(validWorkspacesFile().templates).toBeUndefined();
+  });
 });

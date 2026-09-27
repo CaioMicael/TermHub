@@ -1,0 +1,154 @@
+/*
+ * `WorkspacesView.tsx` visuals — M4.7. The prototype (`termhub-prototipo.
+ * html`) never draws this view (this task's prompt, section 1) — decisions
+ * below follow the sidebar's own established language instead: the
+ * template list reuses `sidebar.css`'s `.th-row`/`.th-row-acts`/
+ * `.th-icon-btn` verbatim (identical hover-revealed actions to the
+ * terminals tree), and the two new pieces this view needs — a full-width
+ * primary/ghost button pair, and form fields — are built from the
+ * prototype's own `.btn`/`.btn.ghost`/`.input` rule blocks (same "hex value
+ * + comment naming the prototype var" convention `tab-bar.css`/
+ * `pane-header.css`/`sidebar.css` already use).
+ */
+
+.th-workspaces-view {
+  padding: 10px 12px 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+}
+
+.th-tv-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.th-btn {
+  background: #0e639c; /* prototype .btn */
+  color: #fff;
+  padding: 5px 12px;
+  border-radius: 3px;
+  font-size: 12px;
+  border: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  font-family: inherit;
+}
+
+.th-btn:hover:not(:disabled) {
+  background: #1177bb; /* prototype .btn:hover */
+}
+
+.th-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.th-btn.th-btn-ghost {
+  background: #3a3d41; /* prototype .btn.ghost */
+}
+
+.th-btn.th-btn-ghost:hover:not(:disabled) {
+  background: #45494e; /* prototype .btn.ghost:hover */
+}
+
+.th-tv-error {
+  color: #f14c4c; /* prototype --st-err */
+  font-size: 11.5px;
+  white-space: normal;
+}
+
+.th-tv-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.th-tv-empty {
+  color: #858585; /* prototype --fg-dim */
+  font-size: 12px;
+  padding: 6px 0;
+}
+
+/* `.th-row`'s own default padding (`sidebar.css`) is tuned for the
+   terminals tree's indent-under-a-group look; this list has no group
+   header above it, so it sits flush left instead. */
+.th-tv-row {
+  padding-left: 6px;
+}
+
+.th-tv-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.th-tv-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.th-tv-label {
+  color: #858585; /* prototype --fg-dim */
+  font-size: 11px;
+}
+
+.th-input {
+  background: #3c3c3c; /* prototype --bg-input */
+  border: 1px solid #3c3c3c;
+  color: #cccccc; /* prototype --fg */
+  padding: 4px 6px;
+  font-size: 12.5px;
+  border-radius: 2px;
+  width: 100%;
+  outline: none;
+  font-family: inherit;
+  box-sizing: border-box;
+}
+
+.th-input:focus {
+  border-color: #007acc; /* prototype --focus-border, undefined there — same substitute sidebar.css's own comment explains */
+}
+
+.th-select {
+  appearance: auto;
+  cursor: pointer;
+}
+
+.th-tv-sessions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.th-tv-session-row {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  padding-top: 10px;
+  border: 1px solid #3c3c3c; /* prototype --bg-input, used as a subtle divider here too */
+  border-radius: 4px;
+}
+
+.th-tv-remove-session {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+}
+
+.th-tv-add-session {
+  align-self: flex-start;
+}
+
+.th-tv-editor-acts {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}

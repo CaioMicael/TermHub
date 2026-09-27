@@ -149,6 +149,24 @@ export class Registry {
     };
     const session = this.sessionFactory(sessionOptions);
 
+    // M4.7: `params.command`, when present, used to be recorded onto the
+    // summary (below) and never actually run — a session created with
+    // `command: 'claude'` opened a blank interactive shell, no agent in
+    // sight. Coordinator's decision: write it as a line of input right after
+    // spawning, exactly as a person would type it at the prompt and press
+    // Enter — `\r`, not `\n`: that is the Enter keystroke a real terminal
+    // sends, and it is what a ConPTY-hosted PowerShell actually submits a
+    // line on (session.test.ts's/service.test.ts's own real-PTY suites use
+    // the same `\r`, for the same reason). This needs no per-shell argument
+    // assembly (`cmd /c`, `bash -c`, ...) and works identically for pwsh,
+    // powershell, cmd, bash and a WSL distro: the shell is still the thing
+    // that's alive underneath, so once `command` exits the shell's own
+    // prompt comes back exactly as if the person had typed it and the
+    // program had quit — never killing the session.
+    if (params.command !== undefined) {
+      session.write(`${params.command}\r`);
+    }
+
     const summary: SessionSummary = {
       id,
       name: params.name ?? params.shell,

@@ -1656,3 +1656,69 @@ describe('profiles.list: real detection end to end over the real pipe (M4.6)', (
     120_000,
   );
 });
+
+/**
+ * Platform-appropriate shell for the `command` test below (M4.7) — `/bin/sh`
+ * off Windows (this container's real environment; every other real-PTY test
+ * in this file assumes pwsh/powershell exist, which only holds on Windows),
+ * `powershell.exe` on Windows (this file's other real-PTY suites' own
+ * assumption). Kept separate from this file's own `resolveShell()`
+ * (Windows-only, pwsh-preferred-over-powershell) rather than changed: that
+ * one is used by tests this task's prompt does not ask to touch.
+ */
+function resolveShellForPlatform(): string {
+  return process.platform === 'win32' ? 'powershell.exe' : '/bin/sh';
+}
+
+describe('session.create with `command` (M4.7): the daemon actually runs it, not just records it', () => {
+  it(
+    'writes `command + "\\r"` to the real PTY right after spawning the shell, and the shell ' +
+      'itself survives after the command exits — proven by running a second command down the ' +
+      'same session afterward',
+    async () => {
+      const { registry, client } = await startHarness();
+      realRegistries.push(registry);
+
+      const createResult = await client.request<SessionCreateResult>('session.create', {
+        shell: resolveShellForPlatform(),
+        cwd: process.cwd(),
+        cols: 80,
+        rows: 24,
+        command: 'echo M47-LAUNCH-OK',
+      });
+      const sessionId = createResult.session.id;
+      // `registry.create()` records `command` onto the summary too (M1.4) —
+      // the defect this test's own suite name calls out is that it used to
+      // stop there, never actually running it.
+      expect(createResult.session.command).toBe('echo M47-LAUNCH-OK');
+
+      let output = '';
+      client.onData((sid, data) => {
+        if (sid === sessionId) {
+          output += Buffer.from(data).toString('utf8');
+        }
+      });
+      // Per M1.7's client contract (see this file's other real-PTY suite,
+      // above): install the data handler before session.attach, since the
+      // snapshot's frame(s) — which, here, already include the command's
+      // own output, written before this client ever attached — arrive ahead
+      // of that RPC's response, on the same ordered stream.
+      await client.request('session.attach', { sessionId });
+
+      // Not hasStandaloneLine: under ConPTY the next prompt can land right
+      // after the echoed text with no line break (see hasEchoOutput's own
+      // doc comment, and commits 66a73e7/78a1804 for the real case that
+      // broke a line-based check like this one).
+      await waitFor(() => hasEchoOutput(output, 'M47-LAUNCH-OK'), 15_000);
+
+      // The shell survives the command exiting — never killed, exactly a
+      // normal prompt back — proven by running a second command down the
+      // very same session and seeing IT echo too.
+      client.sendData(sessionId, Buffer.from('echo M47-STILL-ALIVE\r', 'utf8'));
+      await waitFor(() => hasEchoOutput(output, 'M47-STILL-ALIVE'), 15_000);
+
+      await client.request('session.kill', { sessionId });
+    },
+    20_000,
+  );
+});

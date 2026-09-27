@@ -3,9 +3,11 @@ import type {
   ProfilesListResult,
   SessionCreateParams,
   SessionSummary,
+  WorkspaceTemplate,
   WorkspacesFile,
 } from '@termhub/shared';
 import {
+  applyRelaunchedSession,
   reconcileLayout,
   toPersistedLayout,
   treeFromSessions,
@@ -163,8 +165,10 @@ export interface BootResult {
   /** M4.3: possibly more than one when a persisted layout was reconciled — the fresh-boot fallback still returns exactly one, as before. */
   workspaces: Workspace[];
   activeWorkspaceId: string;
-  /** Every session `session.list` returned (live and exited alike), plus one freshly created session when rule 6 applied — not just the ones placed in some workspace's tree. The caller (`App.tsx`) is expected to `upsertSession`-equivalent (via `hydrate`) all of them into the store. */
+  /** Every session `session.list` returned (live and exited alike), plus one freshly created session per relaunch (M4.7) and/or rule 6 — not just the ones placed in some workspace's tree. The caller (`App.tsx`) is expected to `upsertSession`-equivalent (via `hydrate`) all of them into the store. */
   sessions: SessionSummary[];
+  /** M4.7: the persisted `workspaces.json`'s own `templates`, verbatim — `[]` for the fresh-boot fallback (no file to read them from) or a `loadLayout()` rejection. The caller seeds its templates store with this once, at boot. */
+  templates: WorkspaceTemplate[];
 }
 
 let bootPromise: Promise<BootResult> | null = null;
@@ -211,18 +215,50 @@ async function bootWorkspaceOnce(
   }
 
   const outcome = reconcileLayout(layoutFile, live);
+  const templates = layoutFile?.templates ?? [];
 
   if (outcome.kind === 'fresh-boot') {
-    return freshBootWorkspace(bridge, size, sessions, live);
+    return { ...(await freshBootWorkspace(bridge, size, sessions, live)), templates };
   }
 
   let workspaces = outcome.workspaces;
   let allSessions = sessions;
+
+  // M4.7, rule 6.5: relaunch every dead leaf that carried a `launch` spec —
+  // its own shell/cwd/args/command, never `resolveDefaultShellParams`'s
+  // "machine's current default shell" (the whole point of a launch spec is
+  // running the *same* thing again). Done before rule 6 below: reconcileLayout
+  // itself already guarantees rule 6 never fires when this list isn't empty
+  // (docs/milestones.md M4.7's own decision — "regra 6 só vale quando não
+  // sobrou nada vivo nem nada pra relançar"), but this order also means a
+  // workspace that had *both* a relaunchable leaf and other, unrelated dead
+  // leaves ends up with the relaunched session in exactly the same tree
+  // spot it always occupied — `applyRelaunchedSession`'s own contract.
+  for (const pending of outcome.toRelaunch) {
+    const params: SessionCreateParams = {
+      shell: pending.launch.shell,
+      cwd: pending.launch.cwd,
+      cols: size.cols,
+      rows: size.rows,
+      ...(pending.launch.name !== undefined ? { name: pending.launch.name } : {}),
+      ...(pending.launch.args !== undefined ? { args: pending.launch.args } : {}),
+      ...(pending.launch.command !== undefined ? { command: pending.launch.command } : {}),
+    };
+    const { session } = await bridge.request('session.create', params);
+    workspaces = applyRelaunchedSession(
+      workspaces,
+      pending.workspaceId,
+      pending.sessionId,
+      session,
+    );
+    allSessions = [...allSessions, session];
+  }
+
   if (outcome.needsFreshSessionInWorkspaceId !== undefined) {
-    // Rule 6: the daemon restarted (no live session survived anywhere), so
-    // every workspace's tree collapsed to `root: null` — create exactly one
-    // session, in the workspace that was active, the same call the
-    // fresh-boot path below uses.
+    // Rule 6: the daemon restarted (no live session survived anywhere) and
+    // nothing was relaunchable either, so every workspace's tree collapsed
+    // to `root: null` — create exactly one session, in the workspace that
+    // was active, the same call the fresh-boot path below uses.
     const targetId = outcome.needsFreshSessionInWorkspaceId;
     const target = workspaces.find((workspace) => workspace.id === targetId);
     const defaults = await resolveDefaultShellParams(bridge);
@@ -243,19 +279,24 @@ async function bootWorkspaceOnce(
           }
         : workspace,
     );
-    allSessions = [...sessions, session];
+    allSessions = [...allSessions, session];
   }
 
-  return { workspaces, activeWorkspaceId: outcome.activeWorkspaceId, sessions: allSessions };
+  return {
+    workspaces,
+    activeWorkspaceId: outcome.activeWorkspaceId,
+    sessions: allSessions,
+    templates,
+  };
 }
 
-/** M3.1's original single-workspace boot policy (docs/specs/m2.6-boot-reattach.md section 3.4), used as `reconcileLayout`'s `'fresh-boot'` fallback (rule 5). `allSessions` is every session `session.list` returned (live and exited); `live` is the same list already filtered to non-`exited`, computed once by the caller. */
+/** M3.1's original single-workspace boot policy (docs/specs/m2.6-boot-reattach.md section 3.4), used as `reconcileLayout`'s `'fresh-boot'` fallback (rule 5). `allSessions` is every session `session.list` returned (live and exited); `live` is the same list already filtered to non-`exited`, computed once by the caller. Returns everything but `templates` — this path never has a layout file to read them from, so its one caller (`bootWorkspaceOnce`) fills that field in itself. */
 async function freshBootWorkspace(
   bridge: SessionBootBridge,
   size: SessionBootSize,
   allSessions: SessionSummary[],
   live: SessionSummary[],
-): Promise<BootResult> {
+): Promise<Omit<BootResult, 'templates'>> {
   if (live.length === 0) {
     const defaults = await resolveDefaultShellParams(bridge);
     const params: SessionCreateParams = {
@@ -319,6 +360,20 @@ export interface LayoutPersistenceStore {
 }
 
 /**
+ * M4.7: the templates store's own read surface (`@termhub/ui`'s
+ * `useTemplatesStore`) — narrowed to just `getState`, which is all
+ * `startLayoutPersistence` needs to fold the current templates into a
+ * layout-triggered save (see that function's own doc comment on why a
+ * workspace/tab change must never wipe out the templates half of the same
+ * file). Optional on every call site that predates M4.7 — omitting it
+ * simply persists an empty `templates` list, `toPersistedLayout`'s own
+ * default.
+ */
+export interface LayoutPersistenceTemplatesSource {
+  getState(): { templates: WorkspaceTemplate[] };
+}
+
+/**
  * Starts saving the layout (`toPersistedLayout` -> `bridge.saveLayout`) on
  * every `workspaces`/`activeWorkspaceId` change **from this call onward** —
  * never retroactively, and never for whatever transition (if any) already
@@ -335,10 +390,15 @@ export interface LayoutPersistenceStore {
  * this compares `workspaces`/`activeWorkspaceId` by reference against the
  * previous state itself, rather than depending on a subscription that only
  * fires for a chosen slice.
+ *
+ * `templatesSource` (M4.7), when given, folds its *current* templates into
+ * every save this triggers — see `startTemplatesPersistence` below for the
+ * other half (a templates-only change saving the *current* layout).
  */
 export function startLayoutPersistence(
   store: LayoutPersistenceStore,
   bridge: LayoutPersistenceBridge,
+  templatesSource?: LayoutPersistenceTemplatesSource,
 ): () => void {
   return store.subscribe((state, previousState) => {
     if (
@@ -347,6 +407,41 @@ export function startLayoutPersistence(
     ) {
       return;
     }
-    bridge.saveLayout(toPersistedLayout(state));
+    bridge.saveLayout(toPersistedLayout(state, templatesSource?.getState().templates ?? []));
+  });
+}
+
+/**
+ * M4.7: the templates store's subscribe surface — `useTemplatesStore`
+ * (`@termhub/ui`'s Zustand store) structurally satisfies it.
+ */
+export interface TemplatesPersistenceStore extends LayoutPersistenceTemplatesSource {
+  subscribe(
+    listener: (
+      state: { templates: WorkspaceTemplate[] },
+      previousState: { templates: WorkspaceTemplate[] },
+    ) => void,
+  ): () => void;
+}
+
+/**
+ * The other half of M4.7's persistence: saves the file again whenever the
+ * templates store itself changes (a model saved, edited or deleted) —
+ * `startLayoutPersistence` above only reacts to a *layout* change, so a
+ * template-only edit would otherwise never reach disk at all. Composes the
+ * *current* layout (`mainStore.getState()`) with the *new* templates, same
+ * "never let one half of the file wipe out the other" reasoning. `App.tsx`
+ * starts this alongside `startLayoutPersistence`, once boot is `'ready'`.
+ */
+export function startTemplatesPersistence(
+  templatesStore: TemplatesPersistenceStore,
+  mainStore: { getState(): StoreState },
+  bridge: LayoutPersistenceBridge,
+): () => void {
+  return templatesStore.subscribe((state, previousState) => {
+    if (state.templates === previousState.templates) {
+      return;
+    }
+    bridge.saveLayout(toPersistedLayout(mainStore.getState(), state.templates));
   });
 }

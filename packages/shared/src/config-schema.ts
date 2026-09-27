@@ -38,6 +38,24 @@ export function defaultConfig(): ConfigFile {
 }
 
 /**
+ * M4.7: what it takes to relaunch a session from scratch — a `session.create`
+ * call's own shape, minus `cols`/`rows` (the caller's job to supply, from
+ * whatever size the pane actually is at relaunch time). Shared by a
+ * persisted leaf's own `launch` (below) and by a workspace template's
+ * per-session spec (`WorkspaceTemplate.sessions`) — both are "how do I spawn
+ * this session again", just reached from a different place (one leaf,
+ * one template row).
+ */
+export const LaunchSpecSchema = z.object({
+  name: z.string().optional(),
+  cwd: z.string(),
+  shell: z.string(),
+  args: z.array(z.string()).optional(),
+  command: z.string().optional(),
+});
+export type LaunchSpec = z.infer<typeof LaunchSpecSchema>;
+
+/**
  * Persisted form of `PaneNode` (packages/ui/src/store/tree.ts). The leaf
  * carries `sessionCreatedAt` on top of the live `PaneNode`'s `sessionId`
  * (M4.3, docs/milestones.md): the daemon renumbers session ids from 1 on
@@ -46,9 +64,16 @@ export function defaultConfig(): ConfigFile {
  * were compared. A persisted leaf only matches a live session when **both**
  * `sessionId` and `sessionCreatedAt` agree (`packages/ui/src/
  * layout-persistence.ts`'s `reconcileLayout`).
+ *
+ * `launch` (M4.7) is optional and filled in by `toPersistedLayout` from the
+ * session's own `SessionSummary` at save time — a `workspaces.json` written
+ * before this task, or a leaf whose session metadata wasn't known at save
+ * time, simply has no `launch`, and stays perfectly valid: a dead leaf with
+ * no `launch` is dropped on reconciliation exactly as before this task, only
+ * a dead leaf *with* one is a candidate for `reconcileLayout`'s relaunch.
  */
 export type PersistedPaneNode =
-  | { kind: 'leaf'; sessionId: number; sessionCreatedAt: number }
+  | { kind: 'leaf'; sessionId: number; sessionCreatedAt: number; launch?: LaunchSpec | undefined }
   | {
       kind: 'split';
       id: string;
@@ -64,6 +89,7 @@ const PaneNodeSchema: z.ZodType<PersistedPaneNode> = z.lazy(() =>
       kind: z.literal('leaf'),
       sessionId: z.number().int(),
       sessionCreatedAt: z.number().int(),
+      launch: LaunchSpecSchema.optional(),
     }),
     z.object({
       kind: z.literal('split'),
@@ -99,6 +125,34 @@ function collectLeafSessionIds(node: PersistedPaneNode | null, into: number[]): 
 }
 
 /**
+ * M4.7: one row of a workspace template's per-session spec — the same
+ * shape as a persisted leaf's `LaunchSpec`, `name` included since a
+ * template session (unlike a leaf, which always has a live/former
+ * `SessionSummary` to fall back to) has nothing else to name it by.
+ */
+export const WorkspaceTemplateSessionSchema = z.object({
+  name: z.string(),
+  cwd: z.string(),
+  shell: z.string(),
+  args: z.array(z.string()).optional(),
+  command: z.string().optional(),
+});
+export type WorkspaceTemplateSession = z.infer<typeof WorkspaceTemplateSessionSchema>;
+
+/**
+ * M4.7: "define 3 agentes num workspace e abra tudo com um clique" —
+ * `templates` (below) is an array of these, persisted alongside the layout
+ * itself (same `workspaces.json`, same `layoutSave` path) since both are
+ * just different views of "what sessions a workspace should have".
+ */
+export const WorkspaceTemplateSchema = z.object({
+  id: z.string().min(1),
+  name: z.string(),
+  sessions: z.array(WorkspaceTemplateSessionSchema),
+});
+export type WorkspaceTemplate = z.infer<typeof WorkspaceTemplateSchema>;
+
+/**
  * `workspaces.json`. Validated as a whole, unlike `config.json`: the layout
  * has invariants that cross workspaces, and accepting part of a layout could
  * break them. The content of the layout belongs to M4.3, which may change
@@ -109,6 +163,8 @@ export const WorkspacesFileSchema = z
     version: z.literal(WORKSPACES_VERSION),
     activeWorkspaceId: z.string().optional(),
     workspaces: z.array(PersistedWorkspaceSchema),
+    /** M4.7. Optional so a `workspaces.json` written before this task — or one nobody has ever saved a template into — stays valid with no migration. */
+    templates: z.array(WorkspaceTemplateSchema).optional(),
   })
   .superRefine((file, ctx) => {
     const workspaceIds = new Set<string>();
@@ -117,6 +173,14 @@ export const WorkspacesFileSchema = z
         ctx.addIssue({ code: 'custom', message: `duplicate workspace id "${workspace.id}"` });
       }
       workspaceIds.add(workspace.id);
+    }
+
+    const templateIds = new Set<string>();
+    for (const template of file.templates ?? []) {
+      if (templateIds.has(template.id)) {
+        ctx.addIssue({ code: 'custom', message: `duplicate template id "${template.id}"` });
+      }
+      templateIds.add(template.id);
     }
 
     // One session per leaf, across every workspace (M3.1's invariant).

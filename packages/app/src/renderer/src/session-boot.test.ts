@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import type { ShellProfile, SessionSummary, WorkspacesFile } from '@termhub/shared';
+import type {
+  ShellProfile,
+  SessionSummary,
+  WorkspaceTemplate,
+  WorkspacesFile,
+} from '@termhub/shared';
 import { collectSessionIds, treeLeaves, type PaneNode, type StoreState } from '@termhub/ui';
 
 import {
@@ -9,12 +14,14 @@ import {
   resetSessionBootForTests,
   resolveBootWorkspace,
   startLayoutPersistence,
+  startTemplatesPersistence,
   type BootResult,
   type LayoutPersistenceStore,
   type SessionBootBridge,
   type SessionBootMethod,
   type SessionBootRequestParams,
   type SessionBootRequestResult,
+  type TemplatesPersistenceStore,
 } from './session-boot.js';
 
 /** Every test in this file is about the `'fresh-boot'` fallback (M3.1's original policy) — a fake bridge whose `loadLayout()` always resolves to the "no persisted layout at all" default is what makes `reconcileLayout` take that path. M4.3's own reconciliation rules are `layout-persistence.test.ts`'s job (pure, no bridge at all), and `bridge-gateway.test.ts`/`App.tsx`'s own doc comment cover the wiring around a *present* layout. */
@@ -325,6 +332,178 @@ describe('resolveBootWorkspace', () => {
     ]);
     expect(onlyWorkspace(result).root).toEqual({ kind: 'leaf', sessionId: 6 });
   });
+
+  // -------------------------------------------------------------------------
+  // M4.7: rule 6.5 — relaunching a dead leaf that carries a `launch` spec,
+  // in the exact same tree spot, and never through `resolveDefaultShellParams`
+  // (the whole point is running the *same* thing again, not the machine's
+  // current default shell).
+  // -------------------------------------------------------------------------
+
+  it('relaunches a dead leaf with a launch spec, in the same split position, using its own shell/cwd/args/command — not the profile-based default', async () => {
+    const relaunched = summary({ id: 42, shell: 'pwsh.exe', cwd: '/agents', command: 'claude' });
+    const listCalls: number[] = [];
+    const profilesListCalls: number[] = [];
+    const createCalls: unknown[] = [];
+    const persistedLayout: WorkspacesFile = {
+      version: 1,
+      activeWorkspaceId: 'ws-a',
+      workspaces: [
+        {
+          id: 'ws-a',
+          name: 'a',
+          cwd: '/agents',
+          root: {
+            kind: 'split',
+            id: 'n1',
+            dir: 'row',
+            ratio: 0.37,
+            a: {
+              kind: 'leaf',
+              sessionId: 1,
+              sessionCreatedAt: 100,
+              launch: {
+                name: 'claude',
+                cwd: '/agents',
+                shell: 'pwsh.exe',
+                args: ['-NoLogo'],
+                command: 'claude',
+              },
+            },
+            b: { kind: 'leaf', sessionId: 2, sessionCreatedAt: 200 }, // dead, no launch: dropped as before
+          },
+        },
+      ],
+    };
+    function request<M extends SessionBootMethod>(
+      method: M,
+      params: SessionBootRequestParams[M],
+    ): Promise<SessionBootRequestResult[M]> {
+      if (method === 'session.list') {
+        listCalls.push(1);
+        const result: SessionBootRequestResult['session.list'] = { sessions: [] }; // nothing survived
+        return Promise.resolve(result) as Promise<SessionBootRequestResult[M]>;
+      }
+      if (method === 'profiles.list') {
+        profilesListCalls.push(1);
+        const result: SessionBootRequestResult['profiles.list'] = { profiles: [] };
+        return Promise.resolve(result) as Promise<SessionBootRequestResult[M]>;
+      }
+      createCalls.push(params);
+      const result: SessionBootRequestResult['session.create'] = { session: relaunched };
+      return Promise.resolve(result) as Promise<SessionBootRequestResult[M]>;
+    }
+    const bridge: SessionBootBridge = {
+      request,
+      loadLayout: () => Promise.resolve(persistedLayout),
+    };
+
+    const result = await resolveBootWorkspace(bridge, { cols: 80, rows: 24 });
+
+    // Exactly one session.create — the relaunch — and it never touched
+    // profiles.list at all: the launch spec already says what to run.
+    expect(createCalls).toEqual([
+      {
+        shell: 'pwsh.exe',
+        cwd: '/agents',
+        cols: 80,
+        rows: 24,
+        name: 'claude',
+        args: ['-NoLogo'],
+        command: 'claude',
+      },
+    ]);
+    expect(profilesListCalls).toHaveLength(0);
+    // Same split id/ratio, dead-without-launch sibling gone, relaunched
+    // leaf in the exact same position with the NEW session's id.
+    expect(onlyWorkspace(result).root).toEqual({ kind: 'leaf', sessionId: 42 });
+    expect(onlyWorkspace(result).focusedSessionId).toBe(42);
+    expect(result.sessions.some((s) => s.id === 42)).toBe(true);
+  });
+
+  it('rule 6 (blank fresh session) never fires when something was relaunched instead — no second, extra session.create', async () => {
+    const relaunched = summary({ id: 7 });
+    const createCalls: unknown[] = [];
+    const persistedLayout: WorkspacesFile = {
+      version: 1,
+      workspaces: [
+        {
+          id: 'ws-a',
+          name: 'a',
+          cwd: 'C:\\a',
+          root: {
+            kind: 'leaf',
+            sessionId: 1,
+            sessionCreatedAt: 100,
+            launch: { cwd: 'C:\\a', shell: 'bash' },
+          },
+        },
+      ],
+    };
+    function request<M extends SessionBootMethod>(
+      method: M,
+      params: SessionBootRequestParams[M],
+    ): Promise<SessionBootRequestResult[M]> {
+      if (method === 'session.list') {
+        const result: SessionBootRequestResult['session.list'] = { sessions: [] };
+        return Promise.resolve(result) as Promise<SessionBootRequestResult[M]>;
+      }
+      if (method === 'profiles.list') {
+        const result: SessionBootRequestResult['profiles.list'] = { profiles: [] };
+        return Promise.resolve(result) as Promise<SessionBootRequestResult[M]>;
+      }
+      createCalls.push(params);
+      const result: SessionBootRequestResult['session.create'] = { session: relaunched };
+      return Promise.resolve(result) as Promise<SessionBootRequestResult[M]>;
+    }
+    const bridge: SessionBootBridge = {
+      request,
+      loadLayout: () => Promise.resolve(persistedLayout),
+    };
+
+    const result = await resolveBootWorkspace(bridge, { cols: 80, rows: 24 });
+
+    expect(createCalls).toHaveLength(1); // the relaunch only — not a second, rule-6 blank session
+    expect(onlyWorkspace(result).root).toEqual({ kind: 'leaf', sessionId: 7 });
+  });
+
+  it("carries the persisted file's own templates through untouched, and [] when there is none (fresh-boot)", async () => {
+    const templates = [{ id: 'tpl-1', name: '3 agentes', sessions: [] }];
+    const created = summary({ id: 6 });
+    const { bridge: freshBridge } = createFakeBridge([], created);
+    const freshResult = await resolveBootWorkspace(freshBridge, { cols: 80, rows: 24 });
+    expect(freshResult.templates).toEqual([]);
+
+    resetSessionBootForTests();
+    const persistedLayout: WorkspacesFile = {
+      version: 1,
+      workspaces: [
+        {
+          id: 'ws-a',
+          name: 'a',
+          cwd: 'C:\\a',
+          root: { kind: 'leaf', sessionId: 1, sessionCreatedAt: 100 },
+        },
+      ],
+      templates,
+    };
+    const bridge: SessionBootBridge = {
+      request: <M extends SessionBootMethod>(method: M): Promise<SessionBootRequestResult[M]> => {
+        if (method === 'session.list') {
+          const result: SessionBootRequestResult['session.list'] = { sessions: [created] };
+          return Promise.resolve(result) as Promise<SessionBootRequestResult[M]>;
+        }
+        return Promise.reject(new Error(`unexpected ${method}`));
+      },
+      loadLayout: () => Promise.resolve(persistedLayout),
+    };
+    // The one persisted leaf (id 1) never matches the live session (id 6,
+    // different id/createdAt) — it's dead, no launch, so it's dropped; the
+    // live session (6) lands as an orphan. Irrelevant to this test, which
+    // only cares that `templates` rode along regardless.
+    const result = await resolveBootWorkspace(bridge, { cols: 80, rows: 24 });
+    expect(result.templates).toEqual(templates);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -336,12 +515,50 @@ describe('resolveBootWorkspace', () => {
 
 interface FakeLayoutStore extends LayoutPersistenceStore {
   setState(next: StoreState): void;
+  /** Not part of `LayoutPersistenceStore` itself (that interface only needs `subscribe`) — added so this same fake also satisfies `startTemplatesPersistence`'s `mainStore: {getState(): StoreState}` parameter in the M4.7 "both halves of the file" tests below. */
+  getState(): StoreState;
 }
 
 function makeFakeStore(initial: StoreState): FakeLayoutStore {
   let state = initial;
   const listeners = new Set<(state: StoreState, previousState: StoreState) => void>();
   return {
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    setState(next) {
+      const previous = state;
+      state = next;
+      for (const listener of listeners) {
+        listener(state, previous);
+      }
+    },
+    getState() {
+      return state;
+    },
+  };
+}
+
+/** Same shape `makeFakeStore` gives the layout store, for `useTemplatesStore` (`TemplatesPersistenceStore`'s own `subscribe`/`getState`). */
+interface FakeTemplatesStore extends TemplatesPersistenceStore {
+  setState(next: { templates: WorkspaceTemplate[] }): void;
+}
+
+function makeFakeTemplatesStore(initial: WorkspaceTemplate[]): FakeTemplatesStore {
+  let state = { templates: initial };
+  const listeners = new Set<
+    (
+      state: { templates: WorkspaceTemplate[] },
+      previousState: { templates: WorkspaceTemplate[] },
+    ) => void
+  >();
+  return {
+    getState() {
+      return state;
+    },
     subscribe(listener) {
       listeners.add(listener);
       return () => {
@@ -445,5 +662,103 @@ describe('startLayoutPersistence', () => {
 
     store.setState({ ...hydratedState(), activeWorkspaceId: undefined });
     expect(saved).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M4.7: layout and templates share one `workspaces.json` — a save triggered
+// by either half must never drop the other. Coordinator's own bug report:
+// "se a gravação do layout sair sem os modelos, qualquer mudança de painel
+// regrava o arquivo sem eles, e os modelos do usuário somem."
+// ---------------------------------------------------------------------------
+
+function template(overrides: Partial<WorkspaceTemplate> & { id: string }): WorkspaceTemplate {
+  return { name: 'x', sessions: [], ...overrides };
+}
+
+describe('startLayoutPersistence + startTemplatesPersistence (M4.7): neither save drops the other half of the file', () => {
+  it('a layout-only change saves a file that still contains the current templates', () => {
+    const layoutStore = makeFakeStore(hydratedState());
+    const templatesStore = makeFakeTemplatesStore([template({ id: 'tpl-1', name: '3 agentes' })]);
+    const saved: WorkspacesFile[] = [];
+    const unsubscribe = startLayoutPersistence(
+      layoutStore,
+      { saveLayout: (layout) => saved.push(layout as WorkspacesFile) },
+      templatesStore,
+    );
+
+    // A real layout change (a different `workspaces` array reference, as
+    // every `store/workspace.ts` reducer produces) — no template touched.
+    const changed: StoreState = { ...hydratedState(), activeWorkspaceId: 'ws-a' };
+    layoutStore.setState({ ...changed, workspaces: [...changed.workspaces] });
+
+    expect(saved).toHaveLength(1);
+    expect(saved[0]?.templates).toEqual([template({ id: 'tpl-1', name: '3 agentes' })]);
+    // The layout itself is still there too — this save is additive, not a
+    // templates-only file.
+    expect(saved[0]?.workspaces).toHaveLength(1);
+    unsubscribe();
+  });
+
+  it('a templates-only change saves a file with the current layout and the new templates', () => {
+    const layoutStore = makeFakeStore(hydratedState());
+    const templatesStore = makeFakeTemplatesStore([]);
+    const saved: WorkspacesFile[] = [];
+    const unsubscribe = startTemplatesPersistence(templatesStore, layoutStore, {
+      saveLayout: (layout) => saved.push(layout as WorkspacesFile),
+    });
+
+    templatesStore.setState({ templates: [template({ id: 'tpl-1', name: '3 agentes' })] });
+
+    expect(saved).toHaveLength(1);
+    expect(saved[0]?.templates).toEqual([template({ id: 'tpl-1', name: '3 agentes' })]);
+    // The layout came along too, from `layoutStore`'s own current state —
+    // not just the templates half of the file.
+    expect(saved[0]?.workspaces).toHaveLength(1);
+    expect(saved[0]?.activeWorkspaceId).toBe('ws-a');
+    unsubscribe();
+  });
+
+  it("neither save fires before boot: starting both only after hydrate/setTemplates already ran (App.tsx's own policy, gated on bootState.phase === 'ready') saves nothing for that past transition, and exactly one save each for a later, real change", () => {
+    const layoutStore = makeFakeStore(emptyState);
+    const templatesStore = makeFakeTemplatesStore([]);
+
+    // Boot's own hydrate + templates seed, same as `App.tsx`'s boot effect —
+    // with nobody subscribed yet.
+    layoutStore.setState(hydratedState());
+    templatesStore.setState({ templates: [template({ id: 'tpl-1', name: 'seeded' })] });
+
+    const layoutSaved: unknown[] = [];
+    const templatesSaved: unknown[] = [];
+    const unsubLayout = startLayoutPersistence(
+      layoutStore,
+      { saveLayout: (layout) => layoutSaved.push(layout) },
+      templatesStore,
+    );
+    const unsubTemplates = startTemplatesPersistence(templatesStore, layoutStore, {
+      saveLayout: (layout) => templatesSaved.push(layout),
+    });
+
+    // Neither boot transition (already past) triggers a save — same policy
+    // `startLayoutPersistence`'s own "subscribing only after hydrate" test
+    // already proves for the layout half alone; this is the same guarantee
+    // holding for both functions once wired together, exactly as `App.tsx`
+    // wires them (both effects gated on `bootState.phase === 'ready'`).
+    expect(layoutSaved).toHaveLength(0);
+    expect(templatesSaved).toHaveLength(0);
+
+    // A real, later layout change — exactly one layout-triggered save.
+    const changed: StoreState = { ...hydratedState(), activeWorkspaceId: 'ws-a' };
+    layoutStore.setState({ ...changed, workspaces: [...changed.workspaces] });
+    expect(layoutSaved).toHaveLength(1);
+    expect(templatesSaved).toHaveLength(0); // the templates-only watcher didn't fire for a layout change
+
+    // A real, later templates change — exactly one templates-triggered save.
+    templatesStore.setState({ templates: [template({ id: 'tpl-2', name: 'new' })] });
+    expect(templatesSaved).toHaveLength(1);
+    expect(layoutSaved).toHaveLength(1); // unchanged — the layout watcher didn't fire for a templates change
+
+    unsubLayout();
+    unsubTemplates();
   });
 });
