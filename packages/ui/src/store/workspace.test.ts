@@ -4,6 +4,7 @@ import type { SessionSummary } from '@termhub/shared';
 import { collectSessionIds, makeLeaf, treeFromSessions, type PaneNode } from './tree.js';
 import {
   addWorkspace,
+  applySessionStatus,
   closePaneInWorkspace,
   closeWorkspace,
   focusPane,
@@ -343,5 +344,45 @@ describe('sessions', () => {
     const next = removeSession(s, 5);
     expect(next.sessions[5]).toBeUndefined();
     expect(removeSession(next, 5)).toBe(next);
+  });
+
+  // M5.3, spec section 4's UI test 7: the reducer behind
+  // `session-status-sync.ts`'s `reconcile()`.
+  describe('applySessionStatus', () => {
+    it('is a no-op (same reference) for a session absent from the store', () => {
+      const s = state({ sessions: {} });
+      expect(applySessionStatus(s, 1, 'running', 100)).toBe(s);
+    });
+
+    it('replaces status and statusSince, leaving exitCode untouched when none is given', () => {
+      const s = state({ sessions: { 1: session({ id: 1, status: 'running' }) } });
+      const next = applySessionStatus(s, 1, 'awaiting-input', 200);
+      expect(next.sessions[1]?.status).toBe('awaiting-input');
+      expect(next.sessions[1]?.statusSince).toBe(200);
+      expect(next.sessions[1]?.exitCode).toBeUndefined();
+    });
+
+    it('sets exitCode when given (session.exit)', () => {
+      const s = state({ sessions: { 1: session({ id: 1, status: 'running' }) } });
+      const next = applySessionStatus(s, 1, 'exited', 300, 5);
+      expect(next.sessions[1]?.status).toBe('exited');
+      expect(next.sessions[1]?.exitCode).toBe(5);
+    });
+
+    it('is terminal: an already-exited summary rejects any status other than exited', () => {
+      const s = state({
+        sessions: { 1: session({ id: 1, status: 'exited', statusSince: 100, exitCode: 1 }) },
+      });
+      const next = applySessionStatus(s, 1, 'running', 500);
+      expect(next).toBe(s);
+    });
+
+    it('an exited summary can still be re-applied as exited (e.g. a later exitCode) without being rejected as "no change"', () => {
+      const s = state({
+        sessions: { 1: session({ id: 1, status: 'exited', statusSince: 100 }) },
+      });
+      const next = applySessionStatus(s, 1, 'exited', 100, 7);
+      expect(next.sessions[1]?.exitCode).toBe(7);
+    });
   });
 });

@@ -1,5 +1,10 @@
 import { PROTOCOL_ERROR_CODE, ProtocolError } from '@termhub/shared';
-import type { SessionCreateParams, SessionId, SessionSummary } from '@termhub/shared';
+import type {
+  SessionCreateParams,
+  SessionId,
+  SessionStatus,
+  SessionSummary,
+} from '@termhub/shared';
 
 import { Session } from './session.js';
 import type {
@@ -167,15 +172,22 @@ export class Registry {
       session.write(`${params.command}\r`);
     }
 
+    const createdAt = Date.now();
     const summary: SessionSummary = {
       id,
       name: params.name ?? params.shell,
       cwd: params.cwd,
       shell: params.shell,
-      createdAt: Date.now(),
+      createdAt,
       cols: params.cols,
       rows: params.rows,
       status: 'running',
+      // M5.3: starts equal to createdAt — the session's own birth is its
+      // first "status transition". `service.ts`'s StatusDetector fires no
+      // change for the initial `'running'` it starts in, so nothing else
+      // would ever set this for a session whose status never leaves
+      // `'running'` (docs/specs/m5.3-status-propagation.md section 3.2).
+      statusSince: createdAt,
       ...(params.tag !== undefined ? { tag: params.tag } : {}),
       ...(params.command !== undefined ? { command: params.command } : {}),
       // M4.6 (second half): carried onto the summary so a pane split can
@@ -203,8 +215,28 @@ export class Registry {
   private wireExitTracking(record: InternalRecord): void {
     record.session.onExit((exit) => {
       record.exit = exit;
-      record.summary = { ...record.summary, status: 'exited' };
+      record.summary = { ...record.summary, status: 'exited', statusSince: Date.now() };
     });
+  }
+
+  /**
+   * M5.3: applies a status transition the daemon's `StatusDetector`
+   * (`status-detector.ts`) reported for `id`'s session, replacing `summary`
+   * with a copy the same way `onExit`'s listener above already does for
+   * `status`. A no-op — not an error — for an unknown `id` (the detector may
+   * outlive a session record only through `disposeRuntime`'s own ordering,
+   * but a stale call racing a removal is still safe to ignore) or when the
+   * current summary is already `'exited'`: death is terminal, and only
+   * `wireExitTracking`'s own listener above is allowed to write `'exited'`.
+   * Valid for a buried session too (M4.4) — the graveyard keeps a session's
+   * record here untouched while buried, and its detector keeps running.
+   */
+  setStatus(id: SessionId, status: SessionStatus, since: number): void {
+    const record = this.sessions.get(id);
+    if (record === undefined || record.summary.status === 'exited') {
+      return;
+    }
+    record.summary = { ...record.summary, status, statusSince: since };
   }
 
   /** Looks up a session by id. Returns `undefined` if it was never created, or was `close()`d. */

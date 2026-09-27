@@ -297,6 +297,89 @@ describe('Registry', () => {
     expect(registry.list()[0]?.status).toBe('exited');
   });
 
+  it('create() sets statusSince equal to createdAt (M5.3)', () => {
+    const { factory } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    const summary = registry.create(baseParams());
+    expect(summary.statusSince).toBe(summary.createdAt);
+  });
+
+  it('a self-triggered exit sets statusSince to the moment of exit, not createdAt (M5.3)', () => {
+    const { factory, sessions } = makeFactory();
+    const registry = new Registry({ sessionFactory: factory });
+
+    const summary = registry.create(baseParams());
+    const fake = sessions[0];
+    fake?.emitExit({ exitCode: 0 });
+
+    const registered = registry.get(summary.id);
+    expect(registered?.summary.statusSince).toBeGreaterThanOrEqual(summary.createdAt);
+    expect(registered?.summary.status).toBe('exited');
+  });
+
+  describe('setStatus (M5.3)', () => {
+    it('replaces status and statusSince on a live session', () => {
+      const { factory } = makeFactory();
+      const registry = new Registry({ sessionFactory: factory });
+      const summary = registry.create(baseParams());
+
+      registry.setStatus(summary.id, 'awaiting-input', 12_345);
+
+      const registered = registry.get(summary.id);
+      expect(registered?.summary.status).toBe('awaiting-input');
+      expect(registered?.summary.statusSince).toBe(12_345);
+    });
+
+    it('is a no-op for an unknown id', () => {
+      const { factory } = makeFactory();
+      const registry = new Registry({ sessionFactory: factory });
+
+      expect(() => {
+        registry.setStatus(999, 'idle', 1);
+      }).not.toThrow();
+    });
+
+    it('never overwrites an exited summary — death is terminal, only wireExitTracking writes it', () => {
+      const { factory, sessions } = makeFactory();
+      const registry = new Registry({ sessionFactory: factory });
+      const summary = registry.create(baseParams());
+      const fake = sessions[0];
+      fake?.emitExit({ exitCode: 0 });
+      const exitedSince = registry.get(summary.id)?.summary.statusSince;
+
+      registry.setStatus(summary.id, 'running', 999_999);
+
+      const registered = registry.get(summary.id);
+      expect(registered?.summary.status).toBe('exited');
+      expect(registered?.summary.statusSince).toBe(exitedSince);
+    });
+
+    // NOTE (spec deviation — see this task's final report): the techspec
+    // (docs/specs/m5.3-status-propagation.md section 3.2) says "`setStatus`
+    // vale para sessão no cemitério também, que continua registrada". Against
+    // the real `evict()` above, that premise doesn't hold: `evict()` deletes
+    // the id from `this.sessions` outright (the record moves entirely into
+    // `Graveyard`'s own separate map, out of `Registry`'s reach) — so a
+    // buried session is exactly the "unknown id" no-op path below, not a
+    // distinct case. `service.ts`'s handler still emits `session.status` to
+    // whoever's attached either way (it doesn't go through the registry for
+    // that), but the registry-level `summary.status`/`statusSince` a
+    // buried-then-restored session comes back with never reflects any
+    // transition that happened while buried.
+    it('is a no-op for a buried (evicted) session too — evict() already removed its record', () => {
+      const { factory } = makeFactory();
+      const registry = new Registry({ sessionFactory: factory });
+      const summary = registry.create(baseParams());
+      registry.evict(summary.id);
+
+      expect(() => {
+        registry.setStatus(summary.id, 'idle', 1);
+      }).not.toThrow();
+      expect(registry.get(summary.id)).toBeUndefined();
+    });
+  });
+
   it('close() after a self-triggered exit does not throw and removes the (already-exited) session', () => {
     const { factory, sessions } = makeFactory();
     const registry = new Registry({ sessionFactory: factory });

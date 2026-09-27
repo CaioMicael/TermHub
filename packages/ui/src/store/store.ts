@@ -5,7 +5,7 @@
 // `workspace.ts`/`tree.ts`, not here.
 
 import { create, type StoreApi, type UseBoundStore } from 'zustand';
-import type { SessionId, SessionSummary } from '@termhub/shared';
+import type { SessionId, SessionStatus, SessionSummary } from '@termhub/shared';
 
 import type { MoveEdge, SplitDirection } from './tree.js';
 import * as reducers from './workspace.js';
@@ -57,6 +57,13 @@ export interface TermhubStoreActions {
   reorderWorkspaces: (workspaceIds: readonly string[]) => void;
   renameWorkspace: (workspaceId: string, name: string) => void;
   upsertSession: (session: SessionSummary) => void;
+  /** M5.3: applies a daemon status transition to a session already in the store — see `workspace.ts`'s `applySessionStatus` for the actual reducer. */
+  applySessionStatus: (
+    sessionId: SessionId,
+    status: SessionStatus,
+    since: number,
+    exitCode?: number,
+  ) => void;
   removeSession: (sessionId: SessionId) => void;
   /**
    * Replaces the entire store state at once. The one exception to "every
@@ -131,6 +138,9 @@ export const useTermhubStore: UseBoundStore<StoreApi<TermhubStore>> = create<Ter
     },
     upsertSession: (session) => {
       set((state) => reducers.upsertSession(state, session));
+    },
+    applySessionStatus: (sessionId, status, since, exitCode) => {
+      set((state) => reducers.applySessionStatus(state, sessionId, status, since, exitCode));
     },
     removeSession: (sessionId) => {
       set((state) => reducers.removeSession(state, sessionId));

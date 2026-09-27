@@ -418,6 +418,45 @@ export function upsertSession(state: StoreState, session: SessionSummary): Store
   return { ...state, sessions: { ...state.sessions, [session.id]: session } };
 }
 
+/**
+ * M5.3: applies a status transition to `sessionId`'s summary —
+ * `session-status-sync.ts`'s `reconcile()` calls this once it has already
+ * decided (`docs/specs/m5.3-status-propagation.md` section 3.4) that this
+ * transition is newer than whatever the summary currently has. Rejects
+ * (returns `state` unchanged) when the session isn't present — this action
+ * never creates one, "sem sessão fantasma" being the whole point of keeping
+ * `latest` outside the store in the first place — or when the summary is
+ * already `'exited'` and `status` isn't: death is terminal, mirroring
+ * `registry.ts`'s own `setStatus` guard on the daemon side.
+ */
+export function applySessionStatus(
+  state: StoreState,
+  sessionId: SessionId,
+  status: SessionStatus,
+  since: number,
+  exitCode?: number,
+): StoreState {
+  const session = state.sessions[sessionId];
+  if (session === undefined) {
+    return state;
+  }
+  if (session.status === 'exited' && status !== 'exited') {
+    return state;
+  }
+  return {
+    ...state,
+    sessions: {
+      ...state.sessions,
+      [sessionId]: {
+        ...session,
+        status,
+        statusSince: since,
+        ...(exitCode !== undefined ? { exitCode } : {}),
+      },
+    },
+  };
+}
+
 /** Drops `sessionId`'s metadata. Does **not** touch any workspace's tree — a caller closing a session for real (M4's graveyard reaping it past its TTL) is expected to have already removed its pane via `closePaneInWorkspace`, if it had one. Rejects (returns `state` unchanged) when the session isn't present. */
 export function removeSession(state: StoreState, sessionId: SessionId): StoreState {
   if (!(sessionId in state.sessions)) {

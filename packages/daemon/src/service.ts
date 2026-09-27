@@ -27,10 +27,12 @@ import type {
 
 import { TerminalBuffer } from './buffer.js';
 import { Graveyard, resolveTtlMs } from './graveyard.js';
+import { TerminalSignalParser } from './osc-parser.js';
 import { createProfileService } from './profiles.js';
 import type { ProfileService } from './profiles.js';
 import type { Registry, SessionLike } from './registry.js';
 import type { Disposable } from './session.js';
+import { StatusDetector } from './status-detector.js';
 import type { TransportServer } from './transport.js';
 
 // Wires the transport (transport.ts, M1.2) to the registry (registry.ts,
@@ -219,7 +221,16 @@ export function registerSessionService(
   // untouched: its buffer keeps mirroring output, and any client still
   // attached keeps receiving it, exactly as if nothing happened — M4.4 only
   // changes whether the session shows up in `registry.list()`.
-  const runtimes = new Map<SessionId, { runtime: SessionRuntime; delivery: Disposable }>();
+  // M5.3: `status` is the per-session StatusDetector (status-detector.ts),
+  // sitting next to `runtime`/`delivery` in this same bookkeeping entry
+  // rather than growing `SessionRuntime` itself — `SessionRuntime` is built
+  // literally by many tests in service.test.ts, and adding a field there
+  // would break all of them (docs/specs/m5.3-status-propagation.md section
+  // 3.3).
+  const runtimes = new Map<
+    SessionId,
+    { runtime: SessionRuntime; delivery: Disposable; status: StatusDetector }
+  >();
 
   /**
    * Tears down whatever this module owns for `sessionId` once it's truly
@@ -233,6 +244,10 @@ export function registerSessionService(
     const entry = runtimes.get(sessionId);
     if (entry !== undefined) {
       entry.delivery.dispose();
+      // M5.3: cancels the detector's silence timer before the buffer goes
+      // away — docs/specs/m5.3-status-propagation.md section 3.3's own
+      // ordering ("status.dispose() antes do buffer.dispose()").
+      entry.status.dispose();
       entry.runtime.buffer.dispose();
       runtimes.delete(sessionId);
     }
@@ -255,8 +270,31 @@ export function registerSessionService(
         buffer: new TerminalBuffer({ cols: params.cols, rows: params.rows }),
         attached: new Map(),
       };
-      const delivery = wireSessionDelivery(server, summary.id, registered.session, runtime);
-      runtimes.set(summary.id, { runtime, delivery });
+      // M5.3: one parser + one detector per session, fed from the same
+      // `onData` `wireSessionDelivery` already wires below, through the
+      // `tap` parameter — never touching osc-parser.ts/status-detector.ts
+      // themselves (out of bounds for this task). `agent` mirrors M4.7's own
+      // "was this session launched with a `command`" test: a session with a
+      // command decides silence means `awaiting-input` (an agent CLI likely
+      // waiting on the user), a plain shell decides it means `idle` (spec
+      // section 2, status-detector.ts's own header comment).
+      const parser = new TerminalSignalParser();
+      const detector = new StatusDetector({ agent: (params.command ?? '').trim() !== '' });
+      detector.onChange((status, since) => {
+        registry.setStatus(summary.id, status, since);
+        for (const clientId of runtime.attached.keys()) {
+          server.sendEventTo(clientId, 'session.status', { sessionId: summary.id, status, since });
+        }
+      });
+      const delivery = wireSessionDelivery(server, summary.id, registered.session, runtime, {
+        onOutput: (data) => {
+          detector.onOutput(parser.feed(data));
+        },
+        onExit: () => {
+          detector.onExit();
+        },
+      });
+      runtimes.set(summary.id, { runtime, delivery, status: detector });
     }
     return { session: summary };
   });
@@ -286,6 +324,10 @@ export function registerSessionService(
     // attaching later gets a snapshot sized for the *old* dimensions
     // (docs/specs/m1.7-attach-detach.md section 3.2).
     runtimes.get(params.sessionId)?.runtime.buffer.resize(params.cols, params.rows);
+    // M5.3: opens the detector's resize window (status-detector.ts's
+    // `RESIZE_WINDOW_MS`) so the repaint ConPTY sends right after a resize
+    // isn't mistaken for real output (spec section 3.2).
+    runtimes.get(params.sessionId)?.status.onResize();
     return {};
   });
 
@@ -349,7 +391,17 @@ export function registerSessionService(
     // while buried — session.attach works immediately afterward, same as
     // for a session that was never closed at all.
     registry.reinstate(restored.summary, restored.session);
-    return { session: restored.summary };
+    // M5.3: the session's StatusDetector kept running while buried, but the
+    // registry had evicted the id, so every `registry.setStatus` in between
+    // was a no-op and `restored.summary` still carries the status from the
+    // moment of burial. Copy the detector's current state in before
+    // answering, or the restored pane shows a stale badge until its next
+    // transition. `setStatus` leaves an `exited` summary alone.
+    const detector = runtimes.get(params.sessionId)?.status;
+    if (detector !== undefined) {
+      registry.setStatus(params.sessionId, detector.status, detector.since);
+    }
+    return { session: registry.get(params.sessionId)?.summary ?? restored.summary };
   });
 
   server.registerMethod<GraveyardListParams, GraveyardListResult>('graveyard.list', () => ({
@@ -423,6 +475,10 @@ export function registerSessionService(
 
   server.registerDataHandler((sessionId, data) => {
     writeSessionInput(registry, sessionId, data);
+    // M5.3: opens the detector's echo window (status-detector.ts's
+    // `ECHO_WINDOW_MS`) so the shell's own echo of this keystroke isn't
+    // mistaken for real output (spec section 3.2).
+    runtimes.get(sessionId)?.status.onInput();
   });
 
   // The M1.7 section 3.7 wiring `detachClientEverywhere`'s own doc comment
@@ -491,12 +547,24 @@ export function writeSessionInput(
  * Returns a `Disposable` that unsubscribes both listeners — callers must
  * dispose it before disposing `runtime.buffer` (see `session.close`'s
  * handler above for why).
+ *
+ * `tap` (M5.3, optional — every pre-existing 4-argument call in
+ * service.test.ts keeps compiling and behaving exactly as before) is how
+ * `session.create`'s handler above feeds this session's `StatusDetector`
+ * without this module knowing anything about status detection itself:
+ * `onOutput` runs on every chunk, `onExit` on the session's exit, and —
+ * this is the load-bearing part, `docs/specs/m5.3-status-propagation.md`
+ * section 2.2 — both run **after** this function has already finished
+ * delivering that same chunk/exit to every attached client. A status (or
+ * exit-derived status) event can therefore never reach a client before the
+ * bytes/exit it's reacting to.
  */
 export function wireSessionDelivery(
   transport: AttachTransport,
   sessionId: SessionId,
   session: SessionLike,
   runtime: SessionRuntime,
+  tap?: { onOutput(data: string): void; onExit(): void },
 ): Disposable {
   const dataSub = session.onData((data) => {
     runtime.buffer.write(data);
@@ -509,6 +577,7 @@ export function wireSessionDelivery(
         state.pending.push({ seq, data: bytes });
       }
     }
+    tap?.onOutput(data);
   });
 
   const exitSub = session.onExit((exit) => {
@@ -520,6 +589,7 @@ export function wireSessionDelivery(
     for (const clientId of runtime.attached.keys()) {
       transport.sendEventTo(clientId, 'session.exit', payload);
     }
+    tap?.onExit();
   });
 
   return {

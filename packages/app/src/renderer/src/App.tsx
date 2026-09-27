@@ -6,6 +6,7 @@ import {
   measureFitSize,
   Sidebar,
   SplitTree,
+  startSessionStatusSync,
   TabBar,
   useTemplatesStore,
   useTermhubStore,
@@ -169,6 +170,21 @@ export function App() {
   useEffect(() => () => registry.dispose(), [registry]);
 
   useEffect(() => window.termhub.onConnectionStateChange(setConnection), []);
+
+  // M5.3: starts mirroring session.status/session.exit into the store right
+  // away — a top-level effect, not gated on `bootState`, and running before
+  // this component's boot effect below ever calls `hydrate()`. That ordering
+  // is the whole point (docs/specs/m5.3-status-propagation.md section 2.1):
+  // an event that arrives while boot is still measuring/resolving has to be
+  // remembered by `session-status-sync.ts`'s own `latest` map so it can be
+  // replayed once `hydrate()` actually puts the session in the store,
+  // instead of `hydrate()` silently overwriting it with a status read before
+  // the event happened. `window.termhub` satisfies `StatusSyncBridge`
+  // structurally (same `TerminalBridge`-style narrowing `@termhub/ui`
+  // already uses elsewhere) and `useTermhubStore` satisfies `StatusSyncStore`
+  // as-is (Zustand's `UseBoundStore` already exposes `getState`/`subscribe`)
+  // — no cast needed at this call site.
+  useEffect(() => startSessionStatusSync(window.termhub, useTermhubStore), []);
 
   // M4.8: the faixa (banner) above the tab bar, and the resync it triggers.
   // `lastSeenEpochRef` is the generation this window last resynced against

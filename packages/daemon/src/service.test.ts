@@ -12,6 +12,7 @@ import type {
   SessionId,
   SessionListResult,
   SessionRestoreResult,
+  SessionStatusPayload,
   ShellProfile,
 } from '@termhub/shared';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -37,6 +38,7 @@ import type {
   SessionExit,
   SessionExitListener,
 } from './session.js';
+import { DEFAULT_QUIET_MS } from './status-detector.js';
 import { TransportClient, TransportServer, resolvePipeAddress } from './transport.js';
 
 // `@xterm/headless`'s `buffer` accessor is still marked "proposed" in
@@ -1721,4 +1723,365 @@ describe('session.create with `command` (M4.7): the daemon actually runs it, not
     },
     20_000,
   );
+});
+
+// ---------------------------------------------------------------------------
+// M5.3 — session.status propagation (docs/specs/m5.3-status-propagation.md)
+// ---------------------------------------------------------------------------
+
+/**
+ * A tiny async queue: `push` records or hands a value straight to whoever is
+ * already `next()`-waiting; `next()` returns immediately if a value is
+ * already buffered, otherwise waits for the next `push`. Used below instead
+ * of `waitFor`'s poll loop (which is built on real `setTimeout`, unusable
+ * once a test switches to fake timers) to wait on events that arrive over
+ * the real named pipe asynchronously with respect to the fake clock: fake
+ * timers only virtualize `setTimeout`/`clearTimeout`/`Date` here (see this
+ * suite's `beforeEach`), never the socket's own real I/O.
+ */
+function makeQueue<T>(): { push: (value: T) => void; next: () => Promise<T> } {
+  const buffered: T[] = [];
+  const waiting: Array<(value: T) => void> = [];
+  return {
+    push: (value) => {
+      const waiter = waiting.shift();
+      if (waiter !== undefined) {
+        waiter(value);
+      } else {
+        buffered.push(value);
+      }
+    },
+    next: () => {
+      const value = buffered.shift();
+      if (value !== undefined) {
+        return Promise.resolve(value);
+      }
+      return new Promise((resolve) => waiting.push(resolve));
+    },
+  };
+}
+
+function statusQueue(client: TransportClient): {
+  next: () => Promise<SessionStatusPayload>;
+} {
+  const queue = makeQueue<SessionStatusPayload>();
+  client.onEvent((msg) => {
+    if (msg.event === 'session.status') {
+      queue.push(msg.payload as SessionStatusPayload);
+    }
+  });
+  return queue;
+}
+
+describe('session.status propagation (M5.3, fake session + fake StatusDetector clock)', () => {
+  // Only the three globals status-detector.ts actually reads/writes are
+  // faked — `setImmediate`/socket I/O stay real, which is what lets these
+  // tests still exercise the real named pipe transport underneath.
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    vi.setSystemTime(0);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('test 1: transitions leave the daemon as session.status events, and session.list reflects the same statusSince', async () => {
+    const { factory, sessions } = fakeFactory();
+    const { client } = await startHarness({ sessionFactory: factory });
+
+    const created = await client.request<SessionCreateResult>(
+      'session.create',
+      baseCreateParams(), // no `command`: silence means idle, not awaiting-input
+    );
+    const sessionId = created.session.id;
+    const session = sessions[0];
+    if (session === undefined)
+      throw new Error('unreachable: fakeFactory always records one session');
+
+    await client.request('session.attach', { sessionId });
+    const events = statusQueue(client);
+
+    // running -> idle by silence.
+    vi.advanceTimersByTime(DEFAULT_QUIET_MS);
+    const first = await events.next();
+    expect(first).toEqual({ sessionId, status: 'idle', since: DEFAULT_QUIET_MS });
+
+    // idle -> running: real output counts, unlike echo/resize repaints.
+    session.emitData('plain output, no OSC/BEL in it');
+    const second = await events.next();
+    expect(second).toEqual({ sessionId, status: 'running', since: DEFAULT_QUIET_MS });
+
+    // running -> idle again, by silence.
+    vi.advanceTimersByTime(DEFAULT_QUIET_MS);
+    const third = await events.next();
+    expect(third).toEqual({ sessionId, status: 'idle', since: DEFAULT_QUIET_MS * 2 });
+
+    const listed = await client.request<SessionListResult>('session.list', {});
+    const summary = listed.sessions.find((s) => s.id === sessionId);
+    expect(summary?.status).toBe('idle');
+    expect(summary?.statusSince).toBe(third.since);
+  });
+
+  it('test 2: a session created with `command` decides silence means awaiting-input, not idle', async () => {
+    const { factory, sessions } = fakeFactory();
+    const { client } = await startHarness({ sessionFactory: factory });
+
+    const created = await client.request<SessionCreateResult>('session.create', {
+      ...baseCreateParams(),
+      command: 'claude',
+    });
+    const sessionId = created.session.id;
+    expect(sessions.length).toBe(1); // fakeFactory recorded the one session — nothing else to assert about it here
+
+    await client.request('session.attach', { sessionId });
+    const events = statusQueue(client);
+
+    vi.advanceTimersByTime(DEFAULT_QUIET_MS);
+    const first = await events.next();
+    expect(first).toEqual({ sessionId, status: 'awaiting-input', since: DEFAULT_QUIET_MS });
+
+    const listed = await client.request<SessionListResult>('session.list', {});
+    const summary = listed.sessions.find((s) => s.id === sessionId);
+    expect(summary?.status).toBe('awaiting-input');
+    expect(summary?.statusSince).toBe(first.since);
+  });
+
+  it('test 4: input and resize reach the detector through the real handlers, suppressing the echo/resize-window output that follows', async () => {
+    const { factory, sessions } = fakeFactory();
+    const { client } = await startHarness({ sessionFactory: factory });
+
+    const created = await client.request<SessionCreateResult>('session.create', baseCreateParams());
+    const sessionId = created.session.id;
+    const session = sessions[0];
+    if (session === undefined)
+      throw new Error('unreachable: fakeFactory always records one session');
+
+    await client.request('session.attach', { sessionId });
+    const events = statusQueue(client);
+
+    // Settle into idle first, so a spurious "echo counted as real output"
+    // bug would show up as an unwanted idle -> running transition below.
+    vi.advanceTimersByTime(DEFAULT_QUIET_MS);
+    const idleEvent = await events.next();
+    expect(idleEvent.status).toBe('idle');
+
+    // A keystroke, then output inside the echo window: `registerDataHandler`
+    // -> `writeSessionInput` -> `status.onInput()` (service.ts) is what has
+    // to actually run for this to be ignored — without it, this plain output
+    // would read as "real work" and flip back to running. The `session.list`
+    // round trip in between isn't idle chatter: it's what guarantees the
+    // server has actually dispatched the binary input frame above (arrival
+    // order on one connection is strict) before this test's own synchronous
+    // `session.emitData` call — otherwise the emitted output could reach the
+    // detector before `onInput()` ever opened the echo window, racing the
+    // very thing this test means to prove.
+    client.sendData(sessionId, Buffer.from('x', 'utf8'));
+    await client.request('session.list', {});
+    session.emitData('x'); // the shell's own echo of the keystroke
+
+    // A resize, then output inside the resize window: same story for
+    // `session.resize`'s handler -> `status.onResize()`.
+    await client.request('session.resize', { sessionId, cols: 100, rows: 30 });
+    session.emitData('\x1b[2J\x1b[H'); // a plausible ConPTY repaint
+
+    // Neither produced a transition: session.list is the only way left to
+    // observe this without waiting on an event that (correctly) never comes
+    // — a round trip flushes both sends above, since request/response is
+    // ordered on this one connection.
+    const listed = await client.request<SessionListResult>('session.list', {});
+    const summary = listed.sessions.find((s) => s.id === sessionId);
+    expect(summary?.status).toBe('idle');
+    expect(summary?.statusSince).toBe(idleEvent.since);
+  });
+
+  it('a transition that happens while buried is reflected by session.restore, not lost', async () => {
+    const { factory } = fakeFactory();
+    const { client } = await startHarness({ sessionFactory: factory });
+
+    const created = await client.request<SessionCreateResult>('session.create', baseCreateParams());
+    const sessionId = created.session.id;
+    expect(created.session.status).toBe('running');
+
+    // Buried before the silence timer fires: from here on the registry no
+    // longer knows the id, so every `registry.setStatus` is a no-op, but the
+    // detector keeps running alongside the buried session.
+    await client.request('session.close', { sessionId, ttlMs: 300_000 });
+    vi.advanceTimersByTime(DEFAULT_QUIET_MS);
+
+    const restored = await client.request<SessionRestoreResult>('session.restore', { sessionId });
+    expect(restored.session.status).toBe('idle');
+    expect(restored.session.statusSince).toBe(DEFAULT_QUIET_MS);
+
+    const listed = await client.request<SessionListResult>('session.list', {});
+    expect(listed.sessions.find((s) => s.id === sessionId)?.status).toBe('idle');
+  });
+
+  it('test 5: on exit, the client receives session.exit before session.status exited, and the summary is terminal', async () => {
+    const { factory, sessions } = fakeFactory();
+    const { client } = await startHarness({ sessionFactory: factory });
+
+    const created = await client.request<SessionCreateResult>('session.create', baseCreateParams());
+    const sessionId = created.session.id;
+    const session = sessions[0];
+    if (session === undefined)
+      throw new Error('unreachable: fakeFactory always records one session');
+
+    await client.request('session.attach', { sessionId });
+
+    const order: string[] = [];
+    const statusSeen = new Promise<SessionStatusPayload>((resolve) => {
+      client.onEvent((msg) => {
+        order.push(msg.event);
+        if (msg.event === 'session.status') {
+          resolve(msg.payload as SessionStatusPayload);
+        }
+      });
+    });
+
+    session.emitExit({ exitCode: 0 });
+    const statusPayload = await statusSeen;
+
+    expect(order).toEqual(['session.exit', 'session.status']);
+    expect(statusPayload).toEqual({
+      sessionId,
+      status: 'exited',
+      since: expect.any(Number) as number,
+    });
+
+    const listed = await client.request<SessionListResult>('session.list', {});
+    const summary = listed.sessions.find((s) => s.id === sessionId);
+    expect(summary?.status).toBe('exited');
+    expect(summary?.statusSince).toBe(statusPayload.since);
+  });
+});
+
+describe('session.status propagation (M5.3): data arrives before the status it caused (real pipe, real timers)', () => {
+  it('test 3: the data frame for a chunk reaches the client before the session.status that chunk triggers', async () => {
+    const { factory, sessions } = fakeFactory();
+    const { client } = await startHarness({ sessionFactory: factory });
+
+    const created = await client.request<SessionCreateResult>('session.create', baseCreateParams());
+    const sessionId = created.session.id;
+    const session = sessions[0];
+    if (session === undefined)
+      throw new Error('unreachable: fakeFactory always records one session');
+
+    const order: string[] = [];
+    client.onData((sid) => {
+      if (sid === sessionId) {
+        order.push('data');
+      }
+    });
+    const statusSeen = new Promise<void>((resolve) => {
+      client.onEvent((msg) => {
+        if (msg.event === 'session.status') {
+          order.push('status');
+          resolve();
+        }
+      });
+    });
+    await client.request('session.attach', { sessionId });
+    // `session.attach`'s own (empty, nothing was ever written) snapshot
+    // frame already arrived by now — attach's contract puts it on the wire
+    // *before* the RPC response, on the same ordered stream this client
+    // already decoded. Clearing it out of `order` here keeps this test about
+    // one specific chunk's data-before-status ordering, not the snapshot's.
+    order.length = 0;
+
+    // A BEL is a "notification" signal (osc-parser.ts) regardless of the
+    // rest of the chunk's text — always wins over plain output in the same
+    // chunk (status-detector.ts section 3.3), which is exactly what makes it
+    // a reliable trigger here: this one chunk produces both a data frame and
+    // a session.status event.
+    session.emitData(`some output\x07more output`);
+    await statusSeen;
+
+    expect(order).toEqual(['data', 'status']);
+  });
+});
+
+/**
+ * Platform-appropriate shell/args for the real-PTY status test below —
+ * PowerShell on Windows (this file's other real-PTY suites' own
+ * assumption), `/bin/sh` off Windows (docs/milestones.md's own instruction:
+ * the one real-PTY test in a suite that also has to run on this repo's Linux
+ * CI container picks the shell by platform, same as the M4.4 graveyard
+ * suite's `platformShell()` above).
+ */
+function statusTestShell(): { shell: string; args: string[]; command: string } {
+  if (process.platform === 'win32') {
+    return {
+      shell: 'powershell.exe',
+      args: ['-NoLogo', '-NoProfile'],
+      command: '1..8 | ForEach-Object { Write-Output "line-$_"; Start-Sleep -Milliseconds 200 }',
+    };
+  }
+  return {
+    shell: '/bin/sh',
+    args: [],
+    command: 'for i in 1 2 3 4 5 6 7 8; do echo "line-$i"; sleep 0.2; done',
+  };
+}
+
+describe('session.status: real PTY, real timers (M5.3 test 6 — milestones.md "comando longo rodando, estado muda sozinho")', () => {
+  it('a long-running command settles into awaiting-input on its own, within DEFAULT_QUIET_MS + 3s of its last line', async () => {
+    const { registry, client } = await startHarness();
+    realRegistries.push(registry);
+
+    const { shell, args, command } = statusTestShell();
+    const created = await client.request<SessionCreateResult>('session.create', {
+      shell,
+      args,
+      cwd: process.cwd(),
+      cols: 80,
+      rows: 24,
+      command,
+    });
+    const sessionId = created.session.id;
+
+    // The status sequence this test cares about includes the session's
+    // *initial* status (returned by session.create itself, never an
+    // event of its own — a session is born already `'running'`, so
+    // nothing ever transitions *into* it at t=0) alongside every
+    // `session.status` event actually received.
+    const statuses: Array<{ status: string; at: number }> = [
+      { status: created.session.status, at: Date.now() },
+    ];
+    client.onEvent((msg) => {
+      if (msg.event === 'session.status') {
+        const payload = msg.payload as SessionStatusPayload;
+        statuses.push({ status: payload.status, at: Date.now() });
+      }
+    });
+
+    let output = '';
+    client.onData((sid, data) => {
+      if (sid === sessionId) {
+        output += Buffer.from(data).toString('utf8');
+      }
+    });
+    await client.request('session.attach', { sessionId });
+
+    await waitFor(() => hasEchoOutput(output, 'line-8'), 15_000);
+    const lastLineAt = Date.now();
+
+    await waitFor(
+      () => statuses[statuses.length - 1]?.status === 'awaiting-input',
+      DEFAULT_QUIET_MS + 5_000,
+    );
+    const settled = statuses[statuses.length - 1];
+
+    console.log(
+      '[M5.3 test 6] status sequence:',
+      statuses.map((s) => `${s.status}@${s.at}ms`).join(' -> '),
+      `| last line seen at ${lastLineAt}ms`,
+    );
+
+    expect(statuses.map((s) => s.status)).toContain('running');
+    expect(settled?.status).toBe('awaiting-input');
+    expect((settled?.at ?? 0) - lastLineAt).toBeLessThanOrEqual(DEFAULT_QUIET_MS + 5_000);
+
+    await client.request('session.kill', { sessionId });
+  }, 30_000);
 });

@@ -141,6 +141,15 @@ export interface SessionSummary {
   rows: number;
   status: SessionStatus;
   /**
+   * Epoch ms when `status` last changed. Always set by the daemon; optional
+   * only so older fixtures and clients keep compiling — dozens of tests in
+   * `ui`/`app` build a `SessionSummary` by hand and none of them need to
+   * know about this field (M5.3, `docs/specs/m5.3-status-propagation.md`
+   * section 3.1). A client that doesn't see it treats the summary as older
+   * than any status event it has.
+   */
+  statusSince?: number;
+  /**
    * Process exit code, present only once the session has died (`status`
    * `'exited'`). Mirrors `SessionExitPayload`/`session.ts`'s `SessionExit` so
    * a client that reconnects after missing the `session.exit` event — it

@@ -147,6 +147,7 @@ export type {
 
 export {
   addWorkspace,
+  applySessionStatus,
   closePaneInWorkspace,
   closeWorkspace,
   focusPane,
@@ -162,6 +163,11 @@ export {
   upsertSession,
 } from './store/workspace.js';
 export type { StoreState, Workspace } from './store/workspace.js';
+
+// ─── M5.3: mirrors daemon session.status/session.exit events into the store ─
+
+export { startSessionStatusSync } from './session-status-sync.js';
+export type { StatusSyncBridge, StatusSyncStore } from './session-status-sync.js';
 
 export {
   selectAggregatedWorkspaceStatus,
