@@ -21,7 +21,7 @@ Cada tarefa tem um commit próprio, e a mensagem dele diz o que foi provado, o q
 | M4.4 cemitério | `f12e9bf` | `session.close` enterra; `session.kill`, `session.restore`, `graveyard.list` |
 | M4.5 UI do cemitério | `30bac48` | "Fechados recentemente" e `Ctrl+Shift+T`, barrado no xterm |
 | M4.6 perfis de shell | `3f6b61a`, `d458634` | Detecção no daemon (UTF-16LE do `wsl`, timeout), menu no `+`, fim do `powershell.exe` fixo |
-| M4.7 launch de workspace | ver o log | O daemon executa o `command`; sessão morta relança no mesmo lugar; modelos de workspace |
+| M4.7 launch de workspace | `6ed38cc` | O daemon executa o `command`; sessão morta relança no mesmo lugar; modelos de workspace |
 | M4.8 resiliência do daemon | `005462b` | Supervisor com reconexão, faixa no topo, ressincronização. Spec: `docs/specs/m4.8-daemon-resilience.md` |
 
 ### O gate do M4 é do dono
